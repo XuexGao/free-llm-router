@@ -1,0 +1,245 @@
+{
+  "egressIp": "2a06:98c0:3600::103",
+  "ranAt": "2026-10-03T07:13:32.394Z",
+  "results": [
+    {
+      "target": {
+        "id": "cn-auth-state",
+        "label": "CN 设备授权初始化（本项目登录第一步，零配额）",
+        "url": "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI",
+        "method": "POST",
+        "base": "https://copilot.tencent.com",
+        "body": "{}",
+        "needsAuth": false
+      },
+      "ip": "2a06:98c0:3600::103",
+      "attempts": [
+        {
+          "round": 1,
+          "httpStatus": 200,
+          "verdict": "ok",
+          "code": 0,
+          "msg": "OK",
+          "snippet": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"78e1962d-40cd-4f90-b70a-d65988508f8c\",\"data\":{\"state\":\"4009f536-7d23-49e5-aa54-1a119deeb90a\",\"authUrl\":\"https://copilot.tencent.com/login?platform=CLI\\u0026state=4009f536-7d23-49e5-aa54-1a119deeb90a\"}}",
+          "contentType": "application/json; charset=utf-8",
+          "cfRay": "a44a247f7e393dc5-SIN",
+          "elapsedMs": 973
+        },
+        {
+          "round": 2,
+          "httpStatus": 200,
+          "verdict": "ok",
+          "code": 0,
+          "msg": "OK",
+          "snippet": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"d03d9cc6-e420-4202-97b4-875399c1f8ee\",\"data\":{\"state\":\"83df7793-aa59-40e2-a15c-594941cf1d04\",\"authUrl\":\"https://copilot.tencent.com/login?platform=CLI\\u0026state=83df7793-aa59-40e2-a15c-594941cf1d04\"}}",
+          "contentType": "application/json; charset=utf-8",
+          "cfRay": "a44a248d0a723dc5-SIN",
+          "elapsedMs": 740
+        },
+        {
+          "round": 3,
+          "httpStatus": 200,
+          "verdict": "ok",
+          "code": 0,
+          "msg": "OK",
+          "snippet": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"4dfbfcde-7058-4f7f-bc08-5655099c74a8\",\"data\":{\"state\":\"dd185798-0138-4016-946d-b42327e12e8c\",\"authUrl\":\"https://copilot.tencent.com/login?platform=CLI\\u0026state=dd185798-0138-4016-946d-b42327e12e8c\"}}",
+          "contentType": "application/json; charset=utf-8",
+          "cfRay": "a44a24992d483dc5-SIN",
+          "elapsedMs": 291
+        },
+        {
+          "round": 4,
+          "httpStatus": 200,
+          "verdict": "ok",
+          "code": 0,
+          "msg": "OK",
+          "snippet": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"97b6f014-a35e-483f-b27e-cd9510165b74\",\"data\":{\"state\":\"46232c25-6410-42f0-825c-4ad22e6fadc9\",\"authUrl\":\"https://copilot.tencent.com/login?platform=CLI\\u0026state=46232c25-6410-42f0-825c-4ad22e6fadc9\"}}",
+          "contentType": "application/json; charset=utf-8",
+          "cfRay": "a44a24a27fc13dc5-SIN",
+          "elapsedMs": 389
+        },
+        {
+          "round": 5,
+          "httpStatus": 200,
+          "verdict": "ok",
+          "code": 0,
+          "msg": "OK",
+          "snippet": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"f839ca10-9b59-4246-b263-96e5c4c7f403\",\"data\":{\"state\":\"08ec4b88-2140-469a-971e-a10cb5fbf9d4\",\"authUrl\":\"https://copilot.tencent.com/login?platform=CLI\\u0026state=08ec4b88-2140-469a-971e-a10cb5fbf9d4\"}}",
+          "contentType": "application/json; charset=utf-8",
+          "cfRay": "a44a24ac6af43dc5-SIN",
+          "elapsedMs": 354
+        }
+      ],
+      "summary": {
+        "ok": 5,
+        "auth_rejected": 0,
+        "waf_blocked": 0,
+        "network_error": 0,
+        "unexpected": 0
+      },
+      "verdict": "ok"
+    },
+    {
+      "target": {
+        "id": "cn-billing",
+        "label": "CN billing 域只读探测（无凭据，预期返回鉴权错误）",
+        "url": "https://www.codebuddy.cn/v2/billing/meter/get-user-resource",
+        "method": "POST",
+        "base": "https://www.codebuddy.cn",
+        "body": "{}",
+        "needsAuth": true
+      },
+      "ip": "2a06:98c0:3600::103",
+      "attempts": [
+        {
+          "round": 1,
+          "httpStatus": 401,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html; charset=utf-8",
+          "cfRay": "a44a24aeab9f3dc5-SIN",
+          "elapsedMs": 805
+        },
+        {
+          "round": 2,
+          "httpStatus": 401,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html; charset=utf-8",
+          "cfRay": "a44a24bb2ebf3dc5-SIN",
+          "elapsedMs": 534
+        },
+        {
+          "round": 3,
+          "httpStatus": 401,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html; charset=utf-8",
+          "cfRay": "a44a24c609ea3dc5-SIN",
+          "elapsedMs": 907
+        },
+        {
+          "round": 4,
+          "httpStatus": 401,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html; charset=utf-8",
+          "cfRay": "a44a24d32d5f3dc5-SIN",
+          "elapsedMs": 488
+        },
+        {
+          "round": 5,
+          "httpStatus": 401,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html; charset=utf-8",
+          "cfRay": "a44a24ddb84d3dc5-SIN",
+          "elapsedMs": 487
+        }
+      ],
+      "summary": {
+        "ok": 0,
+        "auth_rejected": 5,
+        "waf_blocked": 0,
+        "network_error": 0,
+        "unexpected": 0
+      },
+      "verdict": "auth_rejected"
+    },
+    {
+      "target": {
+        "id": "cn-web",
+        "label": "CN web 域只读探测（领奖权威域，无凭据 ⇒ 预期鉴权拒绝）",
+        "url": "https://www.workbuddy.cn/console/account",
+        "method": "GET",
+        "base": "https://www.workbuddy.cn",
+        "needsAuth": true
+      },
+      "ip": "2a06:98c0:3600::103",
+      "attempts": [
+        {
+          "round": 1,
+          "httpStatus": 302,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html",
+          "cfRay": "a44a24e0c9203dc5-SIN",
+          "elapsedMs": 770
+        },
+        {
+          "round": 2,
+          "httpStatus": 302,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html",
+          "cfRay": "a44a24ed1cab3dc5-SIN",
+          "elapsedMs": 530
+        },
+        {
+          "round": 3,
+          "httpStatus": 302,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html",
+          "cfRay": "a44a24f7e8763dc5-SIN",
+          "elapsedMs": 255
+        },
+        {
+          "round": 4,
+          "httpStatus": 302,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html",
+          "cfRay": "a44a25010af83dc5-SIN",
+          "elapsedMs": 728
+        },
+        {
+          "round": 5,
+          "httpStatus": 302,
+          "verdict": "auth_rejected",
+          "code": null,
+          "msg": null,
+          "snippet": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\r\n</html>\r\n",
+          "contentType": "text/html",
+          "cfRay": "a44a250d0e8e3dc5-SIN",
+          "elapsedMs": 710
+        }
+      ],
+      "summary": {
+        "ok": 0,
+        "auth_rejected": 5,
+        "waf_blocked": 0,
+        "network_error": 0,
+        "unexpected": 0
+      },
+      "verdict": "auth_rejected"
+    }
+  ],
+  "conclusion": "✅ 判定：可行。全部目标均得到上游正常响应，未检出 WAF 拦截。可以进入第 2 步（骨架）。",
+  "rounds": 5,
+  "verdictLabels": {
+    "ok": "✅ 通",
+    "auth_rejected": "✅ 通（上游正常拒绝，非 WAF）",
+    "waf_blocked": "❌ WAF 拦截",
+    "network_error": "⚠️ 网络层错误",
+    "unexpected": "⚠️ 未预期响应"
+  }
+}

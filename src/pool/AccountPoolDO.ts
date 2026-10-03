@@ -1,0 +1,598 @@
+/**
+ * AccountPool Durable Object：账号池的**唯一权威状态**。
+ *
+ * ## 为什么必须是一个 DO，而不是 Worker 内存
+ *
+ * 账号池的冷却/熔断/降权/租约是**必须跨请求共享且必须串行修改**的状态。
+ * Workers 会水平扩展 + 随时回收 isolate，模块级变量等于「每个 isolate 一份」，
+ * 状态必然撕裂（AGENTS.md §4.2）。
+ *
+ * DO 提供三件这里正需要的东西：
+ * 1. **单点串行** —— 无需自己实现锁；
+ * 2. **持久化存储** —— 替代 Go 侧的 `data/state.json`；
+ * 3. **alarm** —— 替代进程内 ticker（本 DO 暂不需要，见下）。
+ *
+ * 按 realm（`cn` / `global`）**分片**而不是全局单例：避免单 DO 的
+ * ~1000 req/s 软上限成为瓶颈。
+ *
+ * ## 分层纪律（重要）
+ *
+ * 本 DO **只做状态读写与选号**，不做上游网络请求。
+ * 理由：DO 的每次调用都消耗 10ms CPU 预算（Free 计划），
+ * 把上游 fetch 放进 DO 会把 I/O 等待与状态修改耦合在一起，
+ * 让「一次调用 = 一步」的纪律失效。上游请求由 Worker 侧发起。
+ */
+
+import { DurableObject } from 'cloudflare:workers'
+import type { Env } from '../env.js'
+import {
+  type AccountState,
+  createAccountState,
+  healthy,
+  healthyForModel,
+  isActive,
+  modelExempt,
+  pruneExpired,
+} from './state.js'
+import {
+  deleteAccount,
+  deleteSession,
+  listAccounts,
+  listCredentialUids,
+  migrate,
+  pruneLoginSessions,
+  pruneSessions,
+  readAccount,
+  readCredential,
+  readLoginSession,
+  readSession,
+  writeAccount,
+  writeCredential,
+  writeLoginSession,
+  writeSession,
+  deleteCredential,
+  deleteLoginSession,
+} from '../store/db.js'
+import { decryptCredential, encryptCredential, requireCredentialKey } from '../store/crypto.js'
+
+/** 模型成本账本的存活时长：6h 外的价格不再采信（Go 侧 `modelCostTTL` 同口径）。 */
+const MODEL_COST_TTL_MS = 6 * 60 * 60 * 1000
+
+/** 会话粘性默认 TTL。 */
+export const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000
+
+/**
+ * IP 级 WAF 拦截的判定窗口与阈值。
+ *
+ * ## 为什么需要「IP 级」这一层（Go 侧 `internal/server/wafip.go` 的教训）
+ *
+ * 实测记录：**3 个账号在 1 秒内全部命中 403** —— 那不是账号问题，是**出口 IP 被拦**。
+ * 若只有账号级冷却，轮转逻辑会把一次客户端请求**放大 MaxRotate 倍**：
+ * 每个号都去撞一次同一堵墙，反而加重风控。
+ *
+ * ⇒ 判据是「**短窗内多个不同账号**接连命中」，而不是「同一账号反复命中」：
+ * - 同一个号反复 403 → 账号级偶发，交给软冷却（已有的逻辑）；
+ * - **不同号**在 60 秒内接连 403 → 已有 IP 级证据 ⇒ fail-fast，不再轮转。
+ *
+ * 阈值取 2：「多号」的最小定义。Go 侧同值（实测 3 号 1s 全拦，阈值 2 更早止损）。
+ */
+const WAF_IP_WINDOW_MS = 60_000
+const WAF_IP_THRESHOLD = 2
+
+/** 选号候选上限（Go 侧 top5）。 */
+const TOP_N = 5
+
+/**
+ * 选号输入。
+ *
+ * ⚠️ `model` 必须**真的传**：传空串会让模型级冷却过滤整体短路
+ * （Go 侧 `account-pool.ts:917` 记录过的缺陷）。
+ */
+export interface PickRequest {
+  realm: string
+  /** 目标模型；空串表示「还没定模型」——此时不做模型级过滤。 */
+  model: string
+  /** 已尝试过的 uid，必须排除（跨重试保留，否则会在账号间无限来回）。 */
+  exclude: string[]
+  now: number
+}
+
+/** 选号结果。 */
+export interface PickResult {
+  uid: string
+  state: AccountState
+}
+
+/** 账号池的对外 RPC 面（Worker 通过 stub 调用）。 */
+export class AccountPoolDO extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env)
+    // 建表必须完成后再放行任何请求，否则首次调用会撞上不存在的表。
+    ctx.blockConcurrencyWhile(async () => {
+      migrate(ctx.storage.sql)
+    })
+  }
+
+  /** 写入 / 覆盖一个账号的完整状态。 */
+  async upsertAccount(state: AccountState, now: number): Promise<void> {
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+  }
+
+  /** 读取一个账号。 */
+  async getAccount(uid: string): Promise<AccountState | undefined> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    return raw === undefined ? undefined : (JSON.parse(raw) as AccountState)
+  }
+
+  /** 列出某 realm 的全部账号（惰性剪枝过期条目）。 */
+  async listAccounts(realm: string, now: number): Promise<AccountState[]> {
+    const raws = listAccounts(this.ctx.storage.sql, realm)
+    const out: AccountState[] = []
+    for (const raw of raws) {
+      const state = JSON.parse(raw) as AccountState
+      if (pruneExpired(state, now, MODEL_COST_TTL_MS)) {
+        // 剪枝结果不回写：过期条目不影响判定，回写反而多一次 SQLite 往返。
+        // 下次真实状态变更时会一并落盘。
+      }
+      out.push(state)
+    }
+    return out
+  }
+
+  /** 删除账号（连带其会话绑定）。 */
+  async removeAccount(uid: string): Promise<void> {
+    deleteAccount(this.ctx.storage.sql, uid)
+    this.ctx.storage.sql.exec('DELETE FROM sessions WHERE uid = ?', uid)
+  }
+
+  /**
+   * 选号。
+   *
+   * 严格照 Go 侧 `pick.go` 的**顺序**（顺序即语义，不可调换）：
+   * 1. 健康过滤（含模型级）
+   * 2. 排除已尝试
+   * 3. 在途过滤（**本实现暂不做租约**，见下方注记）
+   * 4. 权重计算 → 加权随机
+   *
+   * ⚠️ **有意未实现**：Go 侧的 `costTier` 三层硬分层与「积分保底拦截」依赖
+   * 实测扣费账本（`modelCosts`）。第一版账号数少（1–3 个），分层收益低于
+   * 实现复杂度，故只保留**积分保底**所需的账本字段，不做分层选号。
+   * 这是**刻意**的范围裁剪，不是遗漏（AGENTS.md §3.2）。
+   */
+  async pick(request: PickRequest): Promise<PickResult | undefined> {
+    const { realm, model, exclude, now } = request
+    const excludeSet = new Set(exclude)
+
+    // ⚠️ IP 级拦截激活期内**直接放弃**，连一个号都不试。
+    // 理由见 WAF_IP_WINDOW_MS 的注释：继续轮转只会把一次请求放大成 N 次撞墙。
+    if (await this.wafGateActive(now)) return undefined
+
+    const raws = listAccounts(this.ctx.storage.sql, realm)
+    const candidates: AccountState[] = []
+    for (const raw of raws) {
+      const state = JSON.parse(raw) as AccountState
+      if (excludeSet.has(state.uid)) continue
+      pruneExpired(state, now, MODEL_COST_TTL_MS)
+      if (!healthyForModel(state, now, model)) continue
+      candidates.push(state)
+    }
+
+    if (candidates.length === 0) return undefined
+
+    // 权重：积分越多越优先（温和偏好，不是硬门槛）。
+    // ⚠️ 刻意**不**用 `Math.random()` 之外的全局状态：DO 单线程，无需防并发。
+    const weights = candidates.map((s) => 1 + Math.max(0, s.credits) / 100)
+    const total = weights.reduce((a, b) => a + b, 0)
+    let roll = Math.random() * total
+    for (let i = 0; i < candidates.length; i += 1) {
+      roll -= weights[i] ?? 0
+      if (roll <= 0) {
+        const chosen = candidates[i]
+        if (chosen !== undefined) return { uid: chosen.uid, state: chosen }
+      }
+    }
+
+    // 浮点误差兜底：取最后一个候选（而不是返回 undefined —— 那会被上层误判为「无可用账号」）。
+    const last = candidates[candidates.length - 1]
+    return last === undefined ? undefined : { uid: last.uid, state: last }
+  }
+
+  /** 账号池计数摘要（供 `/healthz` 与面板）。 */
+  async counts(realm: string, now: number): Promise<{
+    total: number
+    healthy: number
+    disabled: number
+    cooling: number
+    modelExempt: number
+  }> {
+    const raws = listAccounts(this.ctx.storage.sql, realm)
+    let healthyCount = 0
+    let disabled = 0
+    let cooling = 0
+    let exempt = 0
+
+    for (const raw of raws) {
+      const state = JSON.parse(raw) as AccountState
+      pruneExpired(state, now, MODEL_COST_TTL_MS)
+      if (state.disabled) {
+        disabled += 1
+        continue
+      }
+      if (healthy(state, now)) {
+        healthyCount += 1
+      } else if (modelExempt(state, now)) {
+        exempt += 1
+      } else {
+        cooling += 1
+      }
+    }
+
+    return { total: raws.length, healthy: healthyCount, disabled, cooling, modelExempt: exempt }
+  }
+
+  /** 读会话粘性绑定。 */
+  async getSession(key: string, now: number): Promise<string | undefined> {
+    return readSession(this.ctx.storage.sql, key, now)
+  }
+
+  /** 写会话粘性绑定（滚动续期）。 */
+  async bindSession(key: string, uid: string, now: number, ttlMs = DEFAULT_SESSION_TTL_MS): Promise<void> {
+    writeSession(this.ctx.storage.sql, key, uid, now + ttlMs)
+  }
+
+  /** 解绑会话（绑定的账号失败时调用）。 */
+  async unbindSession(key: string): Promise<void> {
+    deleteSession(this.ctx.storage.sql, key)
+  }
+
+  /** 清理过期会话。 */
+  async pruneSessions(now: number): Promise<number> {
+    return pruneSessions(this.ctx.storage.sql, now)
+  }
+
+  /**
+   * 记录一次失败，按**错误类别**落到正确的维度。
+   *
+   * ⚠️ 这里刻意做成**一个显式入参的入口**，而不是「一个通用的 punish()」：
+   * 错误分类（AGENTS.md §6.7）决定罚哪个维度，混在一起必然误伤。
+   */
+  async applyFailure(input: {
+    uid: string
+    kind: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model'
+    now: number
+    /** `kind === 'model'` 时的目标模型。 */
+    model?: string
+    /** 上游给出的重置时刻（epoch ms），优先于本地退避计算。 */
+    resetAt?: number
+    reason?: string
+  }): Promise<{ disabled: boolean }> {
+    const raw = readAccount(this.ctx.storage.sql, input.uid)
+    if (raw === undefined) return { disabled: false }
+    const state = JSON.parse(raw) as AccountState
+    const { now } = input
+
+    switch (input.kind) {
+      case 'hard': {
+        // 余额耗尽：冷却到次日 04:00（UTC+8）。签到后余额恢复会自动解冻。
+        state.until = nextDay4AmUtc8(now)
+        state.coolKind = 'hard'
+        state.reason = input.reason ?? 'credit exhausted'
+        break
+      }
+      case 'soft': {
+        state.coolKind = 'soft'
+        state.reason = input.reason ?? 'rate limited'
+        // 有上游重置墙钟就对齐它，否则按连续次数指数退避（封顶 2h）。
+        if (input.resetAt !== undefined && input.resetAt > now) {
+          state.until = input.resetAt
+        } else if (!isActive(state.until, now)) {
+          state.softStreak += 1
+          const backoff = Math.min(600_000 * 2 ** (state.softStreak - 1), 2 * 60 * 60 * 1000)
+          state.until = now + backoff
+        }
+        // ⚠️ 「已在冷却中」时**不推进不延长**（Go 侧 `cooldown.go:321`）——
+        // 那会让一个持续失败的号被无限推远。
+        break
+      }
+      case 'breaker': {
+        state.fails += 1
+        if (state.fails >= 3) {
+          state.breakerUntil = now + Math.min(30 * 60 * 1000 * 2 ** state.retryCount, 6 * 60 * 60 * 1000)
+          state.retryCount += 1
+          state.fails = 0
+        }
+        break
+      }
+      case 'degrade': {
+        state.consecutiveFails += 1
+        if (state.consecutiveFails >= 5) {
+          state.degradeUntil = now + 10 * 60 * 1000
+          state.consecutiveFails = 0
+        }
+        break
+      }
+      case 'session_dead': {
+        // ⚠️ 连续 3 次才禁用：单次 12153 多为网络抖动，一次就杀号会误杀健康账号
+        // （Go 侧 `state.go:27-40` 记录过 P0 事故：13 个 disabled 号 refresh 全部成功）。
+        state.sessionDeadFails += 1
+        if (state.sessionDeadFails >= 3) {
+          state.sessionDeadFails = 0
+          state.disabled = true
+          state.reason = 'session dead (12153 ×3)'
+        }
+        break
+      }
+      case 'model': {
+        const model = input.model ?? ''
+        if (model === '') break
+        const prev = state.modelCooldowns[model]
+        const hits = (prev?.hits ?? 0) + 1
+        // 6004：对齐上游重置墙钟。11102：6h 起指数退避，封顶 24h。
+        const until =
+          input.resetAt !== undefined && input.resetAt > now
+            ? input.resetAt
+            : now + Math.min(6 * 60 * 60 * 1000 * 2 ** Math.min(hits - 1, 2), 24 * 60 * 60 * 1000)
+        state.modelCooldowns[model] = {
+          until,
+          resetAt: input.resetAt ?? 0,
+          reason: input.reason ?? 'model cooldown',
+          hits,
+          auditOnly: false,
+        }
+        break
+      }
+    }
+
+    state.errTotal += 1
+    state.lastErr = now
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return { disabled: state.disabled }
+  }
+
+  /**
+   * 记录一次成功：清熔断与降权，**不碰 `modelCooldowns`**。
+   *
+   * ⚠️ 不清模型级冷却是**刻意的**：一次成功不能证明某个模型已解除限流
+   * （Go 侧 `state.go:141-144`）。
+   */
+  async noteSuccess(uid: string, now: number, usage?: { input: number; output: number }): Promise<void> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return
+    const state = JSON.parse(raw) as AccountState
+
+    state.successCount += 1
+    state.lastSuccess = now
+    state.fails = 0
+    state.retryCount = 0
+    state.breakerUntil = 0
+    state.softStreak = 0
+    state.sessionDeadFails = 0
+    state.consecutiveFails = 0
+    state.degradeUntil = 0
+
+    if (usage !== undefined) {
+      state.tokenUsage.input += usage.input
+      state.tokenUsage.output += usage.output
+    }
+
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+  }
+
+  /** 解冻账号（面板「解冻」/ 签到后余额恢复）。清全部惩罚态，但不动 `disabled`。 */
+  async revive(uid: string, now: number, credits?: number): Promise<boolean> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return false
+    const state = JSON.parse(raw) as AccountState
+
+    state.until = 0
+    state.coolKind = ''
+    state.reason = ''
+    state.softStreak = 0
+    state.breakerUntil = 0
+    state.retryCount = 0
+    state.fails = 0
+    state.degradeUntil = 0
+    state.consecutiveFails = 0
+    state.sessionDeadFails = 0
+    state.modelCooldowns = {}
+    if (credits !== undefined) state.credits = credits
+
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
+  }
+
+  /** 显式禁用（人工或 11140 这类强信号）。 */
+  async disable(uid: string, reason: string, now: number): Promise<void> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return
+    const state = JSON.parse(raw) as AccountState
+    state.disabled = true
+    state.reason = reason
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+  }
+
+  /** 创建账号（供导入 / 登录流程调用）。已存在则覆盖凭证以外的状态。 */
+  async createAccount(input: { uid: string; nickname: string; realm: string }, now: number): Promise<AccountState> {
+    const existing = readAccount(this.ctx.storage.sql, input.uid)
+    if (existing !== undefined) return JSON.parse(existing) as AccountState
+    const state = createAccountState(input)
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return state
+  }
+
+  // ─────────────────────── 凭据（加密存储） ───────────────────────
+
+  /**
+   * 写入凭据（**自动加密**）。
+   *
+   * ⚠️ 未配置 `CREDENTIAL_KEY` 时**抛错**，不静默明文落盘（AGENTS.md §7.1）。
+   * 静默降级是最糟的选择 —— 用户会以为已经加密了。
+   */
+  async putCredential(uid: string, credential: unknown, now: number): Promise<void> {
+    const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
+    const ciphertext = await encryptCredential(key, credential)
+    writeCredential(this.ctx.storage.sql, uid, ciphertext, now)
+  }
+
+  /**
+   * 读取并解密凭据。不存在返回 undefined；解密失败抛错（GCM 认证保证不返回垃圾）。
+   *
+   * ⚠️ 返回 `unknown` 而不是泛型：**DO RPC 的类型映射不支持把泛型参数透传**
+   * （写成 `getCredential<T>()` 会在调用点报 `Expected 0 type arguments`）。
+   * 由调用方在边界处断言一次具体类型。
+   */
+  async getCredential(uid: string): Promise<unknown | undefined> {
+    const ciphertext = readCredential(this.ctx.storage.sql, uid)
+    if (ciphertext === undefined) return undefined
+    const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
+    return await decryptCredential(key, ciphertext)
+  }
+
+  /** 删除凭据。 */
+  async removeCredential(uid: string): Promise<void> {
+    deleteCredential(this.ctx.storage.sql, uid)
+  }
+
+  /** 列出持有凭据的 uid（**不返回密文**）。 */
+  async listCredentialUids(): Promise<string[]> {
+    return listCredentialUids(this.ctx.storage.sql)
+  }
+
+  // ─────────────────────── 登录会话（设备码） ───────────────────────
+
+  /**
+   * 保存登录会话。
+   *
+   * ⚠️ 必须持久化：isolate 随时可能被回收，「发起登录」与「轮询结果」
+   * 会落到不同 isolate。放内存会表现为「state 永远未知」。
+   */
+  async saveLoginSession(state: string, payload: unknown, expiresAt: number): Promise<void> {
+    writeLoginSession(this.ctx.storage.sql, state, JSON.stringify(payload), expiresAt)
+  }
+
+  /**
+   * 读登录会话（已过期视为不存在）。
+   *
+   * ⚠️ 同 `getCredential`：返回 `unknown`，泛型不透传 DO RPC。
+   */
+  async getLoginSession(state: string, now: number): Promise<unknown | undefined> {
+    const raw = readLoginSession(this.ctx.storage.sql, state, now)
+    return raw === undefined ? undefined : JSON.parse(raw)
+  }
+
+  /** 删除登录会话（完成或放弃后清理）。 */
+  async removeLoginSession(state: string): Promise<void> {
+    deleteLoginSession(this.ctx.storage.sql, state)
+  }
+
+  /** 清理过期登录会话。 */
+  async pruneLoginSessions(now: number): Promise<number> {
+    return pruneLoginSessions(this.ctx.storage.sql, now)
+  }
+
+  // ─────────────────────── IP 级 WAF 拦截护栏 ───────────────────────
+
+  /**
+   * 记录一次**某个账号**命中 WAF 403，返回记账后 IP 级拦截是否激活。
+   *
+   * ## 语义（逐条对齐 Go 侧 `wafip.go:50-72`）
+   *
+   * - **已激活期内**新命中：不续期、不记账 —— 保守地「自然解除」，
+   *   而不是被持续命中无限延长；
+   * - **未激活**：记 `hits[uid] = now`（同号重复命中**覆盖**而不累计 ——
+   *   判据是「不同号数」），剪掉窗外的旧命中；
+   * - 不同 uid 数达阈值 → 激活到 `now + window`，并**清空判定窗**
+   *   （解除后需要全新命中重新判定，不叠旧账）。
+   */
+  async noteWaf(uid: string, now: number): Promise<boolean> {
+    const gate = await this.loadWafGate()
+
+    if (gate.until > now) {
+      // 激活期内：不续期、不记账
+      return true
+    }
+
+    gate.hits[uid] = now
+    // 剪枝：删掉窗口外的
+    for (const [u, t] of Object.entries(gate.hits)) {
+      if (now - t > WAF_IP_WINDOW_MS) delete gate.hits[u]
+    }
+
+    if (Object.keys(gate.hits).length >= WAF_IP_THRESHOLD) {
+      gate.until = now + WAF_IP_WINDOW_MS
+      gate.hits = {} // 清空：解除后需全新命中重新判定
+      await this.saveWafGate(gate)
+      // 面板与日志都需要看到「这是 IP 级，不是账号级」
+      console.warn(
+        `[waf] IP 级拦截激活：${WAF_IP_WINDOW_MS / 1000}s 内 ${WAF_IP_THRESHOLD} 个不同账号命中 403，` +
+          `暂停轮转至 +${WAF_IP_WINDOW_MS / 1000}s`,
+      )
+      return true
+    }
+
+    await this.saveWafGate(gate)
+    return false
+  }
+
+  /** IP 级拦截是否激活（只读，不记账）。 */
+  async wafGateActive(now: number): Promise<boolean> {
+    const gate = await this.loadWafGate()
+    return gate.until > now
+  }
+
+  /** 查询 gate 完整状态（供面板展示「是不是 IP 被拦了」）。 */
+  async wafGateStatus(now: number): Promise<{ active: boolean; until: number; recentUids: number }> {
+    const gate = await this.loadWafGate()
+    let recent = 0
+    for (const t of Object.values(gate.hits)) {
+      if (now - t <= WAF_IP_WINDOW_MS) recent += 1
+    }
+    return { active: gate.until > now, until: gate.until, recentUids: recent }
+  }
+
+  /**
+   * 人工解除 IP 级拦截（面板「解冻」用）。
+   *
+   * ⚠️ 刻意提供这个入口：gate 是**保守的推测**，接受人工纠正。
+   * 若实际是账号级问题却被误判成 IP 级，用户需要能立刻恢复。
+   */
+  async clearWafGate(): Promise<void> {
+    await this.ctx.storage.put('wafGate', { until: 0, hits: {} })
+  }
+
+  /** 读 gate 状态（不存在时返回空表）。 */
+  private async loadWafGate(): Promise<{ until: number; hits: Record<string, number> }> {
+    const raw = await this.ctx.storage.get<{ until?: unknown; hits?: unknown }>('wafGate')
+    const until = typeof raw?.until === 'number' ? raw.until : 0
+    const hits: Record<string, number> = {}
+    if (raw?.hits !== null && typeof raw?.hits === 'object' && !Array.isArray(raw?.hits)) {
+      for (const [k, v] of Object.entries(raw.hits as Record<string, unknown>)) {
+        if (typeof v === 'number') hits[k] = v
+      }
+    }
+    return { until, hits }
+  }
+
+  /** 写 gate 状态（**必须持久化**：DO 随时可能被回收）。 */
+  private async saveWafGate(gate: { until: number; hits: Record<string, number> }): Promise<void> {
+    await this.ctx.storage.put('wafGate', gate)
+  }
+}
+
+/**
+ * 次日 04:00（UTC+8）。
+ *
+ * 用**固定 +8 偏移**而不是 `Intl` / 本机时区：Workers 恒为 UTC，
+ * 且 Go 侧明确记录「不依赖容器 tzdata」（`travel.go:36`）。
+ *
+ * 边界语义：04:00 **之前**返回当天 04:00（此时当日签到还没跑，等当天签到即可），
+ * 04:00 之后返回次日 04:00。与 Go 侧 `cooldown.go:409-418` 逐字一致。
+ */
+export function nextDay4AmUtc8(now: number): number {
+  const CST_OFFSET = 8 * 60 * 60 * 1000
+  const shifted = now + CST_OFFSET
+  const dayStart = Math.floor(shifted / 86_400_000) * 86_400_000
+  const today4am = dayStart + 4 * 60 * 60 * 1000
+  const target = shifted < today4am ? today4am : today4am + 86_400_000
+  return target - CST_OFFSET
+}

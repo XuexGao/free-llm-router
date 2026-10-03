@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorkBuddy Serverless 管理面板</title>
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body>
+<header>
+  <h1>WorkBuddy Serverless</h1>
+  <div class="auth">
+    <input id="apikey" type="password" placeholder="API_KEY" autocomplete="off">
+    <button id="save-key">保存密钥</button>
+    <span id="auth-status" class="pill"></span>
+  </div>
+</header>
+
+<main>
+  <div id="waf-banner" class="banner" hidden>
+    <strong>⚠️ 出口 IP 疑似被上游 WAF 拦截</strong>
+    <span id="waf-detail"></span>
+    <button id="clear-waf" class="ghost">立即解除</button>
+  </div>
+
+  <section id="sec-accounts">
+    <h2>账号池 <button id="refresh-accounts" class="ghost">刷新</button></h2>
+    <div id="accounts"></div>
+    <details>
+      <summary>导入凭据</summary>
+      <p class="hint">支持 Go 版 <code>auths/*.json</code>（嵌套形/扁平形）与 DSH 插件
+      <code>.credentials.yaml</code> 里的 snake_case 形态。可粘贴单个对象、数组，或 <code>{"accounts":[...]}</code>。</p>
+      <textarea id="import-body" rows="6" placeholder='{"auth":{"accessToken":"...","expiresAt":1699999999},"account":{"uid":"...","nickname":"..."}}'></textarea>
+      <button id="do-import">导入</button>
+      <pre id="import-result" class="out"></pre>
+    </details>
+    <details>
+      <summary>添加账号（设备码登录）</summary>
+      <p class="hint">点击后会在下方给出授权链接，在浏览器打开完成授权；本页会自动轮询结果。</p>
+      <button id="do-login">发起登录</button>
+      <pre id="login-result" class="out"></pre>
+    </details>
+  </section>
+
+  <section id="sec-tasks">
+    <h2>任务</h2>
+    <div class="row">
+      <label>账号 <select id="task-uid"></select></label>
+      <label>计划
+        <select id="task-plan">
+          <option value="daily">daily（签到 + 余额）</option>
+          <option value="growth">growth（零消耗成长任务）</option>
+          <option value="growth-real">growth + 真实对话任务（⚠️ 消耗配额）</option>
+        </select>
+      </label>
+      <button id="run-task">执行</button>
+      <button id="refresh-status" class="ghost">查进度</button>
+    </div>
+    <pre id="task-status" class="out"></pre>
+  </section>
+
+  <section id="sec-models">
+    <h2>模型目录 <button id="load-models" class="ghost">加载</button></h2>
+    <div id="models" class="out"></div>
+  </section>
+</main>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,118 @@
+/**
+ * 模型目录：从上游 `/v3/config` 拉取并转成 OpenAI 兼容形状。
+ *
+ * ⚠️ 上游**没有** OpenAI 式的 `/v1/models`；目录在 `/v3/config`。
+ */
+
+import { resolveUpstream, type Env } from '../env.js'
+import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
+
+/** 模型目录单条（OpenAI 兼容形状）。 */
+export interface OpenAiModel {
+  id: string
+  object: 'model'
+  created: number
+  owned_by: string
+  name?: string
+}
+
+/** 从账号池取第一个可用账号（1–3 账号场景下够用）。 */
+export async function pickCredential(
+  env: Env,
+  realm: string,
+): Promise<{ uid: string; credential: { accessToken: string } } | undefined> {
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const accounts = await pool.listAccounts(realm, Date.now())
+  for (const account of accounts) {
+    if (account.disabled) continue
+    const credential = (await pool.getCredential(account.uid)) as { accessToken?: string } | undefined
+    if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
+      return { uid: account.uid, credential: { accessToken: credential.accessToken } }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 拉取模型目录。
+ *
+ * 目录响应几十 KB，这里允许整体解析 —— 它是**一次性**调用，
+ * 不在流式回答的热路径上（那条路径绝不能缓冲）。
+ */
+export async function listModels(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<OpenAiModel[]> {
+  const bases = resolveUpstream(env)
+  const machineId = await deriveDeviceId(ctx.uid, 'machine')
+  const sessionId = await deriveDeviceId(ctx.uid, 'session')
+
+  const res = await fetch(`${bases.chat}/v3/config`, {
+    method: 'GET',
+    headers: cliChatHeaders({
+      uid: ctx.uid,
+      machineId,
+      sessionId,
+      accessToken: ctx.accessToken,
+      conversationRequestId: crypto.randomUUID().replaceAll('-', ''),
+    }),
+    signal: AbortSignal.timeout(20_000),
+  })
+
+  if (!res.ok) throw new Error(`模型目录拉取失败：http=${res.status}`)
+  const payload = (await res.json()) as unknown
+  return extractModels(payload)
+}
+
+/**
+ * 从 `/v3/config` 响应里提取模型（**纯函数**，便于单测）。
+ *
+ * ## ⚠️ 路径是本文件最容易搞错的地方（已实测踩过一次）
+ *
+ * CN 域 `/v3/config` 的真实形状是 **`data.models[]`**（单层），
+ * 实测返回 **54 个模型**。最初按 `data.data.models`（双层）去取，
+ * 线上表现为 `GET /v1/models` **HTTP 200 但 models 为空数组** ——
+ * 没有报错、没有提示，只是「看起来这个账号没有模型」，极难排查。
+ *
+ * 双层形态确实存在于**另一**端点家族（global 域企业端点），
+ * 故这里同时兼容两种：先试 `data.models`，没有再看 `data.data.models`。
+ */
+export function extractModels(payload: unknown): OpenAiModel[] {
+  if (payload === null || typeof payload !== 'object') return []
+  const root = payload as Record<string, unknown>
+  const data = root.data
+  if (data === null || typeof data !== 'object') return []
+  const outer = data as Record<string, unknown>
+
+  // ① CN 域当前形态：data.models[]（已实测）
+  const direct = outer.models
+  if (Array.isArray(direct)) return mapModels(direct)
+
+  // ② 兼容双层形态：data.data.models[]
+  const inner = outer.data
+  if (inner !== null && typeof inner === 'object') {
+    const nested = (inner as Record<string, unknown>).models
+    if (Array.isArray(nested)) return mapModels(nested)
+  }
+
+  return []
+}
+
+/** 把上游模型条目映射成 OpenAI 形状（跳过无 id 的脏数据）。 */
+function mapModels(models: unknown[]): OpenAiModel[] {
+  const out: OpenAiModel[] = []
+  for (const raw of models) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const m = raw as Record<string, unknown>
+    const id = typeof m.id === 'string' ? m.id : ''
+    if (id === '') continue
+    out.push({
+      id,
+      object: 'model',
+      created: 0,
+      owned_by: 'workbuddy',
+      ...(typeof m.name === 'string' && m.name !== '' ? { name: m.name } : {}),
+    })
+  }
+  return out
+}

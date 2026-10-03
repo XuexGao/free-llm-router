@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+.build/
+*.log
+.dev.vars
+
+# 绝不提交任何真实凭据 / 密钥
+*.credentials.yaml
+creds*.json
+real_cred*.json
+.env
+.env.*

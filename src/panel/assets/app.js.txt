@@ -1,0 +1,315 @@
+/*
+ * 管理面板前端逻辑。
+ *
+ * ## 为什么是独立文件而不是内联 <script>
+ *
+ * 内联脚本会迫使 CSP 放开 `script-src 'unsafe-inline'`（详见 panel/index.ts）。
+ *
+ * ## 密钥怎么存
+ *
+ * 存在 localStorage，**每个请求带 Authorization 头**。
+ * 刻意不用 cookie：cookie 会被浏览器自动附带，需要额外 CSRF 防护；
+ * Authorization 头不会被自动附带，天然免疫 CSRF。
+ */
+'use strict'
+
+const $ = (id) => document.getElementById(id)
+
+/** 读取已保存的密钥。 */
+function apiKey() {
+  return localStorage.getItem('wb_api_key') || ''
+}
+
+/** 统一的鉴权请求封装（自动带密钥、自动提示 401）。 */
+async function api(path, options) {
+  const opts = Object.assign({}, options)
+  opts.headers = Object.assign({}, opts.headers, {
+    authorization: 'Bearer ' + apiKey(),
+  })
+  const res = await fetch(path, opts)
+  const text = await res.text()
+  let body
+  try { body = JSON.parse(text) } catch { body = text }
+  if (res.status === 401) {
+    setAuth('密钥无效或未设置', false)
+  }
+  return { status: res.status, ok: res.ok, body }
+}
+
+function setAuth(message, ok) {
+  const el = $('auth-status')
+  el.textContent = message
+  el.className = 'pill ' + (ok ? 'ok' : 'err')
+}
+
+function show(id, value) {
+  const el = $(id)
+  if (typeof value === 'string') { el.textContent = value; return }
+  el.textContent = JSON.stringify(value, null, 2)
+}
+
+// ─────────────────────── 账号 ───────────────────────
+
+async function loadAccounts() {
+  const realm = 'cn'
+  const res = await api('/admin/accounts?realm=' + encodeURIComponent(realm))
+  const box = $('accounts')
+  if (!res.ok) {
+    box.innerHTML = ''
+    show('accounts', res.body)
+    return
+  }
+  const accounts = (res.body && res.body.accounts) || []
+  const select = $('task-uid')
+  select.innerHTML = ''
+  if (accounts.length === 0) {
+    box.innerHTML = '<p class="hint">还没有账号。请先在下方「导入凭据」或「添加账号」。</p>'
+    return
+  }
+  box.innerHTML = ''
+  for (const a of accounts) {
+    const card = document.createElement('div')
+    card.className = 'card'
+
+    const left = document.createElement('div')
+    left.className = 'grow'
+    const name = document.createElement('strong')
+    name.textContent = a.nickname || '(无昵称)'
+    const uid = document.createElement('div')
+    uid.className = 'uid'
+    uid.textContent = a.uid
+    left.appendChild(name); left.appendChild(uid)
+    card.appendChild(left)
+
+    // 状态标签：禁用 / 冷却 / 正常
+    const tag = document.createElement('span')
+    const cooling = a.until && a.until > Date.now()
+    if (a.disabled) { tag.className = 'tag err'; tag.textContent = '已禁用' + (a.reason ? '：' + a.reason : '') }
+    else if (cooling) {
+      tag.className = 'tag warn'
+      const mins = Math.max(1, Math.round((a.until - Date.now()) / 60000))
+      tag.textContent = '冷却中（约 ' + mins + ' 分钟）'
+    } else { tag.className = 'tag ok'; tag.textContent = '正常' }
+    card.appendChild(tag)
+
+    const metrics = document.createElement('span')
+    metrics.className = 'metrics'
+    metrics.textContent = '成功 ' + a.successCount + ' / 错误 ' + a.errTotal +
+      (a.lastCheckinDay ? ' / 最近签到 ' + a.lastCheckinDay : '') +
+      (a.modelCooldowns && a.modelCooldowns.length ? ' / 模型冷却 ' + a.modelCooldowns.join(',') : '')
+    card.appendChild(metrics)
+
+    const del = document.createElement('button')
+    del.className = 'danger'
+    del.textContent = '删除'
+    del.onclick = async () => {
+      if (!confirm('删除账号 ' + a.uid + '（含凭据），不可恢复。确认？')) return
+      const r = await api('/admin/accounts/remove', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uid: a.uid, realm: realm, confirm: true }),
+      })
+      if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
+      loadAccounts()
+    }
+    card.appendChild(del)
+
+    box.appendChild(card)
+
+    const opt = document.createElement('option')
+    opt.value = a.uid
+    opt.textContent = (a.nickname || a.uid.slice(0, 12)) + (a.disabled ? '（已禁用）' : '')
+    select.appendChild(opt)
+  }
+}
+
+// ─────────────────────── 导入 ───────────────────────
+
+async function doImport() {
+  const raw = $('import-body').value.trim()
+  if (raw === '') { show('import-result', '请先粘贴凭据 JSON'); return }
+  let payload
+  try { payload = JSON.parse(raw) } catch (e) { show('import-result', 'JSON 解析失败：' + e.message); return }
+  const res = await api('/admin/import', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  show('import-result', res.body)
+  if (res.ok) { $('import-body').value = ''; loadAccounts() }
+}
+
+// ─────────────────────── 设备码登录 ───────────────────────
+
+let loginTimer = null
+
+async function doLogin() {
+  clearInterval(loginTimer)
+  const res = await api('/admin/login/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn' }),
+  })
+  if (!res.ok) { show('login-result', res.body); return }
+  const { authUrl, state } = res.body
+  // 用 DOM 构造链接而不是拼 innerHTML（避免把上游返回的 URL 当 HTML 解析）
+  const el = $('login-result')
+  el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…'
+  const a = document.createElement('a')
+  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+  a.textContent = '打开授权页面'
+  el.appendChild(document.createElement('br'))
+  el.appendChild(a)
+
+  // 轮询：每 3 秒查一次，最多 100 次（约 5 分钟，与 state 有效期一致）
+  let tries = 0
+  loginTimer = setInterval(async () => {
+    tries += 1
+    if (tries > 100) {
+      clearInterval(loginTimer)
+      el.textContent += '\n授权超时，请重新发起。'
+      return
+    }
+    const r = await api('/admin/login/poll?state=' + encodeURIComponent(state))
+    if (r.ok && r.body && r.body.done) {
+      clearInterval(loginTimer)
+      el.textContent = '授权成功，凭据已加密保存：' + (r.body.nickname || r.body.uid)
+      loadAccounts()
+    } else if (r.status === 404) {
+      clearInterval(loginTimer)
+      el.textContent += '\n该登录会话已过期，请重新发起。'
+    } else if (r.ok && r.body && r.body.message) {
+      el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
+    }
+  }, 3000)
+}
+
+// ─────────────────────── 任务 ───────────────────────
+
+async function runTask() {
+  const uid = $('task-uid').value
+  if (!uid) { show('task-status', '请先选择一个账号'); return }
+  const selected = $('task-plan').value
+  // 'growth-real' 是同一个 growth 计划 + 显式打开真实对话任务
+  const includeRealChat = selected === 'growth-real'
+  const plan = selected === 'daily' ? 'daily' : 'growth'
+  if (includeRealChat && !confirm('该计划会执行需要真实对话的任务，会消耗少量上游配额。继续？')) return
+  const res = await api('/admin/tasks/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ uid: uid, realm: 'cn', plan: plan, includeRealChat: includeRealChat }),
+  })
+  show('task-status', res.body)
+  if (res.ok) setTimeout(() => loadTaskStatus(true), 4000)
+}
+
+async function loadTaskStatus(continuePolling) {
+  const uid = $('task-uid').value
+  if (!uid) return
+  const res = await api('/admin/tasks/status?uid=' + encodeURIComponent(uid))
+  if (!res.ok) { show('task-status', res.body); return }
+  const status = res.body && res.body.status
+  if (!status) { show('task-status', '还没有运行记录'); return }
+
+  // 渲染成易读形式而不是原始 JSON：步骤多时原始 JSON 根本看不清
+  const lines = []
+  lines.push('状态：' + (status.finished ? '已完成' : '进行中') +
+    '｜队列剩余 ' + status.queue.length + '｜已完成 ' + status.done.length)
+  if (status.lastError) lines.push('最后错误：' + status.lastError)
+  lines.push('')
+  for (const item of status.done) {
+    lines.push((item.ok ? '✅ ' : '❌ ') + item.code + ' → ' + item.action)
+    if (item.detail) lines.push('     ' + item.detail)
+  }
+  show('task-status', lines.join('\n'))
+
+  // 未完成则继续轮询（面板是用来盯进度的）
+  if (continuePolling && !status.finished) setTimeout(() => loadTaskStatus(true), 5000)
+}
+
+// ─────────────────────── 模型 ───────────────────────
+
+async function loadModels() {
+  show('models', '加载中…')
+  const res = await api('/v1/models')
+  if (!res.ok) { show('models', res.body); return }
+  const data = (res.body && res.body.data) || []
+  const box = $('models')
+  box.innerHTML = ''
+  const table = document.createElement('table')
+  const head = document.createElement('tr')
+  for (const h of ['id', '名称']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
+  }
+  table.appendChild(head)
+  for (const m of data) {
+    const tr = document.createElement('tr')
+    const td1 = document.createElement('td'); td1.textContent = m.id
+    const td2 = document.createElement('td'); td2.textContent = m.name || ''
+    tr.appendChild(td1); tr.appendChild(td2)
+    table.appendChild(tr)
+  }
+  box.appendChild(table)
+  const note = document.createElement('p')
+  note.className = 'hint'
+  note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
+  box.appendChild(note)
+}
+
+// ─────────────────────── WAF 护栏状态 ───────────────────────
+
+async function loadWaf() {
+  const res = await api('/admin/waf?realm=cn')
+  const banner = $('waf-banner')
+  if (!res.ok || !res.body || !res.body.active) {
+    banner.hidden = true
+    return
+  }
+  banner.hidden = false
+  const remain = Math.max(0, Math.round(((res.body.until || 0) - Date.now()) / 1000))
+  $('waf-detail').textContent =
+    '已暂停账号轮转（约 ' + remain + ' 秒后自动恢复）。短窗内有 ' +
+    (res.body.recentUids || 0) + ' 个不同账号命中 403。'
+}
+
+$('clear-waf').onclick = async () => {
+  const r = await api('/admin/waf/clear', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn' }),
+  })
+  alert(r.ok ? '已解除' : '解除失败：' + JSON.stringify(r.body))
+  loadWaf()
+}
+
+// ─────────────────────── 初始化 ───────────────────────
+
+$('save-key').onclick = () => {
+  localStorage.setItem('wb_api_key', $('apikey').value.trim())
+  setAuth('已保存，正在验证…', true)
+  verify()
+}
+$('refresh-accounts').onclick = loadAccounts
+$('do-import').onclick = doImport
+$('do-login').onclick = doLogin
+$('run-task').onclick = runTask
+$('refresh-status').onclick = () => loadTaskStatus(false)
+$('load-models').onclick = loadModels
+
+async function verify() {
+  const res = await api('/admin/pool?realm=cn')
+  if (res.ok) {
+    setAuth('密钥有效', true)
+    loadAccounts()
+    loadWaf()
+    // 每 20 秒刷一次护栏状态（IP 级拦截是 60 秒窗口，20 秒够及时）
+    setInterval(loadWaf, 20000)
+  } else {
+    setAuth('密钥无效', false)
+  }
+}
+
+// 页面加载时：若已存密钥则自动验证
+$('apikey').value = apiKey()
+if (apiKey() !== '') verify()
+else setAuth('未设置密钥', false)

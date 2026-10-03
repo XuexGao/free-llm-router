@@ -1,0 +1,59 @@
+/* WorkBuddy Serverless 管理面板样式 */
+:root {
+  --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e9ef;
+  --dim: #9aa4b2; --accent: #4f8cff; --ok: #34c77b; --warn: #e0a33e; --err: #ef5f5f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+h2 { font-size: 14px; margin: 0 0 10px; display: flex; gap: 10px; align-items: center; }
+main { padding: 20px; max-width: 1080px; margin: 0 auto; display: grid; gap: 18px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+.auth { display: flex; gap: 8px; align-items: center; }
+input, select, textarea, button {
+  font: inherit; color: var(--text); background: #10131a;
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+}
+textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; }
+button { cursor: pointer; background: var(--accent); border-color: var(--accent); color: #fff; }
+button.ghost { background: transparent; border-color: var(--line); color: var(--text); }
+button:hover { filter: brightness(1.1); }
+button.danger { background: var(--err); border-color: var(--err); }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 10px; }
+.row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+.pill { font-size: 12px; color: var(--dim); }
+.pill.ok { color: var(--ok); } .pill.err { color: var(--err); }
+.hint { color: var(--dim); font-size: 12px; margin: 6px 0; }
+.out {
+  background: #0c0f14; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px; font-family: ui-monospace, monospace; font-size: 12px;
+  white-space: pre-wrap; word-break: break-word; max-height: 380px; overflow: auto;
+}
+.card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+}
+.card .uid { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); }
+.card .grow { flex: 1 1 220px; }
+.tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
+.tag.ok { color: var(--ok); border-color: #1e5b3a; }
+.tag.warn { color: var(--warn); border-color: #5b4a1e; }
+.tag.err { color: var(--err); border-color: #5b2424; }
+.metrics { color: var(--dim); font-size: 11px; font-family: ui-monospace, monospace; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-weight: 500; }
+
+.banner {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  background: #3a2020; border: 1px solid #5b2424; color: #ffd9d9;
+  border-radius: 10px; padding: 12px 16px; font-size: 13px;
+}
+.banner button { background: transparent; border-color: #7a3a3a; color: #ffd9d9; }

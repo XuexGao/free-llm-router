@@ -1,0 +1,53 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "workbuddy-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+
+  // ⚠️ 不启用 nodejs_compat：本项目按「纯 Web 标准」实现，不依赖任何 node 内置。
+  // 这是刻意的纪律——一旦引入 node:fs / node:child_process 之类，在 Workers 上
+  // 要么不可用、要么只是 stub，问题会推迟到运行时才暴露。
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "ACCOUNT_POOL", "class_name": "AccountPoolDO" },
+      { "name": "TASK_RUNNER", "class_name": "TaskRunnerDO" }
+    ]
+  },
+
+  // ⚠️ Free 计划只支持 SQLite 后端的 DO，必须用 new_sqlite_classes。
+  // 用 new_classes（KV 后端）在 Free 计划上会部署失败。
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AccountPoolDO", "TaskRunnerDO"]
+    }
+  ],
+
+  // ⚠️ **只占 1 个 cron 配额**（账户 Free 上限 5 个，实测已被其他 Worker 占 4 个）。
+  // 用「每小时触发一次 + Worker 内按时点分发」而不是「每个时点一条 cron」：
+  //   - 省配额（1 条 vs 3 条）；
+  //   - 改时点不用重新部署（改常量即可）。
+  // 分发逻辑见 src/index.ts 的 scheduled()。
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  // 面板静态资源以**字符串**形式 import（见 src/panel/index.ts 的说明）。
+  // 用 Text 模块规则而不是 Workers Static Assets：本项目只有 3 个文件，
+  // 且必须挂在 /panel/* 下并统一加安全头 —— Text import 更直接。
+  "rules": [
+    { "type": "Text", "fallthrough": true, "globs": ["src/panel/assets/*.js.txt", "src/panel/assets/*.css.txt"] }
+  ],
+
+  "vars": {
+    // 上游域名（CN 域）。global 域留作后续扩展。
+    "UPSTREAM_CHAT_BASE": "https://copilot.tencent.com",
+    "UPSTREAM_BILLING_BASE": "https://www.codebuddy.cn",
+    "UPSTREAM_WEB_BASE": "https://www.workbuddy.cn"
+  }
+}

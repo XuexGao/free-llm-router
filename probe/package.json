@@ -1,0 +1,17 @@
+{
+  "name": "workbuddy-egress-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy 出口 IP / WAF 前置验证探针（只读，不消耗配额）",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}
