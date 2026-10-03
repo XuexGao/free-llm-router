@@ -77,6 +77,16 @@ export interface TokenUsage {
 export interface AccountState {
   /** 上游 uid（账号主键）。 */
   uid: string
+  /**
+   * 供应商 id（`workbuddy` / `cline` / …）。
+   *
+   * ⚠️ 加这一维是**必须**的，不是锦上添花：不同供应商的 uid 空间互相独立，
+   * 且同一份凭据在不同供应商下语义完全不同（端点、鉴权、错误分类都不同）。
+   * 没有它就无法回答「这个号该用哪套协议」。
+   *
+   * 缺省值 `workbuddy` 是为了兼容升级前已存的账号（它们只可能是 WorkBuddy）。
+   */
+  provider: string
   /** 昵称（仅展示）。 */
   nickname: string
   /** 域：`cn` / `global`。 */
@@ -140,9 +150,12 @@ export function createAccountState(input: {
   uid: string
   nickname: string
   realm: string
+  /** 供应商 id。缺省 `workbuddy`（兼容升级前只可能是它）。 */
+  provider?: string
 }): AccountState {
   return {
     uid: input.uid,
+    provider: input.provider ?? 'workbuddy',
     nickname: input.nickname,
     realm: input.realm,
     disabled: false,
@@ -167,6 +180,66 @@ export function createAccountState(input: {
     credits: 0,
     creditsExpiring: 0,
     creditsEarliestExpiry: 0,
+  }
+}
+
+/**
+ * 把已存的 JSON 归一成完整 `AccountState`。
+ *
+ * ## 为什么需要它（而不是直接 `as AccountState`）
+ *
+ * 账号状态是**跨版本持久化**的：升级前存的记录里没有后来新增的字段。
+ * 直接断言类型会让那些字段变成 `undefined` —— 而 `undefined` 在布尔语境里
+ * 是 falsy、在算术里是 `NaN`，会在**很远的地方**引发难以定位的故障。
+ *
+ * 故每次从存储读出都过一遍这里，显式补默认值。
+ * 这与本项目「不静默接受坏数据」的纪律一致：宁可在这里补，也不要在业务逻辑里猜。
+ */
+export function normalizeAccountState(raw: unknown): AccountState | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const o = raw as Record<string, unknown>
+  const uid = typeof o.uid === 'string' ? o.uid : ''
+  if (uid === '') return undefined
+
+  const base = createAccountState({
+    uid,
+    nickname: typeof o.nickname === 'string' ? o.nickname : '',
+    realm: typeof o.realm === 'string' ? o.realm : 'cn',
+    // ⚠️ 升级前存的账号只可能是 WorkBuddy，故缺省值就是它
+    provider: typeof o.provider === 'string' && o.provider !== '' ? o.provider : 'workbuddy',
+  })
+
+  // 逐字段合并（只认类型正确的值，其余保留默认）
+  const num = (k: string, d: number): number => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : d)
+  const str = (k: string, d: string): string => (typeof o[k] === 'string' ? (o[k] as string) : d)
+  const bool = (k: string, d: boolean): boolean => (typeof o[k] === 'boolean' ? (o[k] as boolean) : d)
+  const obj = <T>(k: string, d: T): T =>
+    o[k] !== null && typeof o[k] === 'object' && !Array.isArray(o[k]) ? (o[k] as T) : d
+
+  return {
+    ...base,
+    disabled: bool('disabled', base.disabled),
+    reason: str('reason', base.reason),
+    until: num('until', base.until),
+    coolKind: str('coolKind', base.coolKind) as AccountState['coolKind'],
+    softStreak: num('softStreak', base.softStreak),
+    modelCooldowns: obj('modelCooldowns', base.modelCooldowns),
+    breakerUntil: num('breakerUntil', base.breakerUntil),
+    retryCount: num('retryCount', base.retryCount),
+    fails: num('fails', base.fails),
+    degradeUntil: num('degradeUntil', base.degradeUntil),
+    consecutiveFails: num('consecutiveFails', base.consecutiveFails),
+    sessionDeadFails: num('sessionDeadFails', base.sessionDeadFails),
+    successCount: num('successCount', base.successCount),
+    errTotal: num('errTotal', base.errTotal),
+    lastSuccess: num('lastSuccess', base.lastSuccess),
+    lastErr: num('lastErr', base.lastErr),
+    lastCheckinDay: str('lastCheckinDay', base.lastCheckinDay),
+    tokenUsage: obj('tokenUsage', base.tokenUsage),
+    modelCosts: obj('modelCosts', base.modelCosts),
+    credits: num('credits', base.credits),
+    creditsExpiring: num('creditsExpiring', base.creditsExpiring),
+    creditsEarliestExpiry: num('creditsEarliestExpiry', base.creditsEarliestExpiry),
   }
 }
 

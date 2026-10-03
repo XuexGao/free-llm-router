@@ -81,7 +81,7 @@ test('⚠️ CSS 返回真实样式内容（不是 [object Object]）', () => {
   assert.ok(asset?.contentType.includes('text/css'))
   assert.ok(!asset?.body.includes('[object Object]'), 'CSS 内容不得是 [object Object]')
   assert.ok(asset?.body.includes(':root'), 'CSS 应含真实样式')
-  assert.ok((asset?.body.length ?? 0) > 500, `CSS 内容过短（${asset?.body.length} 字节），疑似被错误处理`)
+  assert.ok((asset?.body.length ?? 0) > 2000, `CSS 内容过短（${asset?.body.length} 字节），疑似被错误处理`)
 })
 
 test('⚠️ JS 返回真实代码（可供浏览器执行）', () => {
@@ -90,7 +90,7 @@ test('⚠️ JS 返回真实代码（可供浏览器执行）', () => {
   assert.ok(asset?.contentType.includes('javascript'), '需声明 application/javascript 才能被浏览器执行')
   assert.ok(!asset?.body.includes('[object Object]'))
   assert.ok(asset?.body.includes('localStorage'), 'JS 应含真实逻辑')
-  assert.ok((asset?.body.length ?? 0) > 2000, `JS 内容过短（${asset?.body.length} 字节）`)
+  assert.ok((asset?.body.length ?? 0) > 8000, `JS 内容过短（${asset?.body.length} 字节）`)
 })
 
 test('未知路径返回 undefined（由调用方 404）', () => {
@@ -125,4 +125,39 @@ test('面板 HTML 不内联脚本（保 CSP 严格性）', () => {
   const inline = /<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/i.exec(html)
   assert.equal(inline, null, 'HTML 不得含内联脚本，否则 CSP 必须放开 unsafe-inline')
   assert.ok(html.includes('src="/panel/app.js"'), '应通过 src 引用脚本')
+})
+
+// ─────────────────── 面板可用性（用户报障后新增） ───────────────────
+
+test('⚠️ 面板必须有无密钥的引导（否则用户看到一片空白）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  // 必须有提示区块
+  assert.ok(html.includes('setup-hint'), 'HTML 应有引导区块')
+  assert.ok(html.includes('API_KEY'), '应提示用户填密钥')
+  // 且 JS 在无密钥时也要渲染视图（而不是 return 什么都不做）
+  assert.ok(/key === ''/.test(js) || /key === ""/.test(js), 'JS 应显式处理「无密钥」分支')
+  assert.ok(js.includes('switchView'), '无密钥时也应切换视图（让用户看到界面结构）')
+})
+
+test('⚠️ 面板必须有 8 个视图（对齐参考项目的信息密度）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const views = ['accounts', 'tasks', 'usage', 'packages', 'models', 'providers', 'config', 'logs']
+  for (const v of views) {
+    assert.ok(html.includes(`data-view="${v}"`), `缺少视图：${v}`)
+    assert.ok(html.includes(`id="view-${v}"`), `缺少视图容器：${v}`)
+  }
+})
+
+test('⚠️ 面板不得使用 innerHTML 拼外部数据（XSS）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  // 允许注释里提到 innerHTML，但不允许赋值
+  const assignments = js.match(/\.innerHTML\s*=/g) ?? []
+  assert.equal(assignments.length, 0, `发现 ${assignments.length} 处 innerHTML 赋值，应用 DOM API 构造`)
+})
+
+test('面板 JS 规模合理（不应该只是几十行的空壳）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const lines = js.split('\n').length
+  assert.ok(lines > 300, `面板 JS 只有 ${lines} 行，过薄（参考项目 2600+ 行）`)
 })

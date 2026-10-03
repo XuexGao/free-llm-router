@@ -26,6 +26,7 @@ for f in tests/*.test.ts; do
     --bundle --format=esm --platform=node \
     --external:cloudflare:workers \
     --loader:.html=text --loader:.css.txt=text --loader:.js.txt=text \
+    --loader:.wasm=file \
     --outfile="$OUT/$name.test.mjs" --log-level=warning
 done
 

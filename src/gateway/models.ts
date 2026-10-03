@@ -20,11 +20,20 @@ export interface OpenAiModel {
 export async function pickCredential(
   env: Env,
   realm: string,
+  /**
+   * 只要该供应商的账号。
+   *
+   * ⚠️ 这个过滤是**必须**的（实测踩到）：不带它时，一个「有 cline 账号、
+   * 没有 workbuddy 账号」的部署会把 cline 的凭据拿去打 WorkBuddy 的端点，
+   * 报的是上游 401 —— 看起来像「凭据坏了」，实际是选错了账号。
+   */
+  providerId = 'workbuddy',
 ): Promise<{ uid: string; credential: { accessToken: string } } | undefined> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await pool.listAccounts(realm, Date.now())
   for (const account of accounts) {
     if (account.disabled) continue
+    if ((account.provider ?? 'workbuddy') !== providerId) continue
     const credential = (await pool.getCredential(account.uid)) as { accessToken?: string } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
       return { uid: account.uid, credential: { accessToken: credential.accessToken } }

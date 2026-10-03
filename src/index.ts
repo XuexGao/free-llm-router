@@ -27,8 +27,20 @@ import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstrea
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleChatCompletions } from './gateway/server.js'
+import { fetchBalance } from './upstream/checkin.js'
+import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
 import { jsonError } from './gateway/http.js'
+import { bindWorkbuddy } from './providers/workbuddy.js'
+import {
+  DEFAULT_PROVIDER,
+  findProvider,
+  parseCredentialAnywhere,
+  providerCatalog,
+  providerIds,
+  PROVIDERS,
+} from './providers/index.js'
+import { splitModelName, type ProviderCredential } from './providers/types.js'
 import { panelAsset, securityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
@@ -77,7 +89,39 @@ async function authorized(request: Request, env: Env): Promise<boolean> {
 }
 
 /** 路由处理。 */
-async function handle(request: Request, env: Env): Promise<Response> {
+/**
+ * @param ctx Worker 的 ExecutionContext。
+ *
+ * ⚠️ **必须有它**：响应流结束后，Worker 会**取消所有未完成的 promise**。
+ * 用量记账发生在流结束时（`onFinish`），若不用 `ctx.waitUntil()` 托住，
+ * 它会被直接取消 —— 表现为「对话成功但用量恒为 0」，且**没有任何错误日志**
+ * （线上实测踩到；这正是本项目一直在警告的静默失败形态）。
+ */
+/**
+ * 把供应商登录拿到的凭据加密落盘（与 `/admin/import` 同一套 key 规则）。
+ *
+ * ⚠️ 存储 key 的加前缀规则必须与导入路径**完全一致**，
+ * 否则同一个账号会因为「登录进来」和「导入进来」而变成两条记录。
+ */
+async function persistProviderCredential(
+  env: Env,
+  pool: DurableObjectStub<AccountPoolDO>,
+  credential: ProviderCredential,
+  now: number,
+): Promise<Record<string, unknown>> {
+  const providerId = credential.provider
+  const storageUid = providerId === DEFAULT_PROVIDER ? credential.uid : `${providerId}:${credential.uid}`
+  const realm = credential.extras['realm'] ?? 'cn'
+  await pool.createAccount(
+    { uid: storageUid, nickname: credential.nickname, realm, provider: providerId },
+    now,
+  )
+  await pool.revive(storageUid, now)
+  await pool.putCredential(storageUid, credential, now)
+  return { done: true, provider: providerId, uid: storageUid, nickname: credential.nickname }
+}
+
+async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
 
@@ -205,6 +249,199 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json({ ok: true, removed: body.uid, realm })
   }
 
+  // ── 按供应商发起设备码登录 ──
+  //
+  // ⚠️ 只有**导出完整登录流程**（start + poll 两个函数）的供应商能走这里。
+  // 其余家即便声明了 `login: true` 也无法从本服务发起 —— 见各 provider 的
+  // `capabilities.loginBlockedReason`（这是刻意如实声明的，不是遗漏）。
+  if (path === '/admin/providers/login/start' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { provider?: string }
+    const providerId = body.provider ?? ''
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+
+    if (providerId === 'qoder') {
+      const { startQoderLogin } = await import('./providers/qoder.js')
+      const session = await startQoderLogin('qoder')
+      const state = crypto.randomUUID()
+      // 会话存 DO（**不返回 verifier 给前端**：那是换取令牌的秘密）
+      await pool.saveLoginSession(state, { provider: 'qoder', kind: 'qoder', session }, Date.now() + 15 * 60 * 1000)
+      return json({ ok: true, provider: 'qoder', state, authUrl: session.loginUrl })
+    }
+    if (providerId === 'zcode') {
+      const { startZcodeLogin } = await import('./providers/zcode.js')
+      const flow = await startZcodeLogin(AbortSignal.timeout(20_000))
+      const state = crypto.randomUUID()
+      await pool.saveLoginSession(state, { provider: 'zcode', kind: 'zcode', flow }, Date.now() + 15 * 60 * 1000)
+      return json({ ok: true, provider: 'zcode', state, authUrl: flow.authorizeUrl })
+    }
+    return jsonError(
+      501,
+      `供应商「${providerId}」不支持从本服务发起登录（${providerId === 'workbuddy' ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
+      'login_unsupported',
+    )
+  }
+
+  // ── 轮询供应商登录结果 ──
+  if (path === '/admin/providers/login/poll' && request.method === 'GET') {
+    const state = url.searchParams.get('state') ?? ''
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const saved = (await pool.getLoginSession(state, Date.now())) as
+      | { provider: string; kind: string; session?: unknown; flow?: unknown }
+      | undefined
+    if (saved === undefined) return json({ done: false, message: '会话不存在或已过期' })
+
+    const now = Date.now()
+    try {
+      if (saved.kind === 'qoder') {
+        const { pollQoderLogin } = await import('./providers/qoder.js')
+        const credential = await pollQoderLogin(saved.session as never, AbortSignal.timeout(20_000))
+        if (credential === undefined) return json({ done: false, message: '等待授权中…' })
+        return json(await persistProviderCredential(env, pool, credential, now))
+      }
+      if (saved.kind === 'zcode') {
+        const { pollZcodeLogin } = await import('./providers/zcode.js')
+        const credential = await pollZcodeLogin(saved.flow as never, AbortSignal.timeout(20_000))
+        if (credential === undefined) return json({ done: false, message: '等待授权中…' })
+        return json(await persistProviderCredential(env, pool, credential, now))
+      }
+    } catch (error) {
+      return json({ done: false, message: error instanceof Error ? error.message : String(error) })
+    }
+    return json({ done: false, message: '未知的会话类型' })
+  }
+
+  // ── 清除模型级冷却（「解冻」） ──
+  // ⚠️ 必须有的运维入口：模型级退避 6h 起步，而有些失败其实是**我方**问题
+  // （如模型名带前缀被上游判为「没有这个模型」），修好代码后不该再等 6 小时。
+  if (path === '/admin/cooldowns/clear' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string; model?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const cleared = await pool.clearModelCooldowns(realm, body.uid, body.model)
+    return json({ ok: true, realm, cleared })
+  }
+
+  // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
+  if (path === '/admin/providers' && request.method === 'GET') {
+    return json({ default: DEFAULT_PROVIDER, providers: providerCatalog() })
+  }
+
+  // ── 按供应商列模特（面板用） ──
+  if (path === '/admin/providers/models' && request.method === 'GET') {
+    const providerId = url.searchParams.get('provider') ?? DEFAULT_PROVIDER
+    const provider = findProvider(providerId)
+    if (provider === undefined) return jsonError(404, `未知供应商「${providerId}」`, 'unknown_provider')
+    if (!provider.capabilities.listModels) {
+      return json({ provider: providerId, models: [], note: '该供应商不支持列出模型' })
+    }
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const accounts = await pool.listAccounts('cn', Date.now())
+    const account = accounts.find((a) => (a.provider ?? 'workbuddy') === providerId)
+    if (account === undefined) {
+      return json({ provider: providerId, models: [], note: '没有该供应商的账号，无法拉取模型目录' })
+    }
+    const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+    if (credential === undefined) return jsonError(404, '该账号无凭据', 'no_credential')
+    const bound = providerId === 'workbuddy' ? bindWorkbuddy(env) : provider
+    try {
+      const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+      return json({ provider: providerId, models })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'list_models_failed')
+    }
+  }
+
+  // ── 用量统计 ──
+  if (path === '/admin/usage' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const summary = await pool.usageSummary()
+    return json({ realm, ...summary })
+  }
+  if (path === '/admin/usage/clear' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    await pool.clearUsage()
+    return json({ ok: true, realm })
+  }
+
+  // ── 请求日志 ──
+  if (path === '/admin/logs' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10)
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const logs = await pool.readLogs(Number.isFinite(limit) ? limit : 100)
+    return json({ realm, logs })
+  }
+  if (path === '/admin/logs/clear' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({})) as { realm?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    await pool.clearLogs()
+    return json({ ok: true, realm })
+  }
+
+  // ── 积分包（逐账号余额明细，实时查上游） ──
+  if (path === '/admin/packages' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const now = Date.now()
+    const out: Array<Record<string, unknown>> = []
+    // ⚠️ 串行查询：同时出站连接上限是 6，且并行打上游更容易触发风控
+    for (const a of accounts) {
+      const credential = (await pool.getCredential(a.uid)) as LoginCredential | undefined
+      if (credential === undefined) continue
+      try {
+        const b = await fetchBalance({ uid: a.uid, accessToken: credential.accessToken }, env, now)
+        out.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          total: b.total,
+          expiring: b.expiring,
+          earliestExpiry: b.earliestExpiry,
+          packages: b.packages,
+        })
+      } catch (error) {
+        out.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ realm, accounts: out })
+  }
+
+  // ── 任务总览（扫描全部账号的待办，只读） ──
+  if (path === '/admin/tasks/scan' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const out: Array<Record<string, unknown>> = []
+    for (const a of accounts) {
+      const credential = (await pool.getCredential(a.uid)) as LoginCredential | undefined
+      if (credential === undefined) { out.push({ uid: a.uid, error: '无凭据' }); continue }
+      try {
+        const tasks = await listTasks({ uid: a.uid, accessToken: credential.accessToken, realm }, env)
+        const pending = tasks.filter((t) => !t.claimed)
+        out.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          total: tasks.length,
+          pendingCount: pending.length,
+          claimable: tasks.filter((t) => t.claimable).map((t) => t.taskCode),
+          pending: pending.map((t) => `${t.taskCode}(${t.current}/${t.target})`),
+        })
+      } catch (error) {
+        out.push({ uid: a.uid, error: error instanceof Error ? error.message : String(error) })
+      }
+    }
+    return json({ realm, accounts: out })
+  }
+
   // ── IP 级 WAF 护栏状态（面板要能看出「是不是 IP 被拦了」） ──
   if (path === '/admin/waf' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
@@ -233,6 +470,14 @@ async function handle(request: Request, env: Env): Promise<Response> {
       return json({ error: { message: '请求体必须是合法 JSON', type: 'invalid_json' } }, 400)
     }
 
+    // 允许显式声明供应商（`{"provider":"cline","accounts":[...]}`）；
+    // 未声明时按特征自动识别（见 parseCredentialAnywhere 的顺序说明）。
+    let declaredProvider: string | undefined
+    if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
+      const p = (payload as Record<string, unknown>).provider
+      if (typeof p === 'string' && p !== '') declaredProvider = p
+    }
+
     let entries: Array<{ raw: unknown; source?: string }>
     try {
       entries = parseAuthPayload(payload)
@@ -244,14 +489,21 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
 
     const now = Date.now()
-    const imported: Array<{ uid: string; nickname: string; realm: string; expiresAt: number }> = []
+    const imported: Array<{ uid: string; provider: string; nickname: string; realm: string; expiresAt: number }> = []
     const skipped: Array<{ reason: string; source?: string }> = []
 
     for (const entry of entries) {
       // 逐条独立：单条坏文件不应影响其他条
-      let credential: LoginCredential
+      //
+      // ⚠️ 多供应商后不再直接调 WorkBuddy 的 `parseAuthDocument` ——
+      // 那会把 cline 等供应商的凭据也当成 WorkBuddy 存下来，
+      // 表现为「导入成功但一用就 401」。
+      let providerId: string
+      let credential: ProviderCredential
       try {
-        credential = parseAuthDocument(entry.raw, entry.source)
+        const found = parseCredentialAnywhere(entry.raw, declaredProvider)
+        providerId = found.provider.id
+        credential = found.credential
       } catch (error) {
         skipped.push({
           reason: error instanceof Error ? error.message : String(error),
@@ -259,6 +511,8 @@ async function handle(request: Request, env: Env): Promise<Response> {
         })
         continue
       }
+
+      const realmOf = credential.extras['realm'] ?? 'cn'
 
       // 安全边界：uid 会被用作 storage key
       if (!isValidUid(credential.uid)) {
@@ -269,14 +523,19 @@ async function handle(request: Request, env: Env): Promise<Response> {
         continue
       }
 
-      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(credential.realm))
+      // ⚠️ 存储 key 加供应商前缀。
+      // 不同供应商的 uid 空间互相独立，可能出现同 uid 不同家的情况；
+      // 不加前缀会互相覆盖凭据（表现为「导入 B 家后 A 家坏了」）。
+      const storageUid = providerId === DEFAULT_PROVIDER ? credential.uid : `${providerId}:${credential.uid}`
+
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realmOf))
       try {
         await pool.createAccount(
-          { uid: credential.uid, nickname: credential.nickname, realm: credential.realm },
+          { uid: storageUid, nickname: credential.nickname, realm: realmOf, provider: providerId },
           now,
         )
-        await pool.revive(credential.uid, now)
-        await pool.putCredential(credential.uid, credential, now)
+        await pool.revive(storageUid, now)
+        await pool.putCredential(storageUid, credential, now)
       } catch (error) {
         // 典型：未配置 CREDENTIAL_KEY → 明确报错而不是静默明文落盘
         skipped.push({
@@ -287,9 +546,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
       }
 
       imported.push({
-        uid: credential.uid,
+        uid: storageUid,
+        provider: providerId,
         nickname: credential.nickname,
-        realm: credential.realm,
+        realm: realmOf,
         expiresAt: credential.expiresAt,
       })
     }
@@ -433,11 +693,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
   // ── OpenAI 兼容：模型列表 ──
   if (path === '/v1/models' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const picked = await pickCredential(env, realm)
+    const picked = await pickCredential(env, realm, DEFAULT_PROVIDER)
     if (picked === undefined) {
       return jsonError(
         503,
-        '没有可用账号（请先通过 /admin/login/start 登录或 /admin/import 导入凭据）',
+        `没有可用的 ${DEFAULT_PROVIDER} 账号（请先通过 /admin/login/start 登录或 /admin/import 导入凭据）`,
         'no_available_account',
       )
     }
@@ -446,7 +706,17 @@ async function handle(request: Request, env: Env): Promise<Response> {
         { uid: picked.uid, accessToken: picked.credential.accessToken },
         env,
       )
-      return json({ object: 'list', data: models })
+      // ⚠️ 同时暴露**裸名**与 **`provider/` 前缀名**：
+      // - 裸名保持既有用户兼容（他们已经在用 `deepseek-v4-flash`）；
+      // - 带前缀名让多供应商场景无歧义（多家可能有同名模型）。
+      // 只暴露前缀会破坏兼容性；只暴露裸名则多供应商重名时无法区分。
+      const data: Array<Record<string, unknown>> = []
+      for (const m of models) {
+        const base = m as unknown as Record<string, unknown>
+        data.push(base)
+        data.push({ ...base, id: `${DEFAULT_PROVIDER}/${m.id}` })
+      }
+      return json({ object: 'list', data })
     } catch (error) {
       return jsonError(
         502,
@@ -459,7 +729,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
   // ── OpenAI 兼容：对话（**流式 SSE 透传**） ──
   if (path === '/v1/chat/completions' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const result = await handleChatCompletions(request, env, realm)
+    const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
     return result.response

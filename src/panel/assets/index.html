@@ -8,13 +8,23 @@
 </head>
 <body>
 <header>
-  <h1>WorkBuddy Serverless</h1>
+  <div class="brand"><h1>WorkBuddy Serverless</h1><span id="auth-status" class="pill"></span></div>
   <div class="auth">
     <input id="apikey" type="password" placeholder="API_KEY" autocomplete="off">
     <button id="save-key">保存密钥</button>
-    <span id="auth-status" class="pill"></span>
   </div>
 </header>
+
+<nav id="nav">
+  <button class="nav-item active" data-view="accounts">账号池</button>
+  <button class="nav-item" data-view="tasks">任务中心</button>
+  <button class="nav-item" data-view="usage">用量</button>
+  <button class="nav-item" data-view="packages">积分包</button>
+  <button class="nav-item" data-view="models">模型</button>
+  <button class="nav-item" data-view="providers">供应商</button>
+  <button class="nav-item" data-view="config">配置</button>
+  <button class="nav-item" data-view="logs">日志</button>
+</nav>
 
 <main>
   <div id="waf-banner" class="banner" hidden>
@@ -23,45 +33,118 @@
     <button id="clear-waf" class="ghost">立即解除</button>
   </div>
 
-  <section id="sec-accounts">
-    <h2>账号池 <button id="refresh-accounts" class="ghost">刷新</button></h2>
+  <div id="setup-hint" class="notice" hidden>
+    <strong>请先在右上角填入 API_KEY</strong>
+    <p>密钥用于访问本服务的管理接口。填好后点「保存密钥」，页面会自动加载数据。</p>
+    <p class="hint">密钥存在浏览器 localStorage，每个请求通过 <code>Authorization</code> 头发送（不用 cookie，因此免疫 CSRF）。</p>
+  </div>
+
+  <!-- ───────── 账号池 ───────── -->
+  <section class="view" id="view-accounts">
+    <h2>账号池 <button class="ghost" id="refresh-accounts">刷新</button></h2>
+    <div id="pool-counts" class="counts"></div>
     <div id="accounts"></div>
+
     <details>
       <summary>导入凭据</summary>
-      <p class="hint">支持 Go 版 <code>auths/*.json</code>（嵌套形/扁平形）与 DSH 插件
-      <code>.credentials.yaml</code> 里的 snake_case 形态。可粘贴单个对象、数组，或 <code>{"accounts":[...]}</code>。</p>
-      <textarea id="import-body" rows="6" placeholder='{"auth":{"accessToken":"...","expiresAt":1699999999},"account":{"uid":"...","nickname":"..."}}'></textarea>
+      <p class="hint">支持 Go 版 <code>auths/*.json</code>（嵌套形 / 扁平形）与 DSH 插件的 snake_case 形态。
+      可粘贴单个对象、数组，或 <code>{"accounts":[...]}</code>。</p>
+      <textarea id="import-body" rows="6" placeholder='{"accessToken":"...","uid":"...","expiresAt":1699999999}'></textarea>
       <button id="do-import">导入</button>
       <pre id="import-result" class="out"></pre>
     </details>
+
     <details>
       <summary>添加账号（设备码登录）</summary>
-      <p class="hint">点击后会在下方给出授权链接，在浏览器打开完成授权；本页会自动轮询结果。</p>
+      <p class="hint">点击后给出授权链接，在浏览器完成授权；本页自动轮询结果。
+      只有「支持从本服务发起登录」的供应商能在这里选（其余家请导出凭据后导入）。</p>
+      <div class="row">
+        <label>供应商
+          <select id="login-provider">
+            <option value="workbuddy">WorkBuddy（腾讯）</option>
+          </select>
+        </label>
+      </div>
       <button id="do-login">发起登录</button>
       <pre id="login-result" class="out"></pre>
     </details>
   </section>
 
-  <section id="sec-tasks">
-    <h2>任务</h2>
+  <!-- ───────── 任务中心 ───────── -->
+  <section class="view" id="view-tasks" hidden>
+    <h2>任务中心</h2>
     <div class="row">
       <label>账号 <select id="task-uid"></select></label>
       <label>计划
         <select id="task-plan">
           <option value="daily">daily（签到 + 余额）</option>
           <option value="growth">growth（零消耗成长任务）</option>
-          <option value="growth-real">growth + 真实对话任务（⚠️ 消耗配额）</option>
+          <option value="growth-real">growth + 真实对话（⚠️ 消耗配额）</option>
         </select>
       </label>
       <button id="run-task">执行</button>
       <button id="refresh-status" class="ghost">查进度</button>
     </div>
+    <div class="row">
+      <button id="scan-all" class="ghost">扫描全部账号待办</button>
+      <button id="run-all" class="ghost">对全部账号跑 daily</button>
+    </div>
     <pre id="task-status" class="out"></pre>
+    <div id="scan-result" class="out" hidden></div>
   </section>
 
-  <section id="sec-models">
-    <h2>模型目录 <button id="load-models" class="ghost">加载</button></h2>
+  <!-- ───────── 用量 ───────── -->
+  <section class="view" id="view-usage" hidden>
+    <h2>用量 <button class="ghost" id="refresh-usage">刷新</button>
+      <button class="ghost" id="clear-usage">清空</button></h2>
+    <div id="usage-summary" class="counts"></div>
+    <h3>按小时</h3>
+    <div id="usage-hours" class="bars"></div>
+    <h3>按模型</h3>
+    <div id="usage-models"></div>
+    <h3>按账号</h3>
+    <div id="usage-accounts"></div>
+  </section>
+
+  <!-- ───────── 积分包 ───────── -->
+  <section class="view" id="view-packages" hidden>
+    <h2>积分包 <button class="ghost" id="refresh-packages">实时查询</button></h2>
+    <p class="hint">逐账号实时查上游余额（串行，避免触发风控）。</p>
+    <div id="packages"></div>
+  </section>
+
+  <!-- ───────── 模型 ───────── -->
+  <section class="view" id="view-models" hidden>
+    <h2>模型目录 <button class="ghost" id="load-models">加载</button></h2>
     <div id="models" class="out"></div>
+  </section>
+
+  <!-- ───────── 供应商 ───────── -->
+  <section class="view" id="view-providers" hidden>
+    <h2>供应商 <button class="ghost" id="refresh-providers">刷新</button></h2>
+    <p class="hint">每家的能力由代码显式声明（不是猜测）。声明不可用的会说清原因与替代做法。</p>
+    <div id="providers"></div>
+    <h3>按供应商标识导入</h3>
+    <p class="hint">粘贴凭据时可在 JSON 顶层加 <code>"provider":"cline"</code> 显式声明归属；
+    不加则按凭据特征自动识别（WorkBuddy 最后试，因为它的解析最宽松）。</p>
+    <div class="row">
+      <label>供应商
+        <select id="import-provider"><option value="">自动识别</option></select>
+      </label>
+    </div>
+  </section>
+
+  <!-- ───────── 配置 ───────── -->
+  <section class="view" id="view-config" hidden>
+    <h2>配置与状态</h2>
+    <div id="config"></div>
+  </section>
+
+  <!-- ───────── 日志 ───────── -->
+  <section class="view" id="view-logs" hidden>
+    <h2>请求日志 <button class="ghost" id="refresh-logs">刷新</button>
+      <button class="ghost" id="clear-logs">清空</button></h2>
+    <div id="logs" class="out"></div>
   </section>
 </main>
 

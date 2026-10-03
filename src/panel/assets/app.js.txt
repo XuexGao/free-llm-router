@@ -1,15 +1,13 @@
 /*
  * 管理面板前端逻辑。
  *
- * ## 为什么是独立文件而不是内联 <script>
+ * ## 两个关键设计（都是踩过坑才这样写的）
  *
- * 内联脚本会迫使 CSP 放开 `script-src 'unsafe-inline'`（详见 panel/index.ts）。
+ * 1. **无密钥时也要有内容** —— 早期版本在没输密钥时什么都不加载，
+ *    页面一片空白，用户以为「坏了」。现在显式显示「请填密钥」的引导卡片。
  *
- * ## 密钥怎么存
- *
- * 存在 localStorage，**每个请求带 Authorization 头**。
- * 刻意不用 cookie：cookie 会被浏览器自动附带，需要额外 CSRF 防护；
- * Authorization 头不会被自动附带，天然免疫 CSRF。
+ * 2. **密钥用 Authorization 头，不用 cookie** —— cookie 会被浏览器自动附带，
+ *    需要额外的 CSRF 防护；Authorization 头不会，天然免疫。
  */
 'use strict'
 
@@ -20,20 +18,24 @@ function apiKey() {
   return localStorage.getItem('wb_api_key') || ''
 }
 
-/** 统一的鉴权请求封装（自动带密钥、自动提示 401）。 */
+/**
+ * 统一的鉴权请求封装。
+ * 401 时不抛错，而是返回 `{status:401}` 让调用方决定怎么提示。
+ */
 async function api(path, options) {
   const opts = Object.assign({}, options)
-  opts.headers = Object.assign({}, opts.headers, {
-    authorization: 'Bearer ' + apiKey(),
-  })
-  const res = await fetch(path, opts)
+  opts.headers = Object.assign({}, opts.headers, { authorization: 'Bearer ' + apiKey() })
+  let res
+  try {
+    res = await fetch(path, opts)
+  } catch (e) {
+    return { status: 0, ok: false, body: '网络错误：' + e.message }
+  }
   const text = await res.text()
   let body
   try { body = JSON.parse(text) } catch { body = text }
-  if (res.status === 401) {
-    setAuth('密钥无效或未设置', false)
-  }
-  return { status: res.status, ok: res.ok, body }
+  if (res.status === 401) setAuth('密钥无效或未设置', false)
+  return { status: res.status, ok: res.ok, body: body }
 }
 
 function setAuth(message, ok) {
@@ -48,25 +50,107 @@ function show(id, value) {
   el.textContent = JSON.stringify(value, null, 2)
 }
 
-// ─────────────────────── 账号 ───────────────────────
+/** 清空元素（比 innerHTML='' 更明确，且不解析 HTML）。 */
+function clear(el) { while (el.firstChild) el.removeChild(el.firstChild) }
+
+/** 建一个计数块。 */
+function countBlock(label, value) {
+  const d = document.createElement('div')
+  d.className = 'count'
+  const b = document.createElement('b'); b.textContent = String(value)
+  const s = document.createElement('span'); s.textContent = label
+  d.appendChild(b); d.appendChild(s)
+  return d
+}
+
+/** 建一个表格。`cols` 是列名，`rows` 是二维数组；数字列右对齐。 */
+function buildTable(cols, rows, numericFrom) {
+  const t = document.createElement('table')
+  const head = document.createElement('tr')
+  cols.forEach((c, i) => {
+    const th = document.createElement('th')
+    th.textContent = c
+    if (numericFrom !== undefined && i >= numericFrom) th.className = 'num'
+    head.appendChild(th)
+  })
+  t.appendChild(head)
+  for (const r of rows) {
+    const tr = document.createElement('tr')
+    r.forEach((cell, i) => {
+      const td = document.createElement('td')
+      td.textContent = String(cell)
+      if (numericFrom !== undefined && i >= numericFrom) td.className = 'num'
+      tr.appendChild(td)
+    })
+    t.appendChild(tr)
+  }
+  return t
+}
+
+// ─────────────────────────── 视图切换 ───────────────────────────
+
+const VIEW_LOADERS = {
+  accounts: () => { loadPool(); loadAccounts() },
+  tasks: () => { loadAccounts() },
+  usage: () => loadUsage(),
+  packages: () => { /* 手动触发（实时查上游，有成本） */ },
+  models: () => { /* 手动触发 */ },
+  providers: () => loadProviders(),
+  config: () => loadConfig(),
+  logs: () => loadLogs(),
+}
+
+function switchView(name) {
+  for (const btn of document.querySelectorAll('.nav-item')) {
+    btn.classList.toggle('active', btn.dataset.view === name)
+  }
+  for (const sec of document.querySelectorAll('section.view')) {
+    sec.hidden = sec.id !== 'view-' + name
+  }
+  localStorage.setItem('wb_view', name)
+  const loader = VIEW_LOADERS[name]
+  if (loader && apiKey() !== '') loader()
+}
+
+// ─────────────────────────── 账号池 ───────────────────────────
+
+async function loadPool() {
+  const res = await api('/admin/pool?realm=cn')
+  const box = $('pool-counts')
+  clear(box)
+  if (!res.ok || !res.body || !res.body.counts) return
+  const c = res.body.counts
+  box.appendChild(countBlock('总账号', c.total))
+  box.appendChild(countBlock('可用', c.healthy))
+  box.appendChild(countBlock('冷却中', c.cooling))
+  box.appendChild(countBlock('模型限流', c.modelExempt))
+  box.appendChild(countBlock('已禁用', c.disabled))
+}
 
 async function loadAccounts() {
-  const realm = 'cn'
-  const res = await api('/admin/accounts?realm=' + encodeURIComponent(realm))
+  const res = await api('/admin/accounts?realm=cn')
   const box = $('accounts')
-  if (!res.ok) {
-    box.innerHTML = ''
-    show('accounts', res.body)
-    return
-  }
-  const accounts = (res.body && res.body.accounts) || []
+  clear(box)
   const select = $('task-uid')
-  select.innerHTML = ''
-  if (accounts.length === 0) {
-    box.innerHTML = '<p class="hint">还没有账号。请先在下方「导入凭据」或「添加账号」。</p>'
+  clear(select)
+
+  if (!res.ok) {
+    const p = document.createElement('p')
+    p.className = 'hint'
+    p.textContent = '加载账号失败（401 = 密钥无效）'
+    box.appendChild(p)
     return
   }
-  box.innerHTML = ''
+
+  const accounts = (res.body && res.body.accounts) || []
+  if (accounts.length === 0) {
+    const p = document.createElement('p')
+    p.className = 'hint'
+    p.textContent = '还没有账号。请在下方「导入凭据」或「添加账号」。'
+    box.appendChild(p)
+    return
+  }
+
   for (const a of accounts) {
     const card = document.createElement('div')
     card.className = 'card'
@@ -81,22 +165,21 @@ async function loadAccounts() {
     left.appendChild(name); left.appendChild(uid)
     card.appendChild(left)
 
-    // 状态标签：禁用 / 冷却 / 正常
     const tag = document.createElement('span')
     const cooling = a.until && a.until > Date.now()
     if (a.disabled) { tag.className = 'tag err'; tag.textContent = '已禁用' + (a.reason ? '：' + a.reason : '') }
     else if (cooling) {
       tag.className = 'tag warn'
-      const mins = Math.max(1, Math.round((a.until - Date.now()) / 60000))
-      tag.textContent = '冷却中（约 ' + mins + ' 分钟）'
+      tag.textContent = '冷却中（约 ' + Math.max(1, Math.round((a.until - Date.now()) / 60000)) + ' 分钟）'
     } else { tag.className = 'tag ok'; tag.textContent = '正常' }
     card.appendChild(tag)
 
     const metrics = document.createElement('span')
     metrics.className = 'metrics'
-    metrics.textContent = '成功 ' + a.successCount + ' / 错误 ' + a.errTotal +
-      (a.lastCheckinDay ? ' / 最近签到 ' + a.lastCheckinDay : '') +
-      (a.modelCooldowns && a.modelCooldowns.length ? ' / 模型冷却 ' + a.modelCooldowns.join(',') : '')
+    const bits = ['成功 ' + a.successCount, '错误 ' + a.errTotal]
+    if (a.lastCheckinDay) bits.push('签到 ' + a.lastCheckinDay)
+    if (a.modelCooldowns && a.modelCooldowns.length) bits.push('模型冷却 ' + a.modelCooldowns.join(','))
+    metrics.textContent = bits.join(' · ')
     card.appendChild(metrics)
 
     const del = document.createElement('button')
@@ -107,10 +190,10 @@ async function loadAccounts() {
       const r = await api('/admin/accounts/remove', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ uid: a.uid, realm: realm, confirm: true }),
+        body: JSON.stringify({ uid: a.uid, realm: 'cn', confirm: true }),
       })
       if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
-      loadAccounts()
+      loadAccounts(); loadPool()
     }
     card.appendChild(del)
 
@@ -123,37 +206,46 @@ async function loadAccounts() {
   }
 }
 
-// ─────────────────────── 导入 ───────────────────────
+// ─────────────────────────── 导入 / 登录 ───────────────────────────
 
 async function doImport() {
   const raw = $('import-body').value.trim()
   if (raw === '') { show('import-result', '请先粘贴凭据 JSON'); return }
   let payload
   try { payload = JSON.parse(raw) } catch (e) { show('import-result', 'JSON 解析失败：' + e.message); return }
+  // 显式声明的供应商（可选）会写进 payload 顶层，让后端只试那一家
+  const declared = $('import-provider') ? $('import-provider').value : ''
+  if (declared && payload !== null && typeof payload === 'object' && !Array.isArray(payload) && !payload.provider) {
+    payload = Object.assign({}, payload, { provider: declared })
+  }
   const res = await api('/admin/import', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   })
   show('import-result', res.body)
-  if (res.ok) { $('import-body').value = ''; loadAccounts() }
+  if (res.ok) { $('import-body').value = ''; loadAccounts(); loadPool() }
 }
-
-// ─────────────────────── 设备码登录 ───────────────────────
 
 let loginTimer = null
 
 async function doLogin() {
-  clearInterval(loginTimer)
-  const res = await api('/admin/login/start', {
+  if (loginTimer) clearInterval(loginTimer)
+  const providerId = $('login-provider') ? $('login-provider').value : 'workbuddy'
+  // workbuddy 走既有端点；其它供应商走通用端点
+  const endpoint = providerId === 'workbuddy' ? '/admin/login/start' : '/admin/providers/login/start'
+  const res = await api(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ realm: 'cn' }),
+    body: JSON.stringify({ realm: 'cn', provider: providerId }),
   })
   if (!res.ok) { show('login-result', res.body); return }
-  const { authUrl, state } = res.body
-  // 用 DOM 构造链接而不是拼 innerHTML（避免把上游返回的 URL 当 HTML 解析）
+  const authUrl = res.body.authUrl
+  const state = res.body.state
+
+  // 用 DOM API 构造（不把上游返回的 URL 拼进 innerHTML —— 那有注入风险）
   const el = $('login-result')
+  clear(el)
   el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…'
   const a = document.createElement('a')
   a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
@@ -161,20 +253,16 @@ async function doLogin() {
   el.appendChild(document.createElement('br'))
   el.appendChild(a)
 
-  // 轮询：每 3 秒查一次，最多 100 次（约 5 分钟，与 state 有效期一致）
   let tries = 0
   loginTimer = setInterval(async () => {
     tries += 1
-    if (tries > 100) {
-      clearInterval(loginTimer)
-      el.textContent += '\n授权超时，请重新发起。'
-      return
-    }
-    const r = await api('/admin/login/poll?state=' + encodeURIComponent(state))
+    if (tries > 100) { clearInterval(loginTimer); el.textContent += '\n授权超时，请重新发起。'; return }
+    const pollPath = providerId === 'workbuddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
+    const r = await api(pollPath + '?state=' + encodeURIComponent(state))
     if (r.ok && r.body && r.body.done) {
       clearInterval(loginTimer)
       el.textContent = '授权成功，凭据已加密保存：' + (r.body.nickname || r.body.uid)
-      loadAccounts()
+      loadAccounts(); loadPool()
     } else if (r.status === 404) {
       clearInterval(loginTimer)
       el.textContent += '\n该登录会话已过期，请重新发起。'
@@ -184,13 +272,12 @@ async function doLogin() {
   }, 3000)
 }
 
-// ─────────────────────── 任务 ───────────────────────
+// ─────────────────────────── 任务中心 ───────────────────────────
 
 async function runTask() {
   const uid = $('task-uid').value
   if (!uid) { show('task-status', '请先选择一个账号'); return }
   const selected = $('task-plan').value
-  // 'growth-real' 是同一个 growth 计划 + 显式打开真实对话任务
   const includeRealChat = selected === 'growth-real'
   const plan = selected === 'daily' ? 'daily' : 'growth'
   if (includeRealChat && !confirm('该计划会执行需要真实对话的任务，会消耗少量上游配额。继续？')) return
@@ -211,7 +298,7 @@ async function loadTaskStatus(continuePolling) {
   const status = res.body && res.body.status
   if (!status) { show('task-status', '还没有运行记录'); return }
 
-  // 渲染成易读形式而不是原始 JSON：步骤多时原始 JSON 根本看不清
+  // 渲染成易读的逐步清单（原始 JSON 在步骤多时根本看不清）
   const lines = []
   lines.push('状态：' + (status.finished ? '已完成' : '进行中') +
     '｜队列剩余 ' + status.queue.length + '｜已完成 ' + status.done.length)
@@ -223,48 +310,290 @@ async function loadTaskStatus(continuePolling) {
   }
   show('task-status', lines.join('\n'))
 
-  // 未完成则继续轮询（面板是用来盯进度的）
   if (continuePolling && !status.finished) setTimeout(() => loadTaskStatus(true), 5000)
 }
 
-// ─────────────────────── 模型 ───────────────────────
+async function scanAll() {
+  const box = $('scan-result')
+  box.hidden = false
+  show('scan-result', '扫描中（逐账号串行查询上游）…')
+  const res = await api('/admin/tasks/scan', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn' }),
+  })
+  if (!res.ok) { show('scan-result', res.body); return }
+  const lines = []
+  for (const a of (res.body.accounts || [])) {
+    lines.push('【' + (a.nickname || a.uid) + '】' + a.uid)
+    if (a.error) { lines.push('  错误：' + a.error); continue }
+    lines.push('  共 ' + a.total + ' 个任务，未领 ' + a.pendingCount + ' 个')
+    if (a.claimable && a.claimable.length) lines.push('  可领奖：' + a.claimable.join('、'))
+    if (a.pending && a.pending.length) lines.push('  未领：' + a.pending.join('、'))
+    lines.push('')
+  }
+  show('scan-result', lines.join('\n'))
+}
+
+async function runAllDaily() {
+  const res = await api('/admin/accounts?realm=cn')
+  const accounts = (res.body && res.body.accounts) || []
+  if (accounts.length === 0) { alert('没有账号'); return }
+  if (!confirm('对全部 ' + accounts.length + ' 个账号跑 daily 计划？')) return
+  for (const a of accounts) {
+    await api('/admin/tasks/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: a.uid, realm: 'cn', plan: 'daily' }),
+    })
+  }
+  show('task-status', '已对 ' + accounts.length + ' 个账号入队 daily 计划，稍后查看各自进度。')
+}
+
+// ─────────────────────────── 用量 ───────────────────────────
+
+async function loadUsage() {
+  const res = await api('/admin/usage?realm=cn')
+  if (!res.ok) return
+  const d = res.body
+
+  const box = $('usage-summary')
+  clear(box)
+  box.appendChild(countBlock('总请求', d.total))
+  box.appendChild(countBlock('成功', d.ok))
+  box.appendChild(countBlock('失败', d.failed))
+  box.appendChild(countBlock('输入 token', d.inputTokens))
+  box.appendChild(countBlock('输出 token', d.outputTokens))
+  box.appendChild(countBlock('平均耗时 ms', d.avgMs))
+
+  // 按小时（柱状）
+  const hours = $('usage-hours')
+  clear(hours)
+  const maxCount = Math.max(1, ...(d.byHour || []).map((h) => h.count))
+  for (const h of (d.byHour || [])) {
+    const row = document.createElement('div'); row.className = 'bar-row'
+    const label = document.createElement('span'); label.className = 'bar-label'; label.textContent = h.hour
+    const track = document.createElement('div'); track.className = 'bar-track'
+    const fill = document.createElement('div')
+    fill.className = 'bar-fill' + (h.failed > 0 ? ' bad' : '')
+    fill.style.width = Math.round((h.count / maxCount) * 100) + '%'
+    track.appendChild(fill)
+    const val = document.createElement('span'); val.className = 'bar-val'
+    val.textContent = h.count + (h.failed ? ' / ' + h.failed : '')
+    row.appendChild(label); row.appendChild(track); row.appendChild(val)
+    hours.appendChild(row)
+  }
+  if ((d.byHour || []).length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '还没有请求记录（用 /v1/chat/completions 发一次对话就会出现）'
+    hours.appendChild(p)
+  }
+
+  const models = $('usage-models'); clear(models)
+  if ((d.byModel || []).length) {
+    models.appendChild(buildTable(
+      ['模型', '请求', '输入', '输出', '失败'],
+      d.byModel.map((m) => [m.model, m.count, m.input, m.output, m.failed]),
+      1,
+    ))
+  } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; models.appendChild(p) }
+
+  const accts = $('usage-accounts'); clear(accts)
+  if ((d.byAccount || []).length) {
+    accts.appendChild(buildTable(
+      ['账号', '请求', '输入', '输出', '失败'],
+      d.byAccount.map((a) => [a.uid, a.count, a.input, a.output, a.failed]),
+      1,
+    ))
+  } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; accts.appendChild(p) }
+}
+
+// ─────────────────────────── 积分包 ───────────────────────────
+
+async function loadPackages() {
+  const box = $('packages')
+  clear(box)
+  const p = document.createElement('p'); p.className = 'hint'
+  p.textContent = '查询中（逐账号串行打上游）…'
+  box.appendChild(p)
+
+  const res = await api('/admin/packages?realm=cn')
+  clear(box)
+  if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '查询失败'; box.appendChild(e); return }
+
+  for (const a of (res.body.accounts || [])) {
+    const card = document.createElement('div'); card.className = 'card'
+    const left = document.createElement('div'); left.className = 'grow'
+    const name = document.createElement('strong'); name.textContent = a.nickname || a.uid
+    const uid = document.createElement('div'); uid.className = 'uid'; uid.textContent = a.uid
+    left.appendChild(name); left.appendChild(uid)
+    card.appendChild(left)
+
+    if (a.error) {
+      const t = document.createElement('span'); t.className = 'tag err'; t.textContent = a.error.slice(0, 60)
+      card.appendChild(t)
+    } else {
+      const t = document.createElement('span'); t.className = 'tag ok'
+      t.textContent = '可用 ' + a.total + (a.expiring > 0 ? '（' + a.expiring + ' 即将过期）' : '')
+      card.appendChild(t)
+      const m = document.createElement('span'); m.className = 'metrics'
+      m.textContent = (a.packages || []).length + ' 个包' +
+        (a.earliestExpiry ? ' · 最早到期 ' + new Date(a.earliestExpiry).toLocaleDateString('zh-CN') : '')
+      card.appendChild(m)
+    }
+    box.appendChild(card)
+  }
+}
+
+// ─────────────────────────── 模型 ───────────────────────────
 
 async function loadModels() {
-  show('models', '加载中…')
-  const res = await api('/v1/models')
-  if (!res.ok) { show('models', res.body); return }
-  const data = (res.body && res.body.data) || []
   const box = $('models')
-  box.innerHTML = ''
-  const table = document.createElement('table')
-  const head = document.createElement('tr')
-  for (const h of ['id', '名称']) {
-    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
-  }
-  table.appendChild(head)
-  for (const m of data) {
-    const tr = document.createElement('tr')
-    const td1 = document.createElement('td'); td1.textContent = m.id
-    const td2 = document.createElement('td'); td2.textContent = m.name || ''
-    tr.appendChild(td1); tr.appendChild(td2)
-    table.appendChild(tr)
-  }
-  box.appendChild(table)
-  const note = document.createElement('p')
-  note.className = 'hint'
+  clear(box)
+  const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载中…'
+  box.appendChild(p)
+
+  const res = await api('/v1/models')
+  clear(box)
+  if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '加载失败'; box.appendChild(e); return }
+  const data = (res.body && res.body.data) || []
+  box.appendChild(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || ''])))
+  const note = document.createElement('p'); note.className = 'hint'
   note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
   box.appendChild(note)
 }
 
-// ─────────────────────── WAF 护栏状态 ───────────────────────
+// ─────────────────────────── 供应商 ───────────────────────────
+
+/** 能力的中文标签。 */
+const CAP_LABELS = {
+  login: '设备码登录',
+  listModels: '列模型',
+  chat: '对话',
+  balance: '查余额',
+  checkin: '每日签到',
+}
+
+async function loadProviders() {
+  const res = await api('/admin/providers')
+  const box = $('providers')
+  clear(box)
+  if (!res.ok) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p); return }
+
+  const select = $('import-provider')
+  const keep = select.value
+  clear(select)
+  const auto = document.createElement('option'); auto.value = ''; auto.textContent = '自动识别'
+  select.appendChild(auto)
+
+  for (const prov of (res.body.providers || [])) {
+    const card = document.createElement('div'); card.className = 'card'
+
+    const left = document.createElement('div'); left.className = 'grow'
+    const name = document.createElement('strong'); name.textContent = prov.name
+    const id = document.createElement('div'); id.className = 'uid'; id.textContent = prov.id
+    left.appendChild(name); left.appendChild(id)
+    card.appendChild(left)
+
+    // 能力标签（不可用的用红色，并把原因放 tooltip + 下方说明）
+    const caps = document.createElement('div'); caps.className = 'grow'
+    for (const [key, label] of Object.entries(CAP_LABELS)) {
+      const tag = document.createElement('span')
+      const on = prov.capabilities[key] === true
+      tag.className = 'tag ' + (on ? 'ok' : 'err')
+      tag.textContent = (on ? '✓ ' : '✕ ') + label
+      tag.style.marginRight = '4px'
+      caps.appendChild(tag)
+      const def = document.createElement('span'); def.textContent = ' '
+      caps.appendChild(def)
+    }
+    card.appendChild(caps)
+
+    box.appendChild(card)
+
+    // 不可用能力的**具体原因**（这是本视图最有价值的部分）
+    if (!prov.capabilities.login && prov.capabilities.loginBlockedReason) {
+      const note = document.createElement('p')
+      note.className = 'hint'
+      note.style.marginLeft = '8px'
+      note.textContent = '⚠️ ' + prov.name + ' 无法登录：' + prov.capabilities.loginBlockedReason
+      box.appendChild(note)
+    }
+
+    const opt = document.createElement('option')
+    opt.value = prov.id
+    opt.textContent = prov.name
+    select.appendChild(opt)
+
+    // 只有声明「能发起登录」的家才进登录下拉（避免点了没反应的按钮）
+    const loginSelect = $('login-provider')
+    if (loginSelect && prov.capabilities.login) {
+      const lo = document.createElement('option')
+      lo.value = prov.id
+      lo.textContent = prov.name
+      loginSelect.appendChild(lo)
+    }
+  }
+  select.value = keep
+}
+
+// ─────────────────────────── 配置 ───────────────────────────
+
+async function loadConfig() {
+  const box = $('config')
+  clear(box)
+  const pairs = []
+
+  const pool = await api('/admin/pool?realm=cn')
+  if (pool.ok && pool.body.counts) {
+    const c = pool.body.counts
+    pairs.push(['账号总数', c.total], ['可用', c.healthy], ['冷却中', c.cooling],
+      ['模型级限流', c.modelExempt], ['已禁用', c.disabled])
+  }
+
+  const waf = await api('/admin/waf?realm=cn')
+  if (waf.ok && waf.body) {
+    pairs.push(['IP 级拦截窗口', (waf.body.windowMs / 1000) + ' 秒'],
+      ['触发阈值（不同账号数）', waf.body.threshold],
+      ['IP 级拦截当前状态', waf.body.active ? '已激活（暂停轮转）' : '未激活'])
+  }
+
+  const cred = await api('/admin/credentials?realm=cn')
+  if (cred.ok && cred.body) pairs.push(['已存凭据数', cred.body.count])
+
+  // 任务计划构成（让用户知道会自动做什么）
+  pairs.push(['Cron 触发', '每小时 1 次（0 * * * *）'],
+    ['任务时点（UTC+8）', '09 签到 / 10 活跃 / 21 签到'],
+    ['凭据加密', 'AES-GCM（密钥来自 CREDENTIAL_KEY secret）'])
+
+  box.appendChild(buildTable(['项', '值'], pairs))
+
+  const note = document.createElement('p'); note.className = 'hint'
+  note.textContent = '⚠️ 运行时配置目前通过 wrangler 的 vars / secret 管理，面板暂不支持在线修改。'
+  box.appendChild(note)
+}
+
+// ─────────────────────────── 日志 ───────────────────────────
+
+async function loadLogs() {
+  const box = $('logs')
+  clear(box)
+  const res = await api('/admin/logs?realm=cn&limit=100')
+  if (!res.ok) { box.textContent = '加载失败'; return }
+  const logs = (res.body && res.body.logs) || []
+  if (logs.length === 0) {
+    box.textContent = '暂无日志。\n\n提示：Worker 运行日志也可用 `npx wrangler tail` 实时查看（本页只显示面板侧记录的操作）。'
+    return
+  }
+  box.textContent = logs.map((l) => JSON.stringify(l)).join('\n')
+}
+
+// ─────────────────────────── WAF 护栏 ───────────────────────────
 
 async function loadWaf() {
   const res = await api('/admin/waf?realm=cn')
   const banner = $('waf-banner')
-  if (!res.ok || !res.body || !res.body.active) {
-    banner.hidden = true
-    return
-  }
+  if (!res.ok || !res.body || !res.body.active) { banner.hidden = true; return }
   banner.hidden = false
   const remain = Math.max(0, Math.round(((res.body.until || 0) - Date.now()) / 1000))
   $('waf-detail').textContent =
@@ -272,44 +601,77 @@ async function loadWaf() {
     (res.body.recentUids || 0) + ' 个不同账号命中 403。'
 }
 
+// ─────────────────────────── 初始化 ───────────────────────────
+
+$('save-key').onclick = () => {
+  localStorage.setItem('wb_api_key', $('apikey').value.trim())
+  setAuth('已保存，正在验证…', true)
+  bootstrap()
+}
+$('refresh-accounts').onclick = () => { loadPool(); loadAccounts() }
+$('do-import').onclick = doImport
+$('do-login').onclick = doLogin
+$('run-task').onclick = runTask
+$('refresh-status').onclick = () => loadTaskStatus(false)
+$('scan-all').onclick = scanAll
+$('run-all').onclick = runAllDaily
+$('refresh-usage').onclick = loadUsage
+$('clear-usage').onclick = async () => {
+  if (!confirm('清空用量记录？')) return
+  await api('/admin/usage/clear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  loadUsage()
+}
+$('refresh-packages').onclick = loadPackages
+$('load-models').onclick = loadModels
+$('refresh-providers').onclick = loadProviders
+$('refresh-logs').onclick = loadLogs
+$('clear-logs').onclick = async () => {
+  if (!confirm('清空日志？')) return
+  await api('/admin/logs/clear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  loadLogs()
+}
 $('clear-waf').onclick = async () => {
   const r = await api('/admin/waf/clear', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ realm: 'cn' }),
   })
   alert(r.ok ? '已解除' : '解除失败：' + JSON.stringify(r.body))
   loadWaf()
 }
-
-// ─────────────────────── 初始化 ───────────────────────
-
-$('save-key').onclick = () => {
-  localStorage.setItem('wb_api_key', $('apikey').value.trim())
-  setAuth('已保存，正在验证…', true)
-  verify()
+for (const btn of document.querySelectorAll('.nav-item')) {
+  btn.onclick = () => switchView(btn.dataset.view)
 }
-$('refresh-accounts').onclick = loadAccounts
-$('do-import').onclick = doImport
-$('do-login').onclick = doLogin
-$('run-task').onclick = runTask
-$('refresh-status').onclick = () => loadTaskStatus(false)
-$('load-models').onclick = loadModels
 
-async function verify() {
-  const res = await api('/admin/pool?realm=cn')
-  if (res.ok) {
-    setAuth('密钥有效', true)
-    loadAccounts()
-    loadWaf()
-    // 每 20 秒刷一次护栏状态（IP 级拦截是 60 秒窗口，20 秒够及时）
-    setInterval(loadWaf, 20000)
-  } else {
-    setAuth('密钥无效', false)
+/**
+ * 启动：**无论有没有密钥都要让页面有内容**。
+ *
+ * ⚠️ 早期版本在这里写成「没密钥就什么都不做」，结果页面一片空白，
+ * 用户以为坏了。现在显式区分三种状态：未填密钥 / 密钥无效 / 正常。
+ */
+async function bootstrap() {
+  const key = apiKey()
+
+  if (key === '') {
+    $('setup-hint').hidden = false
+    setAuth('未设置密钥', false)
+    // 仍然显示导航与空状态，让用户看到「这里有东西，只是缺密钥」
+    switchView(localStorage.getItem('wb_view') || 'accounts')
+    return
   }
+
+  $('setup-hint').hidden = true
+  const res = await api('/admin/pool?realm=cn')
+  if (!res.ok) {
+    setAuth('密钥无效', false)
+    $('setup-hint').hidden = false
+    return
+  }
+
+  setAuth('密钥有效', true)
+  switchView(localStorage.getItem('wb_view') || 'accounts')
+  loadWaf()
+  setInterval(loadWaf, 20000)
 }
 
-// 页面加载时：若已存密钥则自动验证
 $('apikey').value = apiKey()
-if (apiKey() !== '') verify()
-else setAuth('未设置密钥', false)
+bootstrap()

@@ -32,6 +32,7 @@ import {
   healthyForModel,
   isActive,
   modelExempt,
+  normalizeAccountState,
   pruneExpired,
 } from './state.js'
 import {
@@ -54,6 +55,12 @@ import {
   deleteLoginSession,
 } from '../store/db.js'
 import { decryptCredential, encryptCredential, requireCredentialKey } from '../store/crypto.js'
+import {
+  summarizeUsage,
+  trimUsageRing,
+  type UsageRecord,
+  type UsageSummary,
+} from '../store/usage.js'
 
 /** 模型成本账本的存活时长：6h 外的价格不再采信（Go 侧 `modelCostTTL` 同口径）。 */
 const MODEL_COST_TTL_MS = 6 * 60 * 60 * 1000
@@ -90,6 +97,15 @@ const TOP_N = 5
  */
 export interface PickRequest {
   realm: string
+  /**
+   * 只要该供应商的账号（空串 = 不限）。
+   *
+   * ⚠️ 过滤必须在这里做，**不能**在 `pick()` 返回之后再筛（实测踩到）：
+   * 后者会先选中一个别家的账号、再把它丢掉，于是
+   * 「池里有账号但当前供应商没账号」时表现为 `pick()` 返回了号、
+   * 调用方却拿不到人 → 直接被当成「没有可用账号」。
+   */
+  provider?: string
   /** 目标模型；空串表示「还没定模型」——此时不做模型级过滤。 */
   model: string
   /** 已尝试过的 uid，必须排除（跨重试保留，否则会在账号间无限来回）。 */
@@ -121,7 +137,7 @@ export class AccountPoolDO extends DurableObject<Env> {
   /** 读取一个账号。 */
   async getAccount(uid: string): Promise<AccountState | undefined> {
     const raw = readAccount(this.ctx.storage.sql, uid)
-    return raw === undefined ? undefined : (JSON.parse(raw) as AccountState)
+    return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
   }
 
   /** 列出某 realm 的全部账号（惰性剪枝过期条目）。 */
@@ -129,7 +145,10 @@ export class AccountPoolDO extends DurableObject<Env> {
     const raws = listAccounts(this.ctx.storage.sql, realm)
     const out: AccountState[] = []
     for (const raw of raws) {
-      const state = JSON.parse(raw) as AccountState
+      const state = normalizeAccountState(JSON.parse(raw))
+      // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
+      if (state === undefined) continue
+      // 供应商不匹配的直接跳过（不同家的凭据/协议完全不同）
       if (pruneExpired(state, now, MODEL_COST_TTL_MS)) {
         // 剪枝结果不回写：过期条目不影响判定，回写反而多一次 SQLite 往返。
         // 下次真实状态变更时会一并落盘。
@@ -161,6 +180,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    */
   async pick(request: PickRequest): Promise<PickResult | undefined> {
     const { realm, model, exclude, now } = request
+    const wantProvider = request.provider ?? ''
     const excludeSet = new Set(exclude)
 
     // ⚠️ IP 级拦截激活期内**直接放弃**，连一个号都不试。
@@ -170,7 +190,11 @@ export class AccountPoolDO extends DurableObject<Env> {
     const raws = listAccounts(this.ctx.storage.sql, realm)
     const candidates: AccountState[] = []
     for (const raw of raws) {
-      const state = JSON.parse(raw) as AccountState
+      const state = normalizeAccountState(JSON.parse(raw))
+      // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
+      if (state === undefined) continue
+      // 供应商不匹配的直接跳过（不同家的凭据/协议完全不同）
+      if (wantProvider !== '' && (state.provider ?? 'workbuddy') !== wantProvider) continue
       if (excludeSet.has(state.uid)) continue
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       if (!healthyForModel(state, now, model)) continue
@@ -212,7 +236,10 @@ export class AccountPoolDO extends DurableObject<Env> {
     let exempt = 0
 
     for (const raw of raws) {
-      const state = JSON.parse(raw) as AccountState
+      const state = normalizeAccountState(JSON.parse(raw))
+      // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
+      if (state === undefined) continue
+      // 供应商不匹配的直接跳过（不同家的凭据/协议完全不同）
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       if (state.disabled) {
         disabled += 1
@@ -268,7 +295,8 @@ export class AccountPoolDO extends DurableObject<Env> {
   }): Promise<{ disabled: boolean }> {
     const raw = readAccount(this.ctx.storage.sql, input.uid)
     if (raw === undefined) return { disabled: false }
-    const state = JSON.parse(raw) as AccountState
+    const state = normalizeAccountState(JSON.parse(raw))
+    if (state === undefined) return { disabled: false }
     const { now } = input
 
     switch (input.kind) {
@@ -412,9 +440,15 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /** 创建账号（供导入 / 登录流程调用）。已存在则覆盖凭证以外的状态。 */
-  async createAccount(input: { uid: string; nickname: string; realm: string }, now: number): Promise<AccountState> {
+  async createAccount(
+    input: { uid: string; nickname: string; realm: string; provider?: string },
+    now: number,
+  ): Promise<AccountState> {
     const existing = readAccount(this.ctx.storage.sql, input.uid)
-    if (existing !== undefined) return JSON.parse(existing) as AccountState
+    if (existing !== undefined) {
+      const parsed = normalizeAccountState(JSON.parse(existing))
+      if (parsed !== undefined) return parsed
+    }
     const state = createAccountState(input)
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
     return state
@@ -488,6 +522,104 @@ export class AccountPoolDO extends DurableObject<Env> {
   /** 清理过期登录会话。 */
   async pruneLoginSessions(now: number): Promise<number> {
     return pruneLoginSessions(this.ctx.storage.sql, now)
+  }
+
+  // ─────────────────────── 用量统计 ───────────────────────
+
+  /**
+   * 记录一次请求的用量。
+   *
+   * ⚠️ 整条环形缓冲存在**一个 storage key** 里（`usage:ring`），而不是一行一条记录。
+   * 理由：Free 计划 DO 行写入配额 100,000/天，一次对话写一行会在正常使用下撞配额；
+   * 而我们要的是**近期趋势**，不是审计账本。
+   *
+   * 单次读改写：DO 是单线程的，不存在并发写覆盖问题。
+   */
+  async recordUsage(record: UsageRecord): Promise<void> {
+    const ring = (await this.ctx.storage.get<UsageRecord[]>('usage:ring')) ?? []
+    ring.push(record)
+    await this.ctx.storage.put('usage:ring', trimUsageRing(ring))
+  }
+
+  /** 读取用量概览（聚合在内存里做）。 */
+  async usageSummary(): Promise<UsageSummary> {
+    const ring = (await this.ctx.storage.get<UsageRecord[]>('usage:ring')) ?? []
+    return summarizeUsage(ring)
+  }
+
+  /** 清空用量记录。 */
+  async clearUsage(): Promise<void> {
+    await this.ctx.storage.put('usage:ring', [])
+  }
+
+  // ─────────────────────── 请求日志（环形缓冲） ───────────────────────
+
+  /**
+   * 追加一条请求日志。
+   *
+   * ⚠️ 与用量分开存：日志条目更大（含 UA、IP 等），且只用于排查，
+   * 不应挤占用量统计的空间。上限更小（200 条）。
+   */
+  async appendLog(entry: Record<string, unknown>): Promise<void> {
+    const ring = (await this.ctx.storage.get<Array<Record<string, unknown>>>('log:ring')) ?? []
+    ring.push(entry)
+    // 只保留最近 200 条（按插入顺序，日志天然有序）
+    await this.ctx.storage.put('log:ring', ring.slice(-200))
+  }
+
+  /** 读日志（最新的在前）。 */
+  async readLogs(limit = 100): Promise<Array<Record<string, unknown>>> {
+    const ring = (await this.ctx.storage.get<Array<Record<string, unknown>>>('log:ring')) ?? []
+    return ring.slice(-Math.max(1, Math.min(limit, 200))).reverse()
+  }
+
+  /** 清空日志。 */
+  async clearLogs(): Promise<void> {
+    await this.ctx.storage.put('log:ring', [])
+  }
+
+    /**
+   * 清除模型级冷却（面板「解冻」用）。
+   *
+   * ## 为什么必须有这个入口
+   *
+   * 模型级冷却的退避是 **6 小时起步、封顶 24 小时**（对齐上游语义：11102 =
+   * 该后端没有这个模型）。但有些失败**并不是上游真的没有这个模型**，
+   * 而是我方请求有问题（实测：模型名带了 `provider/` 前缀，
+   * 上游回 `model [...] service info not found`，被记成 11102）。
+   *
+   * 那种情况下用户会看到「这个模型选不到号」并**只能等 6 小时** ——
+   * 而真实原因是我们的 bug 已经修好了。故必须留人工纠正入口。
+   *
+   * @param model 指定模型则只清它；不传则清全部。
+   */
+  async clearModelCooldowns(realm: string, uid: string | undefined, model?: string): Promise<number> {
+    // ⚠️ 只有传了 uid 时才需要读单条；不传就扫整个 realm。
+    // （DO 本身按 realm 分片，故 realm 只是过滤条件，不是路由信息。）
+    if (uid !== undefined) {
+      const raw = readAccount(this.ctx.storage.sql, uid)
+      if (raw === undefined) return 0
+      const state = normalizeAccountState(JSON.parse(raw))
+      if (state === undefined) return 0
+      const keys = model === undefined ? Object.keys(state.modelCooldowns) : (state.modelCooldowns[model] === undefined ? [] : [model])
+      if (keys.length === 0) return 0
+      for (const k of keys) delete state.modelCooldowns[k]
+      writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+      return keys.length
+    }
+
+    const raws = listAccounts(this.ctx.storage.sql, realm)
+    let cleared = 0
+    for (const raw of raws) {
+      const state = normalizeAccountState(JSON.parse(raw))
+      if (state === undefined) continue
+      const keys = model === undefined ? Object.keys(state.modelCooldowns) : (state.modelCooldowns[model] === undefined ? [] : [model])
+      if (keys.length === 0) continue
+      for (const k of keys) delete state.modelCooldowns[k]
+      writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+      cleared += keys.length
+    }
+    return cleared
   }
 
   // ─────────────────────── IP 级 WAF 拦截护栏 ───────────────────────
