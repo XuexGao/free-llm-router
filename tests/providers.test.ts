@@ -27,6 +27,8 @@ import {
 } from '../src/providers/index.ts'
 import { ProviderError, splitModelName } from '../src/providers/types.ts'
 import { anthropicSseToOpenAiSse } from '../src/providers/anthropic.ts'
+import { planGrowth, REAL_CHAT_ACTIONS } from '../src/taskrunner/plans.ts'
+import { registeredActions } from '../src/taskrunner/actions.ts'
 
 /**
  * 捕获一次抛错（返回 `undefined` 表示**没有抛**）。
@@ -368,5 +370,33 @@ test('腾讯双变体都能设备码登录（实测国际版返回 workbuddy.ai 
   for (const id of ['buddy', 'workbuddy']) {
     const p = findProvider(id)
     assert.equal(p?.capabilities.login, true, `${id} 应支持设备码登录`)
+  }
+})
+
+// ─────────────────── 真实对话任务必须进每日计划（用户要求） ───────────────────
+
+test('⚠️ growth 计划开启 includeRealChat 后必须包含全部真实对话任务', () => {
+  // 用户明确要求：每日任务要**包含真实对话任务**（那些才给积分）。
+  // 漏掉的话，用户点了「执行每日任务」却拿不到 expert_5 / skill_1 等任务的积分。
+  const steps = planGrowth({ includeRealChat: true })
+  const codes = new Set(steps.map((s) => s.code))
+  for (const { code } of REAL_CHAT_ACTIONS) {
+    assert.ok(codes.has(code), `includeRealChat=true 时缺少真实对话任务：${code}`)
+  }
+})
+
+test('⚠️ 真实对话任务表必须覆盖 AGENTS.md §6.4 列的 6 个任务中的 5 个', () => {
+  // §6.4 列出 6 个需真实对话的任务。其中 Model_chat_GLM5.2 归在零消耗侧
+  // （只上报事件、不发对话），其余 5 个在 REAL_CHAT_ACTIONS。
+  const codes = REAL_CHAT_ACTIONS.map((a) => a.code)
+  for (const expected of ['expert_5', 'Expert_team_use_3', 'skill_1', 'Expert_lighthouse', 'black_cat']) {
+    assert.ok(codes.includes(expected), `缺少 ${expected}`)
+  }
+})
+
+test('⚠️ 每个真实对话动作都必须已注册（否则入队了却执行不了）', () => {
+  const registered = new Set(registeredActions())
+  for (const { action } of REAL_CHAT_ACTIONS) {
+    assert.ok(registered.has(action), `未注册的动作：${action}`)
   }
 })

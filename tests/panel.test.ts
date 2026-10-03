@@ -159,7 +159,41 @@ test('⚠️ 任务中心必须是两张卡片且**没有选项下拉**', () => 
   assert.ok(html.includes('run-daily-all'), '应有「Buddy 每日任务」卡片')
   // 用户要求：任务不要有选项，直接全部做一遍
   assert.ok(!html.includes('task-plan'), '不该有任务计划下拉')
-  assert.ok(!js.includes('includeRealChat'), '任务中心不该暴露 includeRealChat 选项')
+  // ⚠️ 面板**不该**让用户选 includeRealChat（无选项），
+  // 但后端必须**自动带上**它 —— 否则拿不到真实对话任务的积分。
+  assert.ok(!js.includes('includeRealChat'), '面板不该暴露该选项（后端自动带）')
+})
+
+test('⚠️ 面板可见文案不得含 Markdown 星号（这是网页不是 Markdown）', () => {
+  // 用户明确要求：网页里不要出现 `**加粗**` 这种 Markdown 语法。
+  for (const [name, path] of [['HTML', '/panel/'], ['JS', '/panel/app.js']] as const) {
+    let body = panelAsset(path)?.body ?? ''
+    // 去掉注释后再检查（注释里的星号用户看不到）
+    body = body.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+    const lines = body.split('\n').filter((l) => !l.trim().startsWith('//'))
+    const bad = lines.filter((l) => l.includes('**'))
+    assert.equal(bad.length, 0, `${name} 里还有 Markdown 星号：${bad[0]?.trim().slice(0, 60)}`)
+  }
+})
+
+test('⚠️ 供应商视图必须显示剩余总积分（未登录时隐藏）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(html.includes('id="total-credits"'), '应有积分徽标容器')
+  assert.ok(/id="total-credits"[^>]*hidden/.test(html), '初始必须 hidden（未登录不显示）')
+  assert.ok(js.includes('loadTotalCredits'), '应有加载总积分的逻辑')
+})
+
+test('⚠️ 必须支持浅色模式（且主题在任何渲染之前应用，避免闪烁）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(html.includes('id="toggle-theme"'), '应有主题切换按钮')
+  assert.ok(css.includes("data-theme='light'"), 'CSS 应有浅色变量覆盖')
+  // 主题必须在使用前应用（applyTheme 调用要在 bootstrap 之前）
+  const applyIdx = js.lastIndexOf('applyTheme(')
+  const bootIdx = js.lastIndexOf('bootstrap()')
+  assert.ok(applyIdx > 0 && applyIdx < bootIdx, 'applyTheme 必须在 bootstrap 之前调用（否则浅色用户会看到深色闪烁）')
 })
 
 test('⚠️ 弹窗模型页必须支持打开/关闭（开关）', () => {

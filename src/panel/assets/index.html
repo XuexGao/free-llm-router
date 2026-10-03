@@ -12,6 +12,7 @@
   <div class="auth">
     <input id="apikey" type="password" placeholder="API_KEY" autocomplete="off">
     <button id="save-key">保存密钥</button>
+    <button id="toggle-theme" class="ghost" title="切换浅色/深色">浅色</button>
   </div>
 </header>
 
@@ -46,16 +47,18 @@
     <div class="task-cards">
       <div class="task-card">
         <h3>全部供应商一键签到</h3>
-        <p class="hint">对**所有**账号逐个签到（串行，避免触发风控）。
-        不支持的供应商会显式说明原因，不会静默跳过。</p>
+        <p class="hint">对所有账号逐个签到（串行，避免触发风控）。
+        不支持的供应商会说明原因，不会静默跳过。</p>
         <button id="run-checkin-all">一键签到</button>
       </div>
 
       <div class="task-card">
         <h3>Buddy 每日任务</h3>
-        <p class="hint">对国内版（buddy）全部账号跑「签到 + 零消耗成长任务 + 自动领奖」。
-        <strong>不含</strong>需要真实对话的任务（那些会消耗配额）。</p>
-        <button id="run-daily-all">全部做一遍</button>
+        <p class="hint">对国内版（buddy）全部账号执行：签到 → 全部成长任务 →
+        真实对话任务（专家召唤 / 技能加载 / 夜猫子，这些才给积分）→ 自动领奖。</p>
+        <p class="hint">真实对话会消耗极少量配额（每次都是最短对话，且已达标的任务自动跳过，
+        不会重复消耗）。重复点按钮安全。</p>
+        <button id="run-daily-all">执行每日任务</button>
       </div>
     </div>
 
@@ -97,7 +100,11 @@
 
   <!-- ───────── 供应商 ───────── -->
   <section class="view" id="view-providers" hidden>
-    <h2>供应商与账号 <button class="ghost" id="refresh-providers">刷新</button></h2>
+    <h2>供应商与账号
+      <button class="ghost" id="refresh-providers">刷新</button>
+      <!-- 剩余总积分：未登录（无账号）时不显示 -->
+      <span id="total-credits" class="credits-pill" hidden></span>
+    </h2>
     <div id="pool-counts" class="counts"></div>
     <p class="hint">点任意一家可管理它的账号与模型。</p>
     <div id="providers" class="prov-grid"></div>
@@ -107,7 +114,7 @@
     凭据会自动声明为该供应商（避免被别家按形状抢走）。</p>
     <div class="row">
       <label>供应商
-        <!-- ⚠️ 选项**全部**由 JS 填（见 loadProviders）。这里刻意不放硬编码
+        <!-- ⚠️ 选项全部由 JS 填（见 loadProviders）。这里刻意不放硬编码
              option —— 之前放了又由 JS 追加，而 loadProviders 会被多次调用
              且不清空，导致下拉项重复累积。 -->
         <select id="login-provider"></select>

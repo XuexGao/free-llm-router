@@ -15,6 +15,26 @@ export interface OpenAiModel {
   created: number
   owned_by: string
   name?: string
+  /**
+   * 上下文窗口（上游 `maxInputTokens`）。
+   *
+   * ⚠️ 之前这里**丢掉了**这个字段（只留 id/name），导致面板显示「—」、
+   * 客户端也拿不到真实的上下文预算。上游 `/v3/config` 本来就下发它，
+   * 白丢是自己的问题。
+   */
+  contextWindow?: number
+  /** 单次输出上限（上游 `maxOutputTokens`）。 */
+  maxOutput?: number
+  /** 是否接受图片输入（上游 `supportsImages`）。 */
+  supportsImage?: boolean
+  /** 是否支持工具调用（上游 `supportsToolCall`）。 */
+  supportsToolCall?: boolean
+  /** 是否支持推理（上游 `supportsReasoning`）。 */
+  supportsReasoning?: boolean
+  /** 是否默认模型（上游 `isDefault`）。 */
+  isDefault?: boolean
+  /** 厂商（上游 `vendor`）。 */
+  vendor?: string
 }
 
 /** 从账号池取第一个可用账号（1–3 账号场景下够用）。 */
@@ -116,12 +136,32 @@ function mapModels(models: unknown[]): OpenAiModel[] {
     const m = raw as Record<string, unknown>
     const id = typeof m.id === 'string' ? m.id : ''
     if (id === '') continue
+
+    const str = (k: string): string | undefined => {
+      const v = m[k]
+      return typeof v === 'string' && v !== '' ? v : undefined
+    }
+    const num = (k: string): number | undefined => {
+      const v = m[k]
+      return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined
+    }
+    const bool = (k: string): boolean | undefined => (typeof m[k] === 'boolean' ? (m[k] as boolean) : undefined)
+
     out.push({
       id,
       object: 'model',
       created: 0,
       owned_by: DEFAULT_PROVIDER,
-      ...(typeof m.name === 'string' && m.name !== '' ? { name: m.name } : {}),
+      ...(str('name') === undefined ? {} : { name: str('name') as string }),
+      // ⚠️ 这些字段上游**本来就下发**（实测 `/v3/config` 的 data.models[]），
+      // 之前只取 id/name 是白丢信息 —— 面板因此显示不出上下文与图片能力。
+      ...(num('maxInputTokens') === undefined ? {} : { contextWindow: num('maxInputTokens') as number }),
+      ...(num('maxOutputTokens') === undefined ? {} : { maxOutput: num('maxOutputTokens') as number }),
+      ...(bool('supportsImages') === undefined ? {} : { supportsImage: bool('supportsImages') as boolean }),
+      ...(bool('supportsToolCall') === undefined ? {} : { supportsToolCall: bool('supportsToolCall') as boolean }),
+      ...(bool('supportsReasoning') === undefined ? {} : { supportsReasoning: bool('supportsReasoning') as boolean }),
+      ...(bool('isDefault') === undefined ? {} : { isDefault: bool('isDefault') as boolean }),
+      ...(str('vendor') === undefined ? {} : { vendor: str('vendor') as string }),
     })
   }
   return out

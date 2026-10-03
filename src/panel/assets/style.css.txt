@@ -187,3 +187,38 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .switch.on { background: #1e5b3a; border-color: #1e5b3a; }
 .switch.on::after { left: 20px; background: var(--ok); }
+
+/* ─────────── 剩余总积分徽标 ─────────── */
+.credits-pill {
+  font-size: 12px; font-weight: 500; color: var(--ok);
+  background: #14301f; border: 1px solid #1e5b3a; border-radius: 999px;
+  padding: 2px 10px; margin-left: 4px;
+}
+
+/* ─────────── 浅色模式 ───────────
+ * ⚠️ 所有颜色都走 CSS 变量，故浅色模式只需覆盖 `:root` 的变量值 ——
+ * 不必给每个组件写一份浅色样式（那会立刻产生两份需要同步维护的规则）。
+ * 少数几个硬编码的深色值（如 #10131a 的输入框背景）单独覆盖。
+ */
+html[data-theme='light'] {
+  --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
+  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+  --ok: #15803d; --warn: #b45309; --err: #dc2626;
+}
+html[data-theme='light'] input,
+html[data-theme='light'] select,
+html[data-theme='light'] textarea,
+html[data-theme='light'] button.ghost { background: #ffffff; }
+html[data-theme='light'] .out { background: #f8f9fb; }
+html[data-theme='light'] .bar-track { background: #e8ebf0; }
+html[data-theme='light'] .switch { background: #e8ebf0; }
+html[data-theme='light'] .tag.ok { border-color: #86c79a; }
+html[data-theme='light'] .tag.warn { border-color: #e0b878; }
+html[data-theme='light'] .tag.err { border-color: #f0a0a0; }
+html[data-theme='light'] .credits-pill { background: #e7f5ec; border-color: #86c79a; }
+html[data-theme='light'] .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
+html[data-theme='light'] .banner button { border-color: #d99; color: #7f1d1d; }
+html[data-theme='light'] .notice { background: #eef4ff; border-color: #b9d0f5; }
+html[data-theme='light'] .cap.off { color: #8a93a3; }
+html[data-theme='light'] .model-row.off .mid,
+html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }

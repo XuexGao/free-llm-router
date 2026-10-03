@@ -500,8 +500,42 @@ const CAPS = [
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
 
+/**
+ * 剩余总积分（供应商视图右上角）。
+ *
+ * ⚠️ 未登录（没有任何账号 / 没有凭据）时**不显示** ——
+ * 显示「0」会让用户以为额度用光了，而真实情况是「还没加账号」。
+ *
+ * 逐账号查余额（串行，避免并行打上游触发风控），只统计有余额能力的供应商。
+ */
+async function loadTotalCredits() {
+  const pill = $('total-credits')
+  if (!pill) return
+  const res = await api('/admin/accounts?realm=cn')
+  if (!res.ok || !res.body || (res.body.accounts || []).length === 0) {
+    pill.hidden = true
+    return
+  }
+  const pkg = await api('/admin/packages?realm=cn')
+  if (!pkg.ok || !pkg.body || !Array.isArray(pkg.body.accounts)) {
+    pill.hidden = true
+    return
+  }
+  let total = 0
+  let counted = 0
+  for (const a of pkg.body.accounts) {
+    if (a.error || typeof a.total !== 'number') continue
+    total += a.total
+    counted += 1
+  }
+  if (counted === 0) { pill.hidden = true; return }
+  pill.hidden = false
+  pill.textContent = '剩余总积分 ' + total.toLocaleString('zh-CN')
+}
+
 async function loadProviders() {
-  loadPool() // 计数渲染在视图顶部
+  loadPool()      // 计数渲染在视图顶部
+  loadTotalCredits() // 右上角积分
   const res = await api('/admin/providers')
   const box = $('providers')
   clear(box)
@@ -820,6 +854,27 @@ async function loadWaf() {
 
 // ─────────────────────────── 初始化 ───────────────────────────
 
+// ─────────────────────────── 主题（深色 / 浅色） ───────────────────────────
+
+/**
+ * 应用主题。
+ *
+ * ⚠️ 主题记在 localStorage，且**在页面加载最早期就应用**（见文件末尾的
+ * applyTheme 调用）—— 若等 DOMContentLoaded 再切，浅色用户会先看到
+ * 一帧深色闪烁（FOUC）。
+ */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme
+  const btn = $('toggle-theme')
+  if (btn) btn.textContent = theme === 'light' ? '深色' : '浅色'
+  localStorage.setItem('wb_theme', theme)
+}
+
+$('toggle-theme').onclick = () => {
+  const now = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'
+  applyTheme(now)
+}
+
 $('save-key').onclick = () => {
   localStorage.setItem('wb_api_key', $('apikey').value.trim())
   setAuth('已保存，正在验证…', true)
@@ -887,6 +942,9 @@ async function bootstrap() {
   loadWaf()
   setInterval(loadWaf, 20000)
 }
+
+// ⚠️ 主题要在**最早期**应用（在任何渲染之前），否则浅色用户会看到深色闪烁。
+applyTheme(localStorage.getItem('wb_theme') || 'dark')
 
 $('apikey').value = apiKey()
 bootstrap()

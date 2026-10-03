@@ -392,11 +392,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     })
   }
 
-  // ── buddy 每日任务（签到 + 零消耗成长任务，**无选项，全部做一遍**） ──
+  // ── buddy 每日任务（签到 + 全部成长任务 + 真实对话任务 + 领奖） ──
   //
   // ⚠️ 刻意**不暴露 plan 选项**：用户要的是「一键做完」，不是「先想清楚要跑哪个计划」。
-  // 内部固定为 `daily + growth`（均零对话消耗），真实对话类任务**不包含**
-  // —— 那会消耗配额，必须显式开启（见 includeRealChat）。
+  //
+  // ⚠️ **包含真实对话任务**（`includeRealChat: true`）——
+  // 那些是真正**给积分**的任务（expert_5 / Expert_team_use_3 / skill_1 /
+  // Expert_lighthouse / black_cat）。用户明确要求把它们一并做掉。
+  //
+  // 代价：每次执行会消耗极少量配额（每次都是 fast-model 的极短对话，
+  // 且**先查进度**，已达标就跳过、不重复消耗）。故只在**用户手动点按钮**时
+  // 走这条路径 —— 挂 cron 的自动计划仍然不含它们（见 plans.ts 的注释）。
   if (path === '/admin/tasks/daily-all' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string }
     const realm = body.realm ?? 'cn'
@@ -416,6 +422,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
           realm: account.realm,
           accessToken: credential.accessToken,
           plan: 'growth',
+          // ⚠️ 关键：带上真实对话任务（它们才给积分）。
+          // 漏了这个参数，用户点了按钮却拿不到那几个任务的积分。
+          includeRealChat: true,
         })
         started.push({ uid: account.uid, nickname: account.nickname, queued: result.queued })
       } catch (error) {
