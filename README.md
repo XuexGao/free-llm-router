@@ -5,8 +5,8 @@
 
 > ⚠️ **仅限本人授权账号自用。** 见 [使用边界](#使用边界)。
 
-- **服务**：`https://workbuddy-gateway.xiegao.workers.dev`
-- **管理面板**：<https://workbuddy-gateway.xiegao.workers.dev/panel/>
+- **服务**：<https://api.xiegao.top>
+- **管理面板**：<https://api.xiegao.top/panel/>
 
 ---
 
@@ -15,10 +15,11 @@
 | 能力 | 说明 |
 |---|---|
 | **任务自动执行** | 成长任务（11 个零对话消耗动作）+ 每日签到 + 余额查询 + **自动领奖**。真实账号实测 **23/23 步全成功** |
-| **OpenAI 兼容网关** | `/v1/models`（真实 54 个模型）+ 流式 `/v1/chat/completions`（含工具调用），已接入账号池（选号 / 记账 / 失败换号） |
+| **OpenAI 兼容网关** | `/v1/models`（108 条：54 裸名 + 54 带前缀）+ 流式 `/v1/chat/completions`（含工具调用），已接入账号池（选号 / 记账 / 失败换号） |
+| **11 家供应商** | workbuddy / cline / minimax / codearts / lobsterai / trae / qoder / opencode / loomy / raccoon / zcode，统一 `Provider` 接口 |
 | **凭据加密** | AES-GCM 落 DO SQLite，**不继承** Go 版明文存盘的做法 |
 | **账号接入** | 设备码登录（浏览器授权）+ 凭据导入（兼容 Go 的 `auths/*.json` 双形态与 DSH 的 snake_case） |
-| **管理面板** | 账号运维 / 导入 / 登录 / 任务触发与进度 / 模型目录 |
+| **管理面板** | 8 个视图：账号池 / 任务中心 / 用量 / 积分包 / 模型 / **供应商** / 配置 / 日志 |
 
 ---
 
@@ -27,7 +28,7 @@
 ```bash
 npm install
 npm run typecheck    # 类型检查
-npm test             # 179 条单测
+npm test             # 231 条单测
 npm run deploy       # 部署（需先 npx wrangler login）
 
 # 必须设置两个 secret（未设置时凭据层会**拒绝写入**，不静默明文落盘）
@@ -36,6 +37,17 @@ openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY # 凭据加密�
 ```
 
 然后打开 `https://<你的域名>/panel/`，把 `API_KEY` 粘进去即可。
+
+### 选供应商（`provider/model` 前缀）
+
+模型名支持两种写法，**都可用**：
+
+```bash
+"model": "deepseek-v4-flash"            # 裸名 → 默认供应商（WorkBuddy），保持既有兼容
+"model": "qoder/xxx"                    # 带前缀 → 指定供应商
+```
+
+看 `GET /admin/providers` 可拿到 11 家的能力矩阵与**每项不可用的具体原因**。
 
 ### 添加账号（两种方式）
 
@@ -117,7 +129,7 @@ curl -N https://<你的域名>/v1/chat/completions \
 ## 测试
 
 ```bash
-npm test    # 179 条
+npm test    # 231 条
 ```
 
 覆盖的都是**踩过坑的语义**，不是「代码能跑」：
@@ -133,6 +145,7 @@ npm test    # 179 条
 | `verify.test.ts` | 领奖闭环（**必须有界轮询**，只读一次会漏领）+ 计划编排不变式 |
 | `gateway.test.ts` | 请求体 4 处必改 + 工具配对清理 + **4 种错误帧识别** |
 | `panel.test.ts` | 面板安全（CSP 无 `unsafe-inline`、不用 cookie、不拼 innerHTML） |
+| `providers.test.ts` | 多供应商（模型名路由不残留前缀、凭据判别不串家、Anthropic SSE 必须转出 `choices`） |
 
 ---
 
@@ -157,7 +170,10 @@ npm test    # 179 条
 | **会话粘性未实现** | 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） |
 | **图片入站未实现** | Free 计划 10ms CPU 下 base64 图片解码可能超限 |
 | **连登兑换 / 抽奖 / 旅行未接入计划表** | `src/upstream/travel.ts` 已实现，但当前计划只覆盖 11 个任务动作 |
-| **需真实对话的 6 个任务未做** | 会消耗配额，`NEEDS_REAL_CHAT` 显式拒绝（不是静默跳过） |
+| **6 个需真实对话的任务已做，但默认不入队** | 必须显式 `includeRealChat`（会消耗配额） |
+| **codearts / lobsterai / trae 的登录** | 需 `127.0.0.1` 回调监听，Workers 无监听 socket；只能导入凭据 |
+| **zcode 签到** | 需 headful Chromium 过阿里云 captcha（推理不受影响） |
+| **opencode 每账号代理** | Workers `fetch` 不接受 `dispatcher` ⇒ 多个匿名槽共享同一出口 IP，免费额度**不再能通过多开扩容** |
 
 ---
 
@@ -173,6 +189,7 @@ npm test    # 179 条
 | [docs/05-task-engine.md](docs/05-task-engine.md) | 任务引擎（11 个动作 + 领奖闭环） |
 | [docs/06-gateway.md](docs/06-gateway.md) | OpenAI 兼容网关 |
 | [docs/07-panel.md](docs/07-panel.md) | 管理面板与安全设计 |
+| [docs/08-providers.md](docs/08-providers.md) | **多供应商（11 家）**：抽象层、自实现的密码学原语、踩到的 5 个真实缺陷 |
 | [probe/](probe/) | 独立的出口验证探针（可单独部署复用） |
 
 ## License

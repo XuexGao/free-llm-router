@@ -8,18 +8,18 @@
 
 ## 文档状态
 
-**当前阶段：第 1–7 步全部完成。项目可交付。**
+**当前阶段：第 1–8 步全部完成。项目可交付。**
 
-- **服务**：`https://workbuddy-gateway.xiegao.workers.dev`
-- **面板**：`https://workbuddy-gateway.xiegao.workers.dev/panel/`
+- **服务**：`https://api.xiegao.top`（备用 `https://workbuddy-gateway.xiegao.workers.dev`）
+- **面板**：`https://api.xiegao.top/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
-- **179 条单测通过**。
+- **231 条单测通过**。
 
 详见 [docs/01-egress-probe.md](docs/01-egress-probe.md)、[02-skeleton.md](docs/02-skeleton.md)、
 [03-protocol.md](docs/03-protocol.md)、[04-accounts.md](docs/04-accounts.md)、
 [05-task-engine.md](docs/05-task-engine.md)、[06-gateway.md](docs/06-gateway.md)、
-[07-panel.md](docs/07-panel.md)。
+[07-panel.md](docs/07-panel.md)、[08-providers.md](docs/08-providers.md)。
 
 本文件是本项目的**唯一权威设计文档**。实现前必须读完；实现中若发现本文件的判断与实测不符，**先改本文件再改代码**，不要把偏差留在注释里。
 
@@ -164,8 +164,8 @@
 | 不做 | 原因 |
 |---|---|
 | 移植 Go 项目全部功能 | Go 侧 21k 行含大量部署态能力（Docker、面板、归档），与 serverless 目标无关 |
-| 一次性支持 13 个 provider | `deepseek-harness-codearts` 的 13 provider 中多数需本地回调或子进程；第一版只做能跑通闭环的子集 |
-| zcode 签到（需浏览器产 captcha） | 依赖 headful Chromium，Workers 不可行 |
+| 支持全部 13 个 provider | ✅ **已做 11 家**（第 8 步）。未做的 2 家是需要本地回调登录的同类，且其推理已以「导入凭据」方式可用 |
+| ~~zcode 签到~~ | 已确认**不可行**（需 headful Chromium 过阿里云 captcha）；推理不受影响 |
 | 管理面板的完整复刻 | 面板功能多；第一版只做**能验证闭环的最小 API** |
 | `Expert_Philanthropy` 任务 | 需真实捐款，Go 侧已实测无法绕过（`internal/panel/autotask.go:19`） |
 
@@ -531,11 +531,50 @@ TaskRunner DO
 | 4. 账号接入 | ✅ **完成**：双形态导入 + 删除（带 confirm）。**凭据全链路打通**（假 token → 上游真实 401）。见 [docs/04-accounts.md](docs/04-accounts.md) |
 | 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功**。见 [docs/05-task-engine.md](docs/05-task-engine.md) |
 | 6. 聚合网关 | ✅ **完成**：`/v1/models`（真实 54 个模型）+ 流式 `/v1/chat/completions`（含工具调用）+ **已接入账号池**（选号/记账/换号）。见 [docs/06-gateway.md](docs/06-gateway.md) |
-| 7. Web 面板 | ✅ **完成**：`/panel/` 已上线（账号运维 / 导入 / 设备码登录 / 任务触发+进度 / 模型目录）。CSP 保持严格（无 `unsafe-inline`），安全头齐全。见 [docs/07-panel.md](docs/07-panel.md) |
+| 7. Web 面板 | ✅ **完成**：`/panel/` 已上线。**已重做为 8 视图**（账号池/任务中心/用量/积分包/模型/供应商/配置/日志），并修掉「无密钥时一片空白」。CSP 保持严格。见 [docs/07-panel.md](docs/07-panel.md) |
+| 8. 多供应商 | ✅ **完成**：**11 家**接入统一 `Provider` 接口（约 14.5k 行）。含 2 个自实现的密码学原语（MD5、AES-128-CFB，均与 OpenSSL 逐字节对拍）。见 [docs/08-providers.md](docs/08-providers.md) |
 
-**测试**：`npm test` → **179/179 通过**。`npm run typecheck` → 通过。
+**测试**：`npm test` → **231/231 通过**。`npm run typecheck` → 通过。
 
-**面板地址**：`https://workbuddy-gateway.xiegao.workers.dev/panel/`
+### 📦 供应商能力矩阵（11 家）
+
+| id | login | chat | checkin |
+|---|---|---|---|
+| `workbuddy`（默认） | ✓ | ✓ | ✓ |
+| `cline` | ✕ | ✓ | ✕ |
+| `minimax` | ✕ | ✓ | ✓ |
+| `codearts` | ✕ | ✓ | ✓ |
+| `lobsterai` | ✕ | ✓ | ✓ |
+| `trae` | ✕ | ✓ | ✓ |
+| `qoder` | ✓ | ✓ | ✓ |
+| `opencode` | ✕ | ✓ | ✕ |
+| `loomy` | ✕ | ✓ | ✓ |
+| `raccoon` | ✕ | ✓ | ✕ |
+| `zcode` | ✓ | ✓ | ✕ |
+
+**每个 `✕` 都有可操作的具体原因**（`/admin/providers` 返回 `loginBlockedReason`），
+不用「不支持」这种无信息量文案。典型原因：
+- **codearts / lobsterai / trae**：登录需 `127.0.0.1` 回调监听，Workers 无监听 socket，且无轮询替代路径；
+- **zcode**：签到需 headful Chromium 过阿里云 captcha（推理不受影响）；
+- **raccoon**：无签到端点（每日额度由服务端自动发放）；
+- **cline / minimax / loomy / raccoon**：协议支持（或函数已实现）但本服务未接线发起流程。
+
+### 🔴 第 8 步实测发现的 5 个真实缺陷
+
+1. **模型名前缀泄漏到上游（放大器级）**：`prepareChatBody` 复制 body 却不改 `model`，
+   带前缀的名字发给上游 → 回 `model [...] service info not found` →
+   被归类为 11102 → **给该模型写 6 小时冷却** → 此后**裸名**请求也选不到号，
+   表现为「没有可用账号」。**教训：错误分类会放大输入错误。**
+2. **用量恒为 0（静默）**：记账在流结束后发生，被 Worker 取消；写成
+   `.catch(()=>{})` 连日志都没有。修：传 `ExecutionContext` + `ctx.waitUntil`。
+3. **minimax 静默无内容**：上游是 Anthropic SSE，网关对 OpenAI 帧零解析直通
+   → 客户端读不到 `choices` 且不报错。修：供应商层就地转换。
+4. **凭据被别家抢走（4 家都犯）**：WorkBuddy/cline/minimax/zcode 的令牌
+   **都是三段式 JWT**，形状无法区分；且字段名重叠（cline 把 `uid` 当 `accountId` 别名）。
+   修：加 `bareStringPattern` + `matchesShape` 两把闸门（只认各家独有特征）。
+5. **选号未按供应商过滤**：会把 cline 的凭据拿去打 WorkBuddy 端点。
+   修：`pick()` 支持 `provider`。**⚠️ 过滤必须在 `pick()` 内部做** ——
+   第一版写成「选完再筛」，会让「池里有账号但当前家没账号」误报成「没有可用账号」。
 
 ### 🎯 真实账号端到端验证结果（2026-10-03）
 
@@ -569,11 +608,13 @@ TaskRunner DO
 
 | 项 | 影响 | 状态 |
 |---|---|---|
-| **IP 级 WAF 护栏**（`wafIPGate` 等价物） | 短窗内多号接连 403 时应在**进程级** fail-fast；当前只有账号级软冷却，真遇到会轮转完所有号才停 | ❌ 未实现 |
-| **带真实凭据的高频请求是否会被 IP 级拦截** | 第 1 步只验证了**无凭据只读**请求 | ⚠️ 未验证 |
+| **带真实凭据的高频请求是否会被 IP 级拦截** | 第 1 步只验证了**无凭据只读**请求；第 8 步的实测也以低频为主 | ⚠️ 未验证 |
+| **opencode 每账号代理丢弃** | 参考实现靠「不同匿名槽配不同出口 IP」扩容免费额度；Workers 的 `fetch` 不接受 `dispatcher` ⇒ 多个匿名槽共享同一出口 IP，**额度不再能通过多开扩容** | ❌ 真实功能损失 |
+| **流内换号（trae / lobsterai）** | 需先消费整个 SSE 才能决定重发，与逐帧透传（10ms CPU 铁律）冲突 | ❌ 未实现 |
 | **会话粘性** | 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） | ❌ 未实现 |
 | **图片入站** | Free 计划 10ms CPU 下 base64 图片解码可能超限 | ❌ 未实现 |
 | **连登兑换 / 抽奖 / 旅行** | `travel.ts` 已实现但**未接入计划表**（当前 `growth` 计划只覆盖 11 个任务动作） | ❌ 未接入 |
+| **cline/minimax/loomy/raccoon 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
 
 ### 项目结构（最终）
 
@@ -590,8 +631,16 @@ src/
 ├── pool/                 ② 账号池（AccountPoolDO + 四维正交状态机）
 ├── taskrunner/           ③ 任务引擎（TaskRunnerDO + 11 个动作 + 领奖闭环）
 ├── upstream/             ④ 上游协议层（四套指纹 / 错误分类 / 登录 / 导入）
-├── panel/                ⑤ 管理面板（严格 CSP + 安全头）
-└── store/                ⑥ 存储（DO SQLite + AES-GCM 凭据加密）
+├── panel/                ⑤ 管理面板（8 视图 + 严格 CSP + 安全头）
+├── providers/            ⑥ **多供应商抽象层（11 家，约 14.5k 行）**
+│   ├── types.ts          Provider 接口 + 能力声明 + 判别式
+│   ├── index.ts          注册表 + 自动识别（含顺序纪律）
+│   ├── anthropic.ts      Anthropic ↔ OpenAI 转换（共享层）
+│   ├── md5.ts            纯 TS MD5（WebCrypto 没有）
+│   ├── aes-cfb.ts        纯 TS AES-128-CFB（WebCrypto 没有）
+│   ├── workbuddy.ts      ★ 参考实现
+│   └── qoder-auth-wasm.wasm  （wrangler 内建 CompiledWasm 规则）
+└── store/                ⑦ 存储（DO SQLite + AES-GCM 凭据加密 + 用量环形缓冲）
 ```
 
 ## 十、参考文件
