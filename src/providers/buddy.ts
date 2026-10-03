@@ -35,12 +35,13 @@ import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
-import { fetchBalance } from '../upstream/checkin.js'
+import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
 import {
   ProviderError,
   type ChatRequest,
   type Provider,
   type ProviderBalance,
+  type CheckinResult,
   type ProviderCredential,
   type ProviderModel,
 } from './types.js'
@@ -263,6 +264,28 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     }
   }
 
+  /**
+   * 每日签到。
+   *
+   * ⚠️ 只有**国内版**会走到这里（国际版的 `capabilities.checkin` 是 false，
+   * 上游本就没有该接口）。
+   *
+   * 幂等由上游业务码保证（已签到返回 `10001`/`1001`，映射为 `alreadyDone`）——
+   * 故重复点击是安全的。
+   */
+  async function checkin(credential: ProviderCredential): Promise<CheckinResult> {
+    const effectiveEnv =
+      config.id === BUDDY_CN.id
+        ? (env as Env)
+        : ({ ...(env ?? {}), UPSTREAM_BILLING_BASE: bases.billing } as Env)
+    const r = await dailyCheckin({ uid: credential.uid, accessToken: credential.accessToken }, effectiveEnv)
+    return {
+      alreadyDone: r.alreadyDone,
+      gained: r.credit,
+      detail: r.alreadyDone ? '今日已签到（幂等命中）' : `签到成功，获得 ${r.credit}`,
+    }
+  }
+
   const provider: Provider = {
     id: config.id,
     name: config.name,
@@ -280,6 +303,9 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     listModels,
     chat,
     balance,
+    // ⚠️ 只在声明支持时挂上 —— 国际版没有签到接口，
+    // 挂上去会让「一键签到」对它发起必然失败的请求。
+    ...(config.checkin ? { checkin } : {}),
   }
 
   return provider

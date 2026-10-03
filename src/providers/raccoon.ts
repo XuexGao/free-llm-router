@@ -989,6 +989,19 @@ export const raccoonProvider: Provider = {
      * {@link grantLoginReward} 提供。
      */
     checkin: false,
+    /**
+     * ⚠️ 这不是本服务的缺陷，而是**上游产品形态**。
+     *
+     * 依据 `plugin-src/client/credits-capabilities.js:133`：
+     * `raccoon: { balance: true, onboardingTasks: true }` —— 登记的是**一次性**
+     * `onboardingTasks`，**没有** `dailyCheckin`。
+     * 每日 300 积分由服务端**按日自动发放**（账单 `biz_type: 'daily_grant'`），
+     * 实测注册后 1 分钟即到账 —— 没有可调用的签到端点。
+     */
+    checkinBlockedReason:
+      'Raccoon 的每日积分由服务端自动发放（账单类型 daily_grant），没有可调用的签到端点。'
+      + '这是上游产品形态，不是本服务的缺失 —— 你的积分照常每天到账。',
+
   },
   parseCredential,
   listModels,

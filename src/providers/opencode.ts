@@ -844,6 +844,13 @@ export const opencodeProvider: Provider = {
     balance: false,
     /** ❌ 同上：Zen 没有每日签到/领取机制。 */
     checkin: false,
+    /**
+     * 依据 `src/opencode-adapter.ts` 全文无 balance/credits/checkin 分支
+     * （已 grep 核对）——Zen 没有公开的积分/签到 API。
+     */
+    checkinBlockedReason:
+      'OpenCode Zen 没有积分与签到 API（免费通道的额度按请求限流，不是可领取的积分）。',
+
   },
   parseCredential,
   listModels,

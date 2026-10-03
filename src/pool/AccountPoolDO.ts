@@ -577,6 +577,30 @@ export class AccountPoolDO extends DurableObject<Env> {
     return pruneLoginSessions(this.ctx.storage.sql, now)
   }
 
+  // ─────────────────────── 模型开关 ───────────────────────
+
+  /**
+   * 读某供应商被**停用**的模型 id 列表。
+   *
+   * ⚠️ 这是「面板层」的开关，与「模型级冷却」（上游限流）是两回事：
+   * - 冷却：上游说这个模型暂时不可用，**自动**恢复；
+   * - 停用：用户**手动**选择不用它，只有手动才能恢复。
+   *
+   * 两者不能混用一个字段 —— 混了会导致「手动停用的模型在冷却到期后
+   * 自动复活」，或「被限流的模型被误认为用户停用」。
+   */
+  async getDisabledModels(provider: string): Promise<string[]> {
+    const all = (await this.ctx.storage.get<Record<string, string[]>>('disabledModels')) ?? {}
+    return all[provider] ?? []
+  }
+
+  /** 设置某供应商的停用模型列表。 */
+  async setDisabledModels(provider: string, models: string[]): Promise<void> {
+    const all = (await this.ctx.storage.get<Record<string, string[]>>('disabledModels')) ?? {}
+    all[provider] = models
+    await this.ctx.storage.put('disabledModels', all)
+  }
+
   // ─────────────────────── 用量统计 ───────────────────────
 
   /**

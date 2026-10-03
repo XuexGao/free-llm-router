@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import {
   DEFAULT_PROVIDER,
   findProvider,
+  PROVIDERS,
   parseCredentialAnywhere,
   providerCatalog,
   providerIds,
@@ -303,4 +304,69 @@ test('保留字面量带斜杠的模型名（不能把上游自带斜杠的名�
   const r = splitModelName('deepseek/v3', ['workbuddy', 'cline'], 'workbuddy')
   assert.equal(r.provider, 'workbuddy')
   assert.equal(r.model, 'deepseek/v3', '未知 head 时原名必须完整保留')
+})
+
+// ─────────────────── 签到能力声明（用户报障后新增） ───────────────────
+
+test('⚠️ checkin=false 的供应商必须给出可读原因（否则用户以为坏了）', () => {
+  // 用户实际报障：「Raccoon 明明支持签到，为什么显示不支持」。
+  // 真实原因是 Raccoon 的每日积分**由服务端自动发放**、没有可调用的签到端点。
+  // 面板只显示「✕ 每日签到」而不解释，用户就会以为是我们的缺陷。
+  const missing: string[] = []
+  for (const p of providerCatalog()) {
+    if (p.capabilities.checkin) continue
+    const reason = p.capabilities.checkinBlockedReason
+    if (typeof reason !== 'string' || reason.length < 10) missing.push(p.id)
+  }
+  assert.deepEqual(missing, [], `这些供应商声明了 checkin=false 却没给原因：${missing.join('、')}`)
+})
+
+test('⚠️ raccoon 的 checkin 必须是 false（上游确实没有该端点）', () => {
+  // 依据参考项目 plugin-src/client/credits-capabilities.js:133：
+  // `raccoon: { balance: true, onboardingTasks: true }` —— 无 dailyCheckin。
+  // 每日 300 是服务端按日自动发放（账单 biz_type: 'daily_grant'）。
+  const raccoon = findProvider('raccoon')
+  assert.notEqual(raccoon, undefined)
+  assert.equal(raccoon?.capabilities.checkin, false, 'raccoon 不该声明支持签到')
+  assert.ok(
+    (raccoon?.capabilities.checkinBlockedReason ?? '').includes('自动发放'),
+    '原因里应说明「服务端自动发放」，否则用户仍会困惑',
+  )
+})
+
+test('⚠️ buddy 声明了 checkin=true 就必须真的实现 checkin（否则一键签到会崩）', () => {
+  // 实测踩到：buddy 声明 checkin:true 但没实现方法，
+  // 于是 /admin/checkin/all 对它调用 undefined() 直接抛错。
+  for (const id of ['buddy']) {
+    const p = findProvider(id)
+    assert.notEqual(p, undefined, `${id} 应已注册`)
+    if (p?.capabilities.checkin === true) {
+      assert.equal(typeof p.checkin, 'function', `${id} 声明支持签到就必须实现 checkin()`)
+    }
+  }
+})
+
+test('⚠️ 声明 checkin=true 的供应商都必须实现 checkin 方法', () => {
+  const broken: string[] = []
+  for (const p of PROVIDERS) {
+    if (p.capabilities.checkin === true && typeof p.checkin !== 'function') broken.push(p.id)
+  }
+  assert.deepEqual(broken, [], `声明了支持签到却没实现：${broken.join('、')}`)
+})
+
+test('腾讯双变体：buddy 有签到，workbuddy（国际版）没有', () => {
+  const buddy = findProvider('buddy')
+  const intl = findProvider('workbuddy')
+  assert.notEqual(buddy, undefined)
+  assert.notEqual(intl, undefined)
+  assert.equal(buddy?.capabilities.checkin, true, '国内版有签到')
+  assert.equal(intl?.capabilities.checkin, false, '国际版无签到接口')
+  assert.ok((intl?.capabilities.checkinBlockedReason ?? '').length > 10, '国际版也要说明原因')
+})
+
+test('腾讯双变体都能设备码登录（实测国际版返回 workbuddy.ai 的 authUrl）', () => {
+  for (const id of ['buddy', 'workbuddy']) {
+    const p = findProvider(id)
+    assert.equal(p?.capabilities.login, true, `${id} 应支持设备码登录`)
+  }
 })

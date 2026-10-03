@@ -16,12 +16,11 @@
 </header>
 
 <nav id="nav">
-  <button class="nav-item active" data-view="accounts">账号池</button>
+  <button class="nav-item active" data-view="providers">供应商与账号</button>
   <button class="nav-item" data-view="tasks">任务中心</button>
   <button class="nav-item" data-view="usage">用量</button>
   <button class="nav-item" data-view="packages">积分包</button>
   <button class="nav-item" data-view="models">模型</button>
-  <button class="nav-item" data-view="providers">供应商</button>
   <button class="nav-item" data-view="config">配置</button>
   <button class="nav-item" data-view="logs">日志</button>
 </nav>
@@ -39,59 +38,35 @@
     <p class="hint">密钥存在浏览器 localStorage，每个请求通过 <code>Authorization</code> 头发送（不用 cookie，因此免疫 CSRF）。</p>
   </div>
 
-  <!-- ───────── 账号池 ───────── -->
-  <section class="view" id="view-accounts">
-    <h2>账号池 <button class="ghost" id="refresh-accounts">刷新</button></h2>
-    <div id="pool-counts" class="counts"></div>
-    <div id="accounts"></div>
-
-    <details>
-      <summary>导入凭据</summary>
-      <p class="hint">支持 Go 版 <code>auths/*.json</code>（嵌套形 / 扁平形）与 DSH 插件的 snake_case 形态。
-      可粘贴单个对象、数组，或 <code>{"accounts":[...]}</code>。</p>
-      <textarea id="import-body" rows="6" placeholder='{"accessToken":"...","uid":"...","expiresAt":1699999999}'></textarea>
-      <button id="do-import">导入</button>
-      <pre id="import-result" class="out"></pre>
-    </details>
-
-    <details>
-      <summary>添加账号（设备码登录）</summary>
-      <p class="hint">点击后给出授权链接，在浏览器完成授权；本页自动轮询结果。
-      只有「支持从本服务发起登录」的供应商能在这里选（其余家请导出凭据后导入）。</p>
-      <div class="row">
-        <label>供应商
-          <!-- ⚠️ 选项**全部**由 JS 填（见 loadProviders）。
-               这里刻意不放硬编码 option —— 之前放了 `buddy` 又由 JS 追加，
-               而 loadProviders 会被多次调用且不清空，导致下拉项**重复累积**。 -->
-          <select id="login-provider"></select>
-        </label>
-      </div>
-      <button id="do-login">发起登录</button>
-      <pre id="login-result" class="out"></pre>
-    </details>
-  </section>
-
   <!-- ───────── 任务中心 ───────── -->
   <section class="view" id="view-tasks" hidden>
     <h2>任务中心</h2>
+    <p class="hint">点一下就跑完，不用选。所有任务都是幂等的，重复点安全。</p>
+
+    <div class="task-cards">
+      <div class="task-card">
+        <h3>全部供应商一键签到</h3>
+        <p class="hint">对**所有**账号逐个签到（串行，避免触发风控）。
+        不支持的供应商会显式说明原因，不会静默跳过。</p>
+        <button id="run-checkin-all">一键签到</button>
+      </div>
+
+      <div class="task-card">
+        <h3>Buddy 每日任务</h3>
+        <p class="hint">对国内版（buddy）全部账号跑「签到 + 零消耗成长任务 + 自动领奖」。
+        <strong>不含</strong>需要真实对话的任务（那些会消耗配额）。</p>
+        <button id="run-daily-all">全部做一遍</button>
+      </div>
+    </div>
+
+    <h3>执行结果</h3>
+    <div id="task-result" class="out"></div>
+    <h3>任务进度</h3>
     <div class="row">
       <label>账号 <select id="task-uid"></select></label>
-      <label>计划
-        <select id="task-plan">
-          <option value="daily">daily（签到 + 余额）</option>
-          <option value="growth">growth（零消耗成长任务）</option>
-          <option value="growth-real">growth + 真实对话（⚠️ 消耗配额）</option>
-        </select>
-      </label>
-      <button id="run-task">执行</button>
       <button id="refresh-status" class="ghost">查进度</button>
     </div>
-    <div class="row">
-      <button id="scan-all" class="ghost">扫描全部账号待办</button>
-      <button id="run-all" class="ghost">对全部账号跑 daily</button>
-    </div>
     <pre id="task-status" class="out"></pre>
-    <div id="scan-result" class="out" hidden></div>
   </section>
 
   <!-- ───────── 用量 ───────── -->
@@ -122,9 +97,31 @@
 
   <!-- ───────── 供应商 ───────── -->
   <section class="view" id="view-providers" hidden>
-    <h2>供应商 <button class="ghost" id="refresh-providers">刷新</button></h2>
+    <h2>供应商与账号 <button class="ghost" id="refresh-providers">刷新</button></h2>
+    <div id="pool-counts" class="counts"></div>
     <p class="hint">点任意一家可管理它的账号与模型。</p>
     <div id="providers" class="prov-grid"></div>
+
+    <h3>添加账号</h3>
+    <p class="hint">选供应商后点「发起登录」；不支持登录的家请粘贴凭据导入。
+    凭据会自动声明为该供应商（避免被别家按形状抢走）。</p>
+    <div class="row">
+      <label>供应商
+        <!-- ⚠️ 选项**全部**由 JS 填（见 loadProviders）。这里刻意不放硬编码
+             option —— 之前放了又由 JS 追加，而 loadProviders 会被多次调用
+             且不清空，导致下拉项重复累积。 -->
+        <select id="login-provider"></select>
+      </label>
+      <button id="do-login">发起登录</button>
+    </div>
+    <pre id="login-result" class="out"></pre>
+
+    <details>
+      <summary>粘贴凭据导入</summary>
+      <textarea id="import-body" rows="6" placeholder='{"accessToken":"...","uid":"..."}'></textarea>
+      <button id="do-import">导入</button>
+      <pre id="import-result" class="out"></pre>
+    </details>
   </section>
 
   <!-- ───────── 配置 ───────── -->

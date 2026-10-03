@@ -1010,6 +1010,19 @@ export const zcodeProvider: Provider = {
      * 而产出它必须 **headful** 浏览器。见 {@link checkin} 的完整依据。
      */
     checkin: false,
+    /**
+     * ⚠️ 上游 `billing/claim` **始终**索要阿里云 captcha，而验证码需要
+     * **headful Chromium**（`src/zcode-captcha.ts:57-65` 实测：`--headless=new` 过不了风控）。
+     * Workers 无法拉起浏览器 ⇒ 签到不可行。
+     *
+     * ✅ 但**推理不受影响**：自 3.14.4（2026-09-29）起模型请求不再索要 captcha
+     * （`src/zcode-captcha.ts:5-12` 的 6 个采样点全部 HTTP 200）。
+     */
+    checkinBlockedReason:
+
+      'ZCode 的签到接口始终要求阿里云验证码（需真实浏览器过风控），Workers 无法完成。'
+
+      + '推理不受影响 —— 自 3.14.4 起模型请求已不再需要验证码。',
   },
   parseCredential,
   listModels,

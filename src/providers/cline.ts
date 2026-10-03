@@ -1107,6 +1107,15 @@ export const clineProvider: Provider = {
      * 必须**重新采集**（新版本 sidecar 全量扫描 + 真实端点验证），不要凭猜测打开。
      */
     checkin: false,
+    /**
+     * 依据 `src/cline-credits.ts:46-55` 的实测：对整份 sidecar 二进制做字符串扫描，
+     * `checkin` / `check-in` / `daily` / `campaign` 均**无业务端点命中**
+     * （`campaign` 的命中是 PostHog UTM 参数，`daily` 是 YAML cron 别名）。
+     */
+    checkinBlockedReason:
+      'Cline 没有每日签到端点（对官方客户端做过端点扫描，无命中）。'
+      + '余额可在「积分包」页查看。',
+
   },
   parseCredential,
   listModels,

@@ -31,7 +31,7 @@ import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
 import { jsonError } from './gateway/http.js'
-import { bindBuddy } from './providers/buddy.js'
+import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
   DEFAULT_PROVIDER,
   findProvider,
@@ -155,14 +155,25 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 
   // ── 登录：发起（返回授权 URL 给前端/用户） ──
   if (path === '/admin/login/start' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; provider?: string }
     const realm = body.realm ?? 'cn'
+    // ⚠️ 按供应商选登录域：
+    // - `buddy`（国内版）→ `copilot.tencent.com`
+    // - `workbuddy`（国际版）→ `www.workbuddy.ai`
+    // 两家的 `/v2/plugin/auth/state` 协议完全相同，只是域名不同
+    // （实测国际版返回 `https://www.workbuddy.ai/login?platform=CLI&state=...`）。
+    const loginProvider = body.provider ?? DEFAULT_PROVIDER
     const bases = resolveUpstream(env)
+    const chatBase = loginProvider === 'workbuddy' ? WORKBUDDY_INTL.chatBase : bases.chat
     try {
-      const { state, authUrl } = await startLogin({ chatBase: bases.chat, realm })
+      const { state, authUrl } = await startLogin({ chatBase, realm })
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-      await pool.saveLoginSession(state, { realm, createdAt: Date.now() }, Date.now() + LOGIN_STATE_TTL_MS)
-      return json({ ok: true, state, authUrl, realm, expiresInMs: LOGIN_STATE_TTL_MS })
+      await pool.saveLoginSession(
+        state,
+        { realm, provider: loginProvider, createdAt: Date.now() },
+        Date.now() + LOGIN_STATE_TTL_MS,
+      )
+      return json({ ok: true, state, authUrl, realm, provider: loginProvider, expiresInMs: LOGIN_STATE_TTL_MS })
     } catch (error) {
       return json(
         { error: { message: error instanceof Error ? error.message : String(error), type: 'login_start_failed' } },
@@ -310,6 +321,137 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ done: false, message: '未知的会话类型' })
   }
 
+  // ── 全部供应商一键签到 ──
+  //
+  // ⚠️ 逐账号**串行**（不是 Promise.all）：同时出站连接上限是 6，
+  // 且并行打上游更容易触发风控。
+  //
+  // 只对**声明了 checkin: true** 的供应商执行 —— 其余家显式跳过并说明原因，
+  // 不静默忽略（用户需要知道「为什么这家没签」）。
+  if (path === '/admin/checkin/all' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; provider?: string }
+    const realm = body.realm ?? 'cn'
+    const only = body.provider ?? ''
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      if (only !== '' && providerId !== only) continue
+      if (account.disabled) {
+        results.push({ uid: account.uid, provider: providerId, ok: false, detail: '账号已禁用' })
+        continue
+      }
+      const provider = findProvider(providerId)
+      if (provider === undefined) {
+        results.push({ uid: account.uid, provider: providerId, ok: false, detail: '未知供应商' })
+        continue
+      }
+      if (!provider.capabilities.checkin || provider.checkin === undefined) {
+        // ⚠️ 显式说明原因，不静默跳过
+        results.push({
+          uid: account.uid,
+          provider: providerId,
+          ok: false,
+          skipped: true,
+          detail: provider.capabilities.checkinBlockedReason ?? '该供应商不支持签到',
+        })
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        results.push({ uid: account.uid, provider: providerId, ok: false, detail: '账号缺少凭据' })
+        continue
+      }
+      const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+      try {
+        const r = await bound.checkin!(credential, AbortSignal.timeout(30_000))
+        results.push({
+          uid: account.uid, provider: providerId, nickname: account.nickname,
+          ok: true, alreadyDone: r.alreadyDone, gained: r.gained, detail: r.detail,
+        })
+        // 记录签到日（面板展示用）
+        if (r.alreadyDone || r.gained >= 0) {
+          await pool.noteSuccess(account.uid, Date.now()).catch(() => {})
+        }
+      } catch (error) {
+        results.push({
+          uid: account.uid, provider: providerId, nickname: account.nickname,
+          ok: false, detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({
+      realm,
+      total: results.length,
+      ok: results.filter((r) => r.ok === true).length,
+      skipped: results.filter((r) => r.skipped === true).length,
+      failed: results.filter((r) => r.ok !== true && r.skipped !== true).length,
+      results,
+    })
+  }
+
+  // ── buddy 每日任务（签到 + 零消耗成长任务，**无选项，全部做一遍**） ──
+  //
+  // ⚠️ 刻意**不暴露 plan 选项**：用户要的是「一键做完」，不是「先想清楚要跑哪个计划」。
+  // 内部固定为 `daily + growth`（均零对话消耗），真实对话类任务**不包含**
+  // —— 那会消耗配额，必须显式开启（见 includeRealChat）。
+  if (path === '/admin/tasks/daily-all' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const started: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      if ((account.provider ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) continue
+      if (account.disabled) continue
+      const credential = (await pool.getCredential(account.uid)) as LoginCredential | undefined
+      if (credential === undefined) continue
+      try {
+        const result = await startRun(env, {
+          uid: account.uid,
+          nickname: account.nickname,
+          realm: account.realm,
+          accessToken: credential.accessToken,
+          plan: 'growth',
+        })
+        started.push({ uid: account.uid, nickname: account.nickname, queued: result.queued })
+      } catch (error) {
+        started.push({
+          uid: account.uid, nickname: account.nickname,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ realm, started })
+  }
+
+  // ── 模型开关（面板用：打开/关闭某供应商下的模型） ──
+  //
+  // ⚠️ 与「模型级冷却」是**两个独立概念**，不共用一个字段：
+  // - 冷却 = 上游限流，自动恢复；
+  // - 停用 = 用户手动选择，只能手动恢复。
+  // 混用会导致「手动停用的模型自动复活」这类难查的行为。
+  if (path === '/admin/providers/models/toggle' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: string; provider?: string; model?: string; enabled?: boolean
+    }
+    const realm = body.realm ?? 'cn'
+    const providerId = body.provider ?? ''
+    const model = body.model ?? ''
+    if (providerId === '' || model === '') {
+      return jsonError(400, 'provider 与 model 必填', 'invalid_request')
+    }
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const current = new Set(await pool.getDisabledModels(providerId))
+    if (body.enabled === false) current.add(model)
+    else current.delete(model)
+    await pool.setDisabledModels(providerId, [...current])
+    return json({ ok: true, provider: providerId, model, enabled: body.enabled !== false })
+  }
+
   // ── 清除模型级冷却（「解冻」） ──
   // ⚠️ 必须有的运维入口：模型级退避 6h 起步，而有些失败其实是**我方**问题
   // （如模型名带前缀被上游判为「没有这个模型」），修好代码后不该再等 6 小时。
@@ -347,7 +489,14 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
     try {
       const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
-      return json({ provider: providerId, models })
+      // 带上「是否被用户停用」标记，供面板渲染开关
+      const disabled = await pool.getDisabledModels(providerId)
+      const set = new Set(disabled)
+      return json({
+        provider: providerId,
+        models: models.map((m) => ({ ...m, disabled: set.has(m.id) })),
+        disabledCount: disabled.length,
+      })
     } catch (error) {
       return jsonError(502, error instanceof Error ? error.message : String(error), 'list_models_failed')
     }

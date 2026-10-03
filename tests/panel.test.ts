@@ -140,13 +140,32 @@ test('⚠️ 面板必须有无密钥的引导（否则用户看到一片空白�
   assert.ok(js.includes('switchView'), '无密钥时也应切换视图（让用户看到界面结构）')
 })
 
-test('⚠️ 面板必须有 8 个视图（对齐参考项目的信息密度）', () => {
+test('⚠️ 面板视图（账号池已并入供应商）', () => {
   const html = panelAsset('/panel/')?.body ?? ''
-  const views = ['accounts', 'tasks', 'usage', 'packages', 'models', 'providers', 'config', 'logs']
+  const views = ['providers', 'tasks', 'usage', 'packages', 'models', 'config', 'logs']
   for (const v of views) {
     assert.ok(html.includes(`data-view="${v}"`), `缺少视图：${v}`)
     assert.ok(html.includes(`id="view-${v}"`), `缺少视图容器：${v}`)
   }
+  // ⚠️ 账号池已并入「供应商与账号」，不该再有独立视图
+  assert.ok(!html.includes('data-view="accounts"'), '账号池应已并入供应商视图')
+  assert.ok(!html.includes('id="view-accounts"'), '不该再有独立的账号池容器')
+})
+
+test('⚠️ 任务中心必须是两张卡片且**没有选项下拉**', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(html.includes('run-checkin-all'), '应有「全部供应商一键签到」卡片')
+  assert.ok(html.includes('run-daily-all'), '应有「Buddy 每日任务」卡片')
+  // 用户要求：任务不要有选项，直接全部做一遍
+  assert.ok(!html.includes('task-plan'), '不该有任务计划下拉')
+  assert.ok(!js.includes('includeRealChat'), '任务中心不该暴露 includeRealChat 选项')
+})
+
+test('⚠️ 弹窗模型页必须支持打开/关闭（开关）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(js.includes('/admin/providers/models/toggle'), '应有模型开关接口调用')
+  assert.ok(js.includes('switch'), '应渲染开关控件')
 })
 
 test('⚠️ 面板不得使用 innerHTML 拼外部数据（XSS）', () => {

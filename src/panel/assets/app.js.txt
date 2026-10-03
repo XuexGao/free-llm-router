@@ -90,12 +90,13 @@ function buildTable(cols, rows, numericFrom) {
 // ─────────────────────────── 视图切换 ───────────────────────────
 
 const VIEW_LOADERS = {
-  accounts: () => { loadPool(); loadAccounts() },
-  tasks: () => { loadAccounts() },
+  // ⚠️ 账号池已**并入**供应商视图（用户要求合并）：账号在各自的供应商弹窗里管理，
+  // 顶层不再单独列一遍。这里保留 loadAccounts 是为了给任务中心的下拉填账号。
+  providers: () => loadProviders(),
+  tasks: () => { loadAccounts(); loadTaskUids() },
   usage: () => loadUsage(),
   packages: () => { /* 手动触发（实时查上游，有成本） */ },
   models: () => { /* 手动触发 */ },
-  providers: () => loadProviders(),
   config: () => loadConfig(),
   logs: () => loadLogs(),
 }
@@ -114,9 +115,17 @@ function switchView(name) {
 
 // ─────────────────────────── 账号池 ───────────────────────────
 
+/**
+ * 账号池计数。
+ *
+ * ⚠️ 账号池视图已并入「供应商与账号」，故这里**不再有独立的 DOM 容器**。
+ * 计数现在渲染在供应商视图顶部（见 loadProviders 的调用处）。
+ * 保留此函数是为了让「导入/删除后刷新」的调用点不必到处改。
+ */
 async function loadPool() {
-  const res = await api('/admin/pool?realm=cn')
   const box = $('pool-counts')
+  if (!box) return
+  const res = await api('/admin/pool?realm=cn')
   clear(box)
   if (!res.ok || !res.body || !res.body.counts) return
   const c = res.body.counts
@@ -276,20 +285,71 @@ async function doLogin() {
 
 // ─────────────────────────── 任务中心 ───────────────────────────
 
-async function runTask() {
-  const uid = $('task-uid').value
-  if (!uid) { show('task-status', '请先选择一个账号'); return }
-  const selected = $('task-plan').value
-  const includeRealChat = selected === 'growth-real'
-  const plan = selected === 'daily' ? 'daily' : 'growth'
-  if (includeRealChat && !confirm('该计划会执行需要真实对话的任务，会消耗少量上游配额。继续？')) return
-  const res = await api('/admin/tasks/start', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ uid: uid, realm: 'cn', plan: plan, includeRealChat: includeRealChat }),
+/** 给「查进度」下拉填 buddy 账号（任务只跑国内版）。 */
+async function loadTaskUids() {
+  const res = await api('/admin/accounts?realm=cn')
+  const sel = $('task-uid')
+  if (!sel) return
+  clear(sel)
+  if (!res.ok) return
+  const mine = (res.body.accounts || []).filter((a) => (a.provider || 'buddy') === 'buddy' && !a.disabled)
+  for (const a of mine) {
+    const o = document.createElement('option')
+    o.value = a.uid
+    o.textContent = (a.nickname || a.uid.slice(0, 12))
+    sel.appendChild(o)
+  }
+  if (mine.length === 0) {
+    const o = document.createElement('option')
+    o.value = ''; o.textContent = '（没有可用的 buddy 账号）'
+    sel.appendChild(o)
+  }
+}
+
+/** 卡片一：全部供应商一键签到。 */
+async function runCheckinAll() {
+  const btn = $('run-checkin-all')
+  btn.disabled = true
+  show('task-result', '签到中（逐账号串行，需要一点时间）…')
+  const res = await api('/admin/checkin/all', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn' }),
   })
-  show('task-status', res.body)
-  if (res.ok) setTimeout(() => loadTaskStatus(true), 4000)
+  btn.disabled = false
+  if (!res.ok) { show('task-result', res.body); return }
+
+  const d = res.body
+  const lines = ['成功 ' + d.ok + ' · 跳过 ' + d.skipped + ' · 失败 ' + d.failed + '（共 ' + d.total + '）', '']
+  for (const r of d.results) {
+    const mark = r.ok ? '✅' : (r.skipped ? '⏭️' : '❌')
+    lines.push(mark + ' [' + r.provider + '] ' + (r.nickname || r.uid.slice(0, 16)))
+    if (r.detail) lines.push('     ' + r.detail)
+  }
+  show('task-result', lines.join('\n'))
+  loadAccounts(); loadProviders()
+}
+
+/** 卡片二：buddy 每日任务（签到 + 零消耗成长任务 + 领奖，全部做一遍）。 */
+async function runDailyAll() {
+  const btn = $('run-daily-all')
+  btn.disabled = true
+  show('task-result', '正在为全部 buddy 账号入队…')
+  const res = await api('/admin/tasks/daily-all', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn' }),
+  })
+  btn.disabled = false
+  if (!res.ok) { show('task-result', res.body); return }
+
+  const lines = []
+  for (const st of res.body.started) {
+    if (st.error) { lines.push('❌ ' + (st.nickname || st.uid.slice(0, 16)) + '：' + st.error); continue }
+    lines.push('✅ ' + (st.nickname || st.uid.slice(0, 16)) + '：已入队 ' + st.queued + ' 步')
+  }
+  lines.push('')
+  lines.push('任务由 Durable Object 按 alarm 逐步执行（每步间隔 1s+），稍后点「查进度」看结果。')
+  show('task-result', lines.join('\n'))
+  loadTaskUids()
 }
 
 async function loadTaskStatus(continuePolling) {
@@ -300,7 +360,6 @@ async function loadTaskStatus(continuePolling) {
   const status = res.body && res.body.status
   if (!status) { show('task-status', '还没有运行记录'); return }
 
-  // 渲染成易读的逐步清单（原始 JSON 在步骤多时根本看不清）
   const lines = []
   lines.push('状态：' + (status.finished ? '已完成' : '进行中') +
     '｜队列剩余 ' + status.queue.length + '｜已完成 ' + status.done.length)
@@ -311,45 +370,7 @@ async function loadTaskStatus(continuePolling) {
     if (item.detail) lines.push('     ' + item.detail)
   }
   show('task-status', lines.join('\n'))
-
   if (continuePolling && !status.finished) setTimeout(() => loadTaskStatus(true), 5000)
-}
-
-async function scanAll() {
-  const box = $('scan-result')
-  box.hidden = false
-  show('scan-result', '扫描中（逐账号串行查询上游）…')
-  const res = await api('/admin/tasks/scan', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ realm: 'cn' }),
-  })
-  if (!res.ok) { show('scan-result', res.body); return }
-  const lines = []
-  for (const a of (res.body.accounts || [])) {
-    lines.push('【' + (a.nickname || a.uid) + '】' + a.uid)
-    if (a.error) { lines.push('  错误：' + a.error); continue }
-    lines.push('  共 ' + a.total + ' 个任务，未领 ' + a.pendingCount + ' 个')
-    if (a.claimable && a.claimable.length) lines.push('  可领奖：' + a.claimable.join('、'))
-    if (a.pending && a.pending.length) lines.push('  未领：' + a.pending.join('、'))
-    lines.push('')
-  }
-  show('scan-result', lines.join('\n'))
-}
-
-async function runAllDaily() {
-  const res = await api('/admin/accounts?realm=cn')
-  const accounts = (res.body && res.body.accounts) || []
-  if (accounts.length === 0) { alert('没有账号'); return }
-  if (!confirm('对全部 ' + accounts.length + ' 个账号跑 daily 计划？')) return
-  for (const a of accounts) {
-    await api('/admin/tasks/start', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ uid: a.uid, realm: 'cn', plan: 'daily' }),
-    })
-  }
-  show('task-status', '已对 ' + accounts.length + ' 个账号入队 daily 计划，稍后查看各自进度。')
 }
 
 // ─────────────────────────── 用量 ───────────────────────────
@@ -480,6 +501,7 @@ const CAPS = [
 let providerCache = []
 
 async function loadProviders() {
+  loadPool() // 计数渲染在视图顶部
   const res = await api('/admin/providers')
   const box = $('providers')
   clear(box)
@@ -613,13 +635,35 @@ async function loadModalModels() {
   if (models.length === 0) {
     const n = document.createElement('p'); n.className = 'hint'; n.textContent = '没有模型可显示。'; box.appendChild(n); return
   }
-  box.appendChild(buildTable(
-    ['模型 id', '名称', '上下文', '最大输出'],
-    models.map((m) => [m.id, m.name || '', m.contextWindow || '—', m.maxOutput || '—']),
-  ))
-  const note = document.createElement('p'); note.className = 'hint'
-  note.textContent = '共 ' + models.length + ' 个模型'
-  box.appendChild(note)
+  // 模型列表 + 开关（打开/关闭）
+  const head = document.createElement('p'); head.className = 'hint'
+  head.textContent = '共 ' + models.length + ' 个模型，已关闭 ' + (res.body.disabledCount || 0) + ' 个。'
+    + '开关只影响本服务的模型列表展示，不影响上游额度。'
+  box.appendChild(head)
+
+  for (const m of models) {
+    const row = document.createElement('div')
+    row.className = 'model-row' + (m.disabled ? ' off' : '')
+
+    const mid = document.createElement('span'); mid.className = 'mid'; mid.textContent = m.id
+    const mname = document.createElement('span'); mname.className = 'mname'; mname.textContent = m.name || ''
+    row.appendChild(mid); row.appendChild(mname)
+
+    const sw = document.createElement('button')
+    sw.className = 'switch' + (m.disabled ? '' : ' on')
+    sw.title = m.disabled ? '已关闭，点击打开' : '已打开，点击关闭'
+    sw.onclick = async () => {
+      const nextEnabled = m.disabled === true // 当前关闭 → 打开
+      const r = await api('/admin/providers/models/toggle', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: modalProviderId, model: m.id, enabled: nextEnabled }),
+      })
+      if (!r.ok) { alert('切换失败：' + JSON.stringify(r.body)); return }
+      loadModalModels()
+    }
+    row.appendChild(sw)
+    box.appendChild(row)
+  }
 }
 
 /** 弹窗「添加账号」页：导入 + （若支持）设备码登录。 */
@@ -781,13 +825,11 @@ $('save-key').onclick = () => {
   setAuth('已保存，正在验证…', true)
   bootstrap()
 }
-$('refresh-accounts').onclick = () => { loadPool(); loadAccounts() }
 $('do-import').onclick = doImport
 $('do-login').onclick = doLogin
-$('run-task').onclick = runTask
+$('run-checkin-all').onclick = runCheckinAll
+$('run-daily-all').onclick = runDailyAll
 $('refresh-status').onclick = () => loadTaskStatus(false)
-$('scan-all').onclick = scanAll
-$('run-all').onclick = runAllDaily
 $('refresh-usage').onclick = loadUsage
 $('clear-usage').onclick = async () => {
   if (!confirm('清空用量记录？')) return
