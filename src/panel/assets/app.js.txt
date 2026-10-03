@@ -501,41 +501,36 @@ const CAPS = [
 let providerCache = []
 
 /**
- * 剩余总积分（供应商视图右上角）。
+ * 各供应商的剩余总积分（**每张卡片右上角**）。
  *
- * ⚠️ 未登录（没有任何账号 / 没有凭据）时**不显示** ——
- * 显示「0」会让用户以为额度用光了，而真实情况是「还没加账号」。
+ * ⚠️ 未登录（该供应商没有账号）时**不显示徽标** ——
+ * 显示「0」会让用户以为额度用光了，而真实情况是还没加账号。
  *
- * 逐账号查余额（串行，避免并行打上游触发风控），只统计有余额能力的供应商。
+ * ⚠️ 逐账号查余额是**真打上游**的操作，故只在用户点「刷新」或
+ * 主动触发时执行（`refreshCredits`），不在每次切视图时自动跑 ——
+ * 否则会无谓地消耗上游配额并可能触发风控。
  */
-async function loadTotalCredits() {
-  const pill = $('total-credits')
-  if (!pill) return
-  const res = await api('/admin/accounts?realm=cn')
-  if (!res.ok || !res.body || (res.body.accounts || []).length === 0) {
-    pill.hidden = true
-    return
-  }
-  const pkg = await api('/admin/packages?realm=cn')
-  if (!pkg.ok || !pkg.body || !Array.isArray(pkg.body.accounts)) {
-    pill.hidden = true
-    return
-  }
-  let total = 0
-  let counted = 0
-  for (const a of pkg.body.accounts) {
+let creditCache = {}
+
+async function loadProviderCredits() {
+  const res = await api('/admin/packages?realm=cn')
+  if (!res.ok || !res.body || !Array.isArray(res.body.accounts)) return
+  const byProvider = {}
+  for (const a of res.body.accounts) {
     if (a.error || typeof a.total !== 'number') continue
-    total += a.total
-    counted += 1
+    const pid = a.provider || 'buddy'
+    byProvider[pid] = (byProvider[pid] || 0) + a.total
   }
-  if (counted === 0) { pill.hidden = true; return }
-  pill.hidden = false
-  pill.textContent = '剩余总积分 ' + total.toLocaleString('zh-CN')
+  creditCache = byProvider
+  // 只更新徽标，不重建整张卡片（避免闪烁）
+  for (const [pid, total] of Object.entries(byProvider)) {
+    const el = document.querySelector(`.prov-card[data-provider="${pid}"] .prov-credits`)
+    if (el) { el.hidden = false; el.textContent = total.toLocaleString('zh-CN') }
+  }
 }
 
 async function loadProviders() {
   loadPool()      // 计数渲染在视图顶部
-  loadTotalCredits() // 右上角积分
   const res = await api('/admin/providers')
   const box = $('providers')
   clear(box)
@@ -557,7 +552,18 @@ async function loadProviders() {
     // 卡片：名称 + id + 能力标签
     const card = document.createElement('div')
     card.className = 'prov-card'
+    card.dataset.provider = prov.id
     card.onclick = () => openProviderModal(prov.id)
+
+    // 右上角：该供应商的剩余总积分（无账号时不显示）
+    const credits = document.createElement('span')
+    credits.className = 'prov-credits'
+    credits.hidden = true
+    if (typeof creditCache[prov.id] === 'number') {
+      credits.hidden = false
+      credits.textContent = creditCache[prov.id].toLocaleString('zh-CN')
+    }
+    card.appendChild(credits)
 
     const name = document.createElement('div'); name.className = 'prov-name'; name.textContent = prov.name
     const id = document.createElement('div'); id.className = 'prov-id'; id.textContent = prov.id
@@ -672,8 +678,32 @@ async function loadModalModels() {
   // 模型列表 + 开关（打开/关闭）
   const head = document.createElement('p'); head.className = 'hint'
   head.textContent = '共 ' + models.length + ' 个模型，已关闭 ' + (res.body.disabledCount || 0) + ' 个。'
-    + '开关只影响本服务的模型列表展示，不影响上游额度。'
+    + '关闭后该模型会从 /v1/models 消失，客户端拿不到也调不到。'
   box.appendChild(head)
+
+  // 工具条：一键关闭全部 / 一键开启全部
+  const bar = document.createElement('div'); bar.className = 'model-toolbar'
+  const offAll = document.createElement('button')
+  offAll.className = 'ghost'; offAll.textContent = '全部关闭'
+  // ⚠️ 用**批量**接口（一次往返），不在前端循环调 toggle ——
+  // 那会产生 N 次 DO 往返，中途失败还会留下「关了一半」的不一致状态。
+  const bulk = async (enabled) => {
+    const r = await api('/admin/providers/models/bulk', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: modalProviderId, models: models.map((m) => m.id), enabled }),
+    })
+    if (!r.ok) { alert('操作失败：' + JSON.stringify(r.body)); return }
+    loadModalModels()
+  }
+  offAll.onclick = async () => {
+    if (!confirm('关闭该供应商的全部 ' + models.length + ' 个模型？关闭后客户端在 /v1/models 里看不到它们。')) return
+    offAll.disabled = true; await bulk(false); offAll.disabled = false
+  }
+  const onAll = document.createElement('button')
+  onAll.className = 'ghost'; onAll.textContent = '全部开启'
+  onAll.onclick = async () => { onAll.disabled = true; await bulk(true); onAll.disabled = false }
+  bar.appendChild(offAll); bar.appendChild(onAll)
+  box.appendChild(bar)
 
   for (const m of models) {
     const row = document.createElement('div')
@@ -863,16 +893,35 @@ async function loadWaf() {
  * applyTheme 调用）—— 若等 DOMContentLoaded 再切，浅色用户会先看到
  * 一帧深色闪烁（FOUC）。
  */
+const THEME_ICON = { auto: '🌗', light: '☀️', dark: '🌙' }
+
+/**
+ * 应用主题（三态：auto / light / dark）。
+ *
+ * - `auto` 跟随系统（靠 CSS 的 `prefers-color-scheme`，JS 不干预）；
+ * - `light` / `dark` 显式指定（写 `data-theme`，CSS 里优先级更高）。
+ *
+ * ⚠️ `auto` 时**必须移除** `data-theme` 属性，而不是设成 'auto' ——
+ * 设成字符串 'auto' 会让 CSS 的 `[data-theme='light']` 选择器都不匹配，
+ * 但同时也失去了「跟随系统」的能力（因为属性存在会覆盖媒体查询的意图）。
+ */
 function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme
+  const root = document.documentElement
+  if (theme === 'light' || theme === 'dark') root.dataset.theme = theme
+  else delete root.dataset.theme
   const btn = $('toggle-theme')
-  if (btn) btn.textContent = theme === 'light' ? '深色' : '浅色'
+  if (btn) {
+    btn.textContent = THEME_ICON[theme] || THEME_ICON.auto
+    btn.title = '主题：' + ({ auto: '跟随系统', light: '浅色', dark: '深色' }[theme] || '跟随系统')
+  }
   localStorage.setItem('wb_theme', theme)
 }
 
 $('toggle-theme').onclick = () => {
-  const now = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'
-  applyTheme(now)
+  const cur = localStorage.getItem('wb_theme') || 'auto'
+  // 循环：auto → light → dark → auto
+  const next = cur === 'auto' ? 'light' : cur === 'light' ? 'dark' : 'auto'
+  applyTheme(next)
 }
 
 $('save-key').onclick = () => {
@@ -893,7 +942,10 @@ $('clear-usage').onclick = async () => {
 }
 $('refresh-packages').onclick = loadPackages
 $('load-models').onclick = loadModels
-$('refresh-providers').onclick = loadProviders
+$('refresh-providers').onclick = async () => {
+  await loadProviders()
+  await loadProviderCredits() // 刷新时才真查上游余额
+}
 $('refresh-logs').onclick = loadLogs
 $('clear-logs').onclick = async () => {
   if (!confirm('清空日志？')) return

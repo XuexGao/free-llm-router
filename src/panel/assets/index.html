@@ -12,7 +12,7 @@
   <div class="auth">
     <input id="apikey" type="password" placeholder="API_KEY" autocomplete="off">
     <button id="save-key">保存密钥</button>
-    <button id="toggle-theme" class="ghost" title="切换浅色/深色">浅色</button>
+    <button id="toggle-theme" class="ghost icon-btn" title="切换主题（自动/浅色/深色）">🌗</button>
   </div>
 </header>
 
@@ -102,8 +102,6 @@
   <section class="view" id="view-providers" hidden>
     <h2>供应商与账号
       <button class="ghost" id="refresh-providers">刷新</button>
-      <!-- 剩余总积分：未登录（无账号）时不显示 -->
-      <span id="total-credits" class="credits-pill" hidden></span>
     </h2>
     <div id="pool-counts" class="counts"></div>
     <p class="hint">点任意一家可管理它的账号与模型。</p>
@@ -150,7 +148,7 @@
   <div class="modal-box">
     <div class="modal-head">
       <h3 id="modal-title"></h3>
-      <button id="modal-close" class="ghost">关闭</button>
+      <button id="modal-close" class="ghost icon-btn" title="关闭" aria-label="关闭">✕</button>
     </div>
     <div class="modal-tabs">
       <button class="mtab active" data-mtab="accounts">账号</button>

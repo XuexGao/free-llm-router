@@ -461,6 +461,28 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ ok: true, provider: providerId, model, enabled: body.enabled !== false })
   }
 
+  // ── 批量设置（一键关闭 / 一键开启全部） ──
+  //
+  // ⚠️ 必须服务端批量，不能让前端循环调 N 次 toggle ——
+  // 那会产生 N 次 DO 往返，且中途失败会留下「关了一半」的不一致状态。
+  if (path === '/admin/providers/models/bulk' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: string; provider?: string; models?: unknown; enabled?: boolean
+    }
+    const realm = body.realm ?? 'cn'
+    const providerId = body.provider ?? ''
+    if (providerId === '') return jsonError(400, 'provider 必填', 'invalid_request')
+    if (!Array.isArray(body.models)) return jsonError(400, 'models 必须是数组', 'invalid_request')
+
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const current = new Set(await pool.getDisabledModels(providerId))
+    const ids = body.models.filter((m): m is string => typeof m === 'string' && m !== '')
+    if (body.enabled === false) for (const id of ids) current.add(id)
+    else for (const id of ids) current.delete(id)
+    await pool.setDisabledModels(providerId, [...current])
+    return json({ ok: true, provider: providerId, changed: ids.length, disabledCount: current.size })
+  }
+
   // ── 清除模型级冷却（「解冻」） ──
   // ⚠️ 必须有的运维入口：模型级退避 6h 起步，而有些失败其实是**我方**问题
   // （如模型名带前缀被上游判为「没有这个模型」），修好代码后不该再等 6 小时。
@@ -557,6 +579,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         const b = await fetchBalance({ uid: a.uid, accessToken: credential.accessToken }, env, now)
         out.push({
           uid: a.uid,
+          // ⚠️ 必须回传 provider：面板按供应商卡片汇总积分，
+          // 不回传会让所有账号的积分都算到默认供应商头上（静默算错）。
+          provider: a.provider ?? DEFAULT_PROVIDER,
           nickname: a.nickname,
           total: b.total,
           expiring: b.expiring,
@@ -566,6 +591,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       } catch (error) {
         out.push({
           uid: a.uid,
+          provider: a.provider ?? DEFAULT_PROVIDER,
           nickname: a.nickname,
           error: error instanceof Error ? error.message : String(error),
         })
@@ -870,17 +896,26 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         { uid: picked.uid, accessToken: picked.credential.accessToken },
         env,
       )
+      // ⚠️ **过滤掉用户手动停用的模型**（面板的开关）。
+      // 用户明确要求：「关了之后是真的在 api 上看不见」——
+      // 只在面板上隐藏是不够的，客户端仍然会拿到并可能调用它。
+      //
+      // ⚠️ 只作用于**默认供应商**的裸名/前缀名；其它供应商的模型不在这个端点里。
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const disabled = new Set(await pool.getDisabledModels(DEFAULT_PROVIDER))
+
       // ⚠️ 同时暴露**裸名**与 **`provider/` 前缀名**：
       // - 裸名保持既有用户兼容（他们已经在用 `deepseek-v4-flash`）；
       // - 带前缀名让多供应商场景无歧义（多家可能有同名模型）。
       // 只暴露前缀会破坏兼容性；只暴露裸名则多供应商重名时无法区分。
       const data: Array<Record<string, unknown>> = []
       for (const m of models) {
+        if (disabled.has(m.id)) continue
         const base = m as unknown as Record<string, unknown>
         data.push(base)
         data.push({ ...base, id: `${DEFAULT_PROVIDER}/${m.id}` })
       }
-      return json({ object: 'list', data })
+      return json({ object: 'list', data, disabledCount: disabled.size })
     } catch (error) {
       return jsonError(
         502,

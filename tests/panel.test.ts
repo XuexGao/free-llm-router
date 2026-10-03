@@ -176,12 +176,41 @@ test('⚠️ 面板可见文案不得含 Markdown 星号（这是网页不是 Ma
   }
 })
 
-test('⚠️ 供应商视图必须显示剩余总积分（未登录时隐藏）', () => {
-  const html = panelAsset('/panel/')?.body ?? ''
+test('⚠️ 剩余总积分必须显示在**每张供应商卡片**的右上角（不是顶部）', () => {
+  // 用户明确要求：积分放每个提供商卡片右上角，不是页面右上角。
   const js = panelAsset('/panel/app.js')?.body ?? ''
-  assert.ok(html.includes('id="total-credits"'), '应有积分徽标容器')
-  assert.ok(/id="total-credits"[^>]*hidden/.test(html), '初始必须 hidden（未登录不显示）')
-  assert.ok(js.includes('loadTotalCredits'), '应有加载总积分的逻辑')
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(js.includes('prov-credits'), '卡片应渲染积分徽标')
+  assert.ok(js.includes('data-provider') || js.includes('dataset.provider'), '卡片要带 provider 标识以便定位徽标')
+  assert.ok(/position:\s*absolute/.test(css) && /prov-credits/.test(css), '徽标要绝对定位到卡片右上角')
+  // 未登录（无账号）时不显示：初始 hidden
+  assert.ok(js.includes('credits.hidden = true'), '无积分时徽标必须隐藏（显示 0 会让人以为额度用光）')
+})
+
+test('⚠️ 主题必须支持三态（自动 / 浅色 / 深色）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(js.includes("'auto'"), '应有 auto 态')
+  assert.ok(js.includes("light") && js.includes("dark"), '应有 light / dark 态')
+  // auto 必须靠媒体查询跟随系统
+  assert.ok(css.includes('prefers-color-scheme'), 'CSS 应有 prefers-color-scheme（跟随系统）')
+  // 图标而非文字
+  assert.ok(!js.includes("'浅色'") || js.includes('THEME_ICON'), '主题按钮应显示图标')
+})
+
+test('⚠️ 关闭按钮与主题切换必须是图标（不是文字）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  assert.ok(html.includes('icon-btn'), '应有图标按钮样式类')
+  // 关闭按钮应是 ✕ 而不是「关闭」二字
+  const closeBlock = /<button id="modal-close"[^>]*>([^<]*)</.exec(html)
+  assert.notEqual(closeBlock, null, '应有关闭按钮')
+  assert.ok(!closeBlock[1].includes('关闭'), `关闭按钮应是图标，当前是「${closeBlock[1]}」`)
+})
+
+test('⚠️ 弹窗模型页必须有一键关闭/开启', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(js.includes('全部关闭'), '应有「全部关闭」按钮')
+  assert.ok(js.includes('全部开启'), '应有「全部开启」按钮')
 })
 
 test('⚠️ 必须支持浅色模式（且主题在任何渲染之前应用，避免闪烁）', () => {

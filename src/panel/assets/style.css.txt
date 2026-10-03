@@ -222,3 +222,49 @@ html[data-theme='light'] .notice { background: #eef4ff; border-color: #b9d0f5; }
 html[data-theme='light'] .cap.off { color: #8a93a3; }
 html[data-theme='light'] .model-row.off .mid,
 html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
+
+/* ─────────── 图标按钮 ─────────── */
+.icon-btn {
+  padding: 4px 9px; font-size: 15px; line-height: 1.2;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+
+/* 供应商卡片：积分放右上角 */
+.prov-card { position: relative; }
+.prov-card .prov-credits {
+  position: absolute; top: 8px; right: 10px;
+  font-size: 11px; font-weight: 600; color: var(--ok);
+  background: #14301f; border: 1px solid #1e5b3a; border-radius: 999px;
+  padding: 1px 8px;
+}
+html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-color: #86c79a; }
+
+/* 模型页工具条（一键关闭） */
+.model-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+
+/* ─────────── 自适应主题（auto） ───────────
+ * ⚠️ 只在**没有**显式 data-theme 时生效 ——
+ * 显式选择浅色/深色的用户不该被系统设置覆盖。
+ * 用户若选 auto，JS 会移除 data-theme 属性，于是这里的媒体查询接管。
+ */
+@media (prefers-color-scheme: light) {
+  html:not([data-theme]) {
+    --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
+    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+    --ok: #15803d; --warn: #b45309; --err: #dc2626;
+  }
+  html:not([data-theme]) input,
+  html:not([data-theme]) select,
+  html:not([data-theme]) textarea,
+  html:not([data-theme]) button.ghost { background: #ffffff; }
+  html:not([data-theme]) .out { background: #f8f9fb; }
+  html:not([data-theme]) .bar-track,
+  html:not([data-theme]) .switch { background: #e8ebf0; }
+  html:not([data-theme]) .credits-pill,
+  html:not([data-theme]) .prov-credits { background: #e7f5ec; border-color: #86c79a; }
+  html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
+  html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
+  html:not([data-theme]) .cap.off { color: #8a93a3; }
+  html:not([data-theme]) .model-row.off .mid,
+  html:not([data-theme]) .model-row.off .mname { color: #9aa3b2; }
+}

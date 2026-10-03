@@ -135,3 +135,36 @@ test('allowsAllFieldsExplicit：所有计数字段都被初始化为数字（不
   assert.equal(s.tokenUsage.input, 0)
   assert.equal(s.tokenUsage.output, 0)
 })
+
+// ─────────────────── 池计数（面板恒为 0 的 bug） ───────────────────
+
+test('⚠️ healthy 与 modelExempt 会**同时为真**（计数必须按顺序判）', () => {
+  // 线上实测：面板的「模型限流」恒为 0。
+  // 根因是 counts() 里先判 healthy —— 而 healthy() 只看账号级四维，
+  // **不看** modelCooldowns，于是「账号健康但有模型在冷却」时两个都为 true，
+  // 先判 healthy 就把模型限流那一类吞掉了。
+  const now = 1_700_000_000_000
+  const s = createAccountState({ uid: 'u', nickname: 'n', realm: 'cn' })
+  s.modelCooldowns['glm-5.2'] = {
+    until: now + 3600_000, resetAt: 0, reason: 'x', hits: 1, auditOnly: false,
+  }
+  assert.equal(healthy(s, now), true, 'healthy 只看账号级四维，这里是 true')
+  assert.equal(modelExempt(s, now), true, '有未过期模型冷却 → 也是 true')
+  // ⇒ 两者同时为真，故 counts 必须**先判 modelExempt**
+})
+
+test('⚠️ 审计条目不该让账号被算成「模型限流」', () => {
+  const now = 1_700_000_000_000
+  const s = createAccountState({ uid: 'u', nickname: 'n', realm: 'cn' })
+  s.modelCooldowns['x'] = { until: now + 3600_000, resetAt: 0, reason: 'audit', hits: 1, auditOnly: true }
+  assert.equal(modelExempt(s, now), false, 'auditOnly 不参与判定')
+})
+
+test('过期的模型冷却被剪枝后不算限流', () => {
+  const now = 1_700_000_000_000
+  const s = createAccountState({ uid: 'u', nickname: 'n', realm: 'cn' })
+  s.modelCooldowns['x'] = { until: now - 1000, resetAt: 0, reason: 'old', hits: 1, auditOnly: false }
+  pruneExpired(s, now, 6 * 3600_000)
+  assert.equal(modelExempt(s, now), false)
+  assert.equal(Object.keys(s.modelCooldowns).length, 0, '过期条目应被删除')
+})

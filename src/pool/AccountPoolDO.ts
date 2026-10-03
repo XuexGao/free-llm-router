@@ -298,10 +298,19 @@ export class AccountPoolDO extends DurableObject<Env> {
         disabled += 1
         continue
       }
-      if (healthy(state, now)) {
-        healthyCount += 1
-      } else if (modelExempt(state, now)) {
+      // ⚠️ 判定顺序有语义：**先判模型级限流**，再判整体健康。
+      //
+      // 根因（线上实测踩到）：`healthy()` 只看账号级的四个维度
+      // （until / breakerUntil / degradeUntil / disabled），**不看** modelCooldowns。
+      // 而 `modelExempt()` 要求「账号级健康 且 存在未过期的模型冷却」。
+      // 于是「账号健康但有模型在冷却」时**两个都返回 true** ——
+      // 若先判 healthy，模型限流就永远统计不到（面板恒为 0）。
+      //
+      // 语义上正确：该账号对**部分模型**不可用，不该算「完全健康」。
+      if (modelExempt(state, now)) {
         exempt += 1
+      } else if (healthy(state, now)) {
+        healthyCount += 1
       } else {
         cooling += 1
       }
