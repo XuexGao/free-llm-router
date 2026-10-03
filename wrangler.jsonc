@@ -37,6 +37,22 @@
     "enabled": true
   },
 
+  // ⚠️ **必须显式保留 workers.dev**：一旦配置里出现 `routes`，
+  // wrangler 会**默认关闭** workers.dev（本次实测踩到）——
+  // 若此时自定义域的 DNS 还没建好，服务就**完全不可达**了（404 / 解析失败）。
+  // 显式写 true 作为兜底入口。
+  "workers_dev": true,
+
+  // ⚠️ 自定义域：api.xiegao.top 是对外入口。
+  //
+  // 这里用 **route**（pattern）。注意：route 与 DNS 是两回事 ——
+  // 创建 route **不会**自动建 DNS 记录，故 api.xiegao.top 必须有一条
+  // 同 zone 的 DNS 记录（见 DEPLOY.md）。若缺 DNS，route 不会生效，
+  // 表现为「域名解析不了」（与 Worker 本身无关）。
+  "routes": [
+    { "pattern": "api.xiegao.top/*", "zone_name": "xiegao.top" }
+  ],
+
   // 面板静态资源以**字符串**形式 import（见 src/panel/index.ts 的说明）。
   // 用 Text 模块规则而不是 Workers Static Assets：本项目只有 3 个文件，
   // 且必须挂在 /panel/* 下并统一加安全头 —— Text import 更直接。
