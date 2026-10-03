@@ -31,7 +31,7 @@ import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
 import { jsonError } from './gateway/http.js'
-import { bindWorkbuddy } from './providers/workbuddy.js'
+import { bindBuddy } from './providers/buddy.js'
 import {
   DEFAULT_PROVIDER,
   findProvider,
@@ -276,7 +276,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     }
     return jsonError(
       501,
-      `供应商「${providerId}」不支持从本服务发起登录（${providerId === 'workbuddy' ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
+      `供应商「${providerId}」不支持从本服务发起登录（${providerId === DEFAULT_PROVIDER ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
       'login_unsupported',
     )
   }
@@ -336,13 +336,15 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     }
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     const accounts = await pool.listAccounts('cn', Date.now())
-    const account = accounts.find((a) => (a.provider ?? 'workbuddy') === providerId)
+    const account = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId)
     if (account === undefined) {
       return json({ provider: providerId, models: [], note: '没有该供应商的账号，无法拉取模型目录' })
     }
     const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
     if (credential === undefined) return jsonError(404, '该账号无凭据', 'no_credential')
-    const bound = providerId === 'workbuddy' ? bindWorkbuddy(env) : provider
+    // ⚠️ 只有国内版（buddy）需要绑定 env —— 它允许用 env 覆盖域名便于调试；
+    // 国际版恒用官方域名。
+    const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
     try {
       const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
       return json({ provider: providerId, models })
@@ -584,6 +586,10 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       realm,
       accounts: accounts.map((a) => ({
         uid: a.uid,
+        // ⚠️ 必须回传 provider：面板靠它把账号分到各家卡片下。
+        // 不回传时面板的 `.filter(a => a.provider === id)` 恒为空，
+        // 表现为「点开供应商看不到自己的账号」（实测踩到）。
+        provider: a.provider ?? DEFAULT_PROVIDER,
         nickname: a.nickname,
         disabled: a.disabled,
         reason: a.reason,

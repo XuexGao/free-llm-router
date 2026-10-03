@@ -60,9 +60,10 @@
       只有「支持从本服务发起登录」的供应商能在这里选（其余家请导出凭据后导入）。</p>
       <div class="row">
         <label>供应商
-          <select id="login-provider">
-            <option value="workbuddy">WorkBuddy（腾讯）</option>
-          </select>
+          <!-- ⚠️ 选项**全部**由 JS 填（见 loadProviders）。
+               这里刻意不放硬编码 option —— 之前放了 `buddy` 又由 JS 追加，
+               而 loadProviders 会被多次调用且不清空，导致下拉项**重复累积**。 -->
+          <select id="login-provider"></select>
         </label>
       </div>
       <button id="do-login">发起登录</button>
@@ -122,16 +123,8 @@
   <!-- ───────── 供应商 ───────── -->
   <section class="view" id="view-providers" hidden>
     <h2>供应商 <button class="ghost" id="refresh-providers">刷新</button></h2>
-    <p class="hint">每家的能力由代码显式声明（不是猜测）。声明不可用的会说清原因与替代做法。</p>
-    <div id="providers"></div>
-    <h3>按供应商标识导入</h3>
-    <p class="hint">粘贴凭据时可在 JSON 顶层加 <code>"provider":"cline"</code> 显式声明归属；
-    不加则按凭据特征自动识别（WorkBuddy 最后试，因为它的解析最宽松）。</p>
-    <div class="row">
-      <label>供应商
-        <select id="import-provider"><option value="">自动识别</option></select>
-      </label>
-    </div>
+    <p class="hint">点任意一家可管理它的账号与模型。</p>
+    <div id="providers" class="prov-grid"></div>
   </section>
 
   <!-- ───────── 配置 ───────── -->
@@ -147,6 +140,28 @@
     <div id="logs" class="out"></div>
   </section>
 </main>
+
+<!-- ───────── 供应商详情弹窗 ───────── -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="ghost">关闭</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="mtab active" data-mtab="accounts">账号</button>
+      <button class="mtab" data-mtab="models">模型</button>
+      <button class="mtab" data-mtab="add">添加账号</button>
+    </div>
+    <div class="modal-body">
+      <div id="modal-accounts" class="mtab-panel"></div>
+      <div id="modal-models" class="mtab-panel" hidden></div>
+      <div id="modal-add" class="mtab-panel" hidden>
+        <div id="modal-add-body"></div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="/panel/app.js"></script>
 </body>

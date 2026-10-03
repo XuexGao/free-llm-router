@@ -6,7 +6,7 @@
 
 | 项 | 值 |
 |---|---|
-| Worker 地址 | `https://workbuddy-gateway.xiegao.workers.dev` |
+| Worker 地址 | `https://workbuddy-gateway.<你的子域>.workers.dev` |
 | Durable Objects | `AccountPoolDO`（每 realm 一个）+ `TaskRunnerDO`（每账号一个） |
 | DO 存储后端 | **SQLite**（Free 计划唯一可选） |
 | 体积 | 37.34 KiB / gzip 11.57 KiB |
@@ -125,7 +125,7 @@ npm run deploy       # 部署（需已 wrangler login）
 
 # 部署后验证
 KEY=$(cat /tmp/wb_api_key.txt)   # 或重新 wrangler secret put API_KEY
-BASE=https://workbuddy-gateway.xiegao.workers.dev
+BASE=https://workbuddy-gateway.<你的子域>.workers.dev
 curl -s "$BASE/healthz"
 curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/pool?realm=cn"
 ```

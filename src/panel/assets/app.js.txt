@@ -213,8 +213,9 @@ async function doImport() {
   if (raw === '') { show('import-result', '请先粘贴凭据 JSON'); return }
   let payload
   try { payload = JSON.parse(raw) } catch (e) { show('import-result', 'JSON 解析失败：' + e.message); return }
-  // 显式声明的供应商（可选）会写进 payload 顶层，让后端只试那一家
-  const declared = $('import-provider') ? $('import-provider').value : ''
+  // 显式声明供应商（可选）：取「添加账号」里选的那家，让后端只试它。
+  // 不选（空 = 自动识别）则由后端按凭据形状判别。
+  const declared = $('login-provider') ? $('login-provider').value : ''
   if (declared && payload !== null && typeof payload === 'object' && !Array.isArray(payload) && !payload.provider) {
     payload = Object.assign({}, payload, { provider: declared })
   }
@@ -231,9 +232,10 @@ let loginTimer = null
 
 async function doLogin() {
   if (loginTimer) clearInterval(loginTimer)
-  const providerId = $('login-provider') ? $('login-provider').value : 'workbuddy'
+  // 空 = 自动识别，此时用默认供应商（buddy）走既有端点
+  const providerId = ($('login-provider') && $('login-provider').value) || 'buddy'
   // workbuddy 走既有端点；其它供应商走通用端点
-  const endpoint = providerId === 'workbuddy' ? '/admin/login/start' : '/admin/providers/login/start'
+  const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
   const res = await api(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -257,7 +259,7 @@ async function doLogin() {
   loginTimer = setInterval(async () => {
     tries += 1
     if (tries > 100) { clearInterval(loginTimer); el.textContent += '\n授权超时，请重新发起。'; return }
-    const pollPath = providerId === 'workbuddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
+    const pollPath = providerId === 'buddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
     const r = await api(pollPath + '?state=' + encodeURIComponent(state))
     if (r.ok && r.body && r.body.done) {
       clearInterval(loginTimer)
@@ -465,77 +467,248 @@ async function loadModels() {
 
 // ─────────────────────────── 供应商 ───────────────────────────
 
-/** 能力的中文标签。 */
-const CAP_LABELS = {
-  login: '设备码登录',
-  listModels: '列模型',
-  chat: '对话',
-  balance: '查余额',
-  checkin: '每日签到',
-}
+/** 能力标签（只显示 ✓/✕ + 名称，**不显示说明文案**）。 */
+const CAPS = [
+  ['login', '设备码登录'],
+  ['listModels', '列模型'],
+  ['chat', '对话'],
+  ['balance', '查余额'],
+  ['checkin', '每日签到'],
+]
+
+/** 缓存的供应商目录（弹窗要用）。 */
+let providerCache = []
 
 async function loadProviders() {
   const res = await api('/admin/providers')
   const box = $('providers')
   clear(box)
-  if (!res.ok) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p); return }
+  if (!res.ok) {
+    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p); return
+  }
+  providerCache = res.body.providers || []
 
-  const select = $('import-provider')
-  const keep = select.value
-  clear(select)
-  const auto = document.createElement('option'); auto.value = ''; auto.textContent = '自动识别'
-  select.appendChild(auto)
+  // ⚠️ 登录下拉必须**先清空**再填。
+  // 之前只追加不清空，而 loadProviders 会被多次调用（切视图/刷新），
+  // 于是选项**重复累积** —— 这就是「添加账号选项重复」的根因。
+  const loginSelect = $('login-provider')
+  clear(loginSelect)
+  const autoOpt = document.createElement('option')
+  autoOpt.value = ''; autoOpt.textContent = '自动识别'
+  loginSelect.appendChild(autoOpt)
 
-  for (const prov of (res.body.providers || [])) {
-    const card = document.createElement('div'); card.className = 'card'
+  for (const prov of providerCache) {
+    // 卡片：名称 + id + 能力标签
+    const card = document.createElement('div')
+    card.className = 'prov-card'
+    card.onclick = () => openProviderModal(prov.id)
 
-    const left = document.createElement('div'); left.className = 'grow'
-    const name = document.createElement('strong'); name.textContent = prov.name
-    const id = document.createElement('div'); id.className = 'uid'; id.textContent = prov.id
-    left.appendChild(name); left.appendChild(id)
-    card.appendChild(left)
+    const name = document.createElement('div'); name.className = 'prov-name'; name.textContent = prov.name
+    const id = document.createElement('div'); id.className = 'prov-id'; id.textContent = prov.id
+    card.appendChild(name); card.appendChild(id)
 
-    // 能力标签（不可用的用红色，并把原因放 tooltip + 下方说明）
-    const caps = document.createElement('div'); caps.className = 'grow'
-    for (const [key, label] of Object.entries(CAP_LABELS)) {
+    const caps = document.createElement('div'); caps.className = 'caps'
+    for (const [key, label] of CAPS) {
       const tag = document.createElement('span')
       const on = prov.capabilities[key] === true
-      tag.className = 'tag ' + (on ? 'ok' : 'err')
+      tag.className = 'cap ' + (on ? 'on' : 'off')
       tag.textContent = (on ? '✓ ' : '✕ ') + label
-      tag.style.marginRight = '4px'
       caps.appendChild(tag)
-      const def = document.createElement('span'); def.textContent = ' '
-      caps.appendChild(def)
     }
     card.appendChild(caps)
-
     box.appendChild(card)
 
-    // 不可用能力的**具体原因**（这是本视图最有价值的部分）
-    if (!prov.capabilities.login && prov.capabilities.loginBlockedReason) {
-      const note = document.createElement('p')
-      note.className = 'hint'
-      note.style.marginLeft = '8px'
-      note.textContent = '⚠️ ' + prov.name + ' 无法登录：' + prov.capabilities.loginBlockedReason
-      box.appendChild(note)
-    }
-
-    const opt = document.createElement('option')
-    opt.value = prov.id
-    opt.textContent = prov.name
-    select.appendChild(opt)
-
-    // 只有声明「能发起登录」的家才进登录下拉（避免点了没反应的按钮）
-    const loginSelect = $('login-provider')
-    if (loginSelect && prov.capabilities.login) {
+    // 只有声明能登录的家才进下拉
+    if (prov.capabilities.login) {
       const lo = document.createElement('option')
       lo.value = prov.id
       lo.textContent = prov.name
       loginSelect.appendChild(lo)
     }
   }
-  select.value = keep
 }
+
+// ─────────────────── 供应商弹窗（管理账号 / 模型 / 添加） ───────────────────
+
+let modalProviderId = ''
+
+async function openProviderModal(providerId) {
+  modalProviderId = providerId
+  const prov = providerCache.find((p) => p.id === providerId)
+  $('modal-title').textContent = prov ? `${prov.name}（${prov.id}）` : providerId
+  $('modal').hidden = false
+  switchModalTab('accounts')
+}
+
+function switchModalTab(name) {
+  for (const b of document.querySelectorAll('.mtab')) b.classList.toggle('active', b.dataset.mtab === name)
+  for (const p of document.querySelectorAll('.mtab-panel')) p.hidden = p.id !== 'modal-' + name
+  if (name === 'accounts') loadModalAccounts()
+  if (name === 'models') loadModalModels()
+  if (name === 'add') renderModalAdd()
+}
+
+/** 弹窗「账号」页：只显示该供应商的账号。 */
+async function loadModalAccounts() {
+  const box = $('modal-accounts')
+  clear(box)
+  const res = await api('/admin/accounts?realm=cn')
+  if (!res.ok) { box.textContent = '加载失败'; return }
+  const mine = (res.body.accounts || []).filter((a) => (a.provider || 'buddy') === modalProviderId)
+  if (mine.length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '该供应商下还没有账号。切到「添加账号」页导入或登录。'
+    box.appendChild(p); return
+  }
+  for (const a of mine) {
+    const card = document.createElement('div'); card.className = 'card'
+    const left = document.createElement('div'); left.className = 'grow'
+    const nm = document.createElement('strong'); nm.textContent = a.nickname || '(无昵称)'
+    const uid = document.createElement('div'); uid.className = 'uid'; uid.textContent = a.uid
+    left.appendChild(nm); left.appendChild(uid); card.appendChild(left)
+
+    const tag = document.createElement('span')
+    const cooling = a.until && a.until > Date.now()
+    if (a.disabled) { tag.className = 'tag err'; tag.textContent = '已禁用' }
+    else if (cooling) { tag.className = 'tag warn'; tag.textContent = '冷却中' }
+    else { tag.className = 'tag ok'; tag.textContent = '正常' }
+    card.appendChild(tag)
+
+    const m = document.createElement('span'); m.className = 'metrics'
+    m.textContent = '成功 ' + a.successCount + ' · 错误 ' + a.errTotal
+    card.appendChild(m)
+
+    const del = document.createElement('button'); del.className = 'danger'; del.textContent = '删除'
+    del.onclick = async () => {
+      if (!confirm('删除账号 ' + a.uid + '（含凭据）？不可恢复。')) return
+      const r = await api('/admin/accounts/remove', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uid: a.uid, realm: 'cn', confirm: true }),
+      })
+      if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
+      loadModalAccounts(); loadAccounts(); loadPool()
+    }
+    card.appendChild(del)
+    box.appendChild(card)
+  }
+}
+
+/** 弹窗「模型」页：只列该供应商的模型（带 provider/ 前缀去重）。 */
+async function loadModalModels() {
+  const box = $('modal-models')
+  clear(box)
+  const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载中…'
+  box.appendChild(p)
+  const res = await api('/admin/providers/models?provider=' + encodeURIComponent(modalProviderId))
+  clear(box)
+  if (!res.ok) {
+    const e = document.createElement('p'); e.className = 'hint'
+    e.textContent = (res.body && res.body.error && res.body.error.message) || '加载失败'
+    box.appendChild(e); return
+  }
+  const models = res.body.models || []
+  if (res.body.note) {
+    const n = document.createElement('p'); n.className = 'hint'; n.textContent = res.body.note; box.appendChild(n)
+  }
+  if (models.length === 0) {
+    const n = document.createElement('p'); n.className = 'hint'; n.textContent = '没有模型可显示。'; box.appendChild(n); return
+  }
+  box.appendChild(buildTable(
+    ['模型 id', '名称', '上下文', '最大输出'],
+    models.map((m) => [m.id, m.name || '', m.contextWindow || '—', m.maxOutput || '—']),
+  ))
+  const note = document.createElement('p'); note.className = 'hint'
+  note.textContent = '共 ' + models.length + ' 个模型'
+  box.appendChild(note)
+}
+
+/** 弹窗「添加账号」页：导入 + （若支持）设备码登录。 */
+function renderModalAdd() {
+  const box = $('modal-add-body')
+  clear(box)
+  const prov = providerCache.find((p) => p.id === modalProviderId)
+  const canLogin = prov && prov.capabilities.login
+
+  const hint = document.createElement('p'); hint.className = 'hint'
+  hint.textContent = '粘贴凭据 JSON（会自动声明为本供应商）。'
+  box.appendChild(hint)
+
+  const ta = document.createElement('textarea')
+  ta.id = 'modal-import-body'; ta.rows = 6
+  ta.placeholder = '{"accessToken":"...","uid":"..."}'
+  box.appendChild(ta)
+
+  const imp = document.createElement('button'); imp.textContent = '导入'
+  imp.onclick = async () => {
+    const raw = ta.value.trim()
+    if (raw === '') { alert('请先粘贴凭据'); return }
+    let payload
+    try { payload = JSON.parse(raw) } catch (e) { alert('JSON 解析失败：' + e.message); return }
+    // ⚠️ 显式声明供应商，避免被别家按形状抢走
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      payload = Object.assign({}, payload, { provider: modalProviderId })
+    }
+    const r = await api('/admin/import', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    })
+    alert(r.ok ? '导入成功' : '导入失败：' + JSON.stringify(r.body))
+    if (r.ok) { ta.value = ''; loadModalAccounts(); loadAccounts(); loadPool() }
+  }
+  box.appendChild(imp)
+
+  if (!canLogin) {
+    const n = document.createElement('p'); n.className = 'hint'
+    n.textContent = '该供应商不支持从本服务发起登录，请导入凭据。'
+    box.appendChild(n)
+    return
+  }
+
+  const h2 = document.createElement('h3'); h2.textContent = '设备码登录'
+  box.appendChild(h2)
+  const btn = document.createElement('button'); btn.textContent = '发起登录'
+  const out = document.createElement('pre'); out.className = 'out'
+  btn.onclick = () => startModalLogin(modalProviderId, out)
+  box.appendChild(btn); box.appendChild(out)
+}
+
+let modalLoginTimer = null
+
+async function startModalLogin(providerId, out) {
+  if (modalLoginTimer) clearInterval(modalLoginTimer)
+  const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
+  const res = await api(endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn', provider: providerId }),
+  })
+  if (!res.ok) { out.textContent = JSON.stringify(res.body, null, 2); return }
+  const authUrl = res.body.authUrl
+  const state = res.body.state
+  clear(out)
+  out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…'
+  const a = document.createElement('a')
+  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+  a.textContent = '打开授权页面'
+  out.appendChild(document.createElement('br')); out.appendChild(a)
+
+  let tries = 0
+  modalLoginTimer = setInterval(async () => {
+    tries += 1
+    if (tries > 100) { clearInterval(modalLoginTimer); out.textContent += '\n授权超时。'; return }
+    const pollPath = providerId === 'buddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
+    const r = await api(pollPath + '?state=' + encodeURIComponent(state))
+    if (r.ok && r.body && r.body.done) {
+      clearInterval(modalLoginTimer)
+      out.textContent = '授权成功：' + (r.body.nickname || r.body.uid)
+      loadModalAccounts(); loadAccounts(); loadPool()
+    } else if (r.ok && r.body && r.body.message) {
+      out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
+    }
+  }, 3000)
+}
+
+$('modal-close').onclick = () => { $('modal').hidden = true }
+$('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true }
+for (const b of document.querySelectorAll('.mtab')) b.onclick = () => switchModalTab(b.dataset.mtab)
 
 // ─────────────────────────── 配置 ───────────────────────────
 

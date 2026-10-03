@@ -15,7 +15,7 @@
 
 import type { Provider, ProviderCredential } from './types.js'
 import { ProviderError } from './types.js'
-import { workbuddyProvider } from './workbuddy.js'
+import { buddyProvider, workbuddyProvider } from './buddy.js'
 import { clineProvider } from './cline.js'
 import { minimaxProvider } from './minimax.js'
 import { codeartsProvider } from './codearts.js'
@@ -31,6 +31,14 @@ import { zcodeProvider } from './zcode.js'
  * 全部供应商（**顺序有意义**：第 0 项是默认供应商）。
  */
 export const PROVIDERS: readonly Provider[] = [
+  // ⚠️ 顺序有语义：第 0 项是默认供应商（裸模型名回落到它）。
+  //
+  // `buddy`（国内版）在前：本项目既有的账号与调用方都是国内版，
+  // 保持它作默认才不会破坏兼容。
+  //
+  // 命名口径对齐参考项目 `deepseek-harness-codearts/src/product.ts:76`
+  // （`id: 'buddy' | 'workbuddy'`）：buddy = 国内，workbuddy = 国际。
+  buddyProvider,
   workbuddyProvider,
   clineProvider,
   minimaxProvider,

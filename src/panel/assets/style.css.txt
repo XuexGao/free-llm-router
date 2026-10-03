@@ -5,6 +5,18 @@
   --ok: #34c77b; --warn: #e0a33e; --err: #ef5f5f;
 }
 * { box-sizing: border-box; }
+/*
+ * ⚠️ 全局防御：`[hidden]` 必须压过任何作者样式的 `display`。
+ *
+ * 根因（线上实测）：`.banner { display: flex }` 的优先级**高于**浏览器默认的
+ * `[hidden] { display: none }`（作者样式 > UA 样式），于是 `hidden` 属性
+ * **静默失效** —— 横幅永远显示，即使服务端说 `active: false`、
+ * 点「立即解除」也没用（不报错，只是不生效）。
+ *
+ * 这里用 `!important` 一劳永逸：**任何**元素只要带 `hidden` 就一定不显示，
+ * 不必记得给每个设了 `display` 的类补一条 `[hidden]` 规则。
+ */
+[hidden] { display: none !important; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
@@ -60,6 +72,17 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #1a2432; border: 1px solid #2a3d57; border-radius: 10px; padding: 14px 16px;
 }
 .notice p { margin: 6px 0 0; font-size: 13px; color: var(--dim); }
+/*
+ * ⚠️ `[hidden]` 必须显式声明 `display: none`。
+ *
+ * 根因（线上实测）：`.banner { display: flex }` 的**优先级高于**
+ * 浏览器默认的 `[hidden] { display: none }`（作者样式压过 UA 样式），
+ * 于是 `hidden` 属性完全失效 —— 横幅**永远显示**，
+ * 即使服务端 `active: false`、点「立即解除」也没用。
+ *
+ * 教训：任何给元素设了 `display` 的类，都要配一条 `[hidden]` 规则，
+ * 否则 `hidden` 属性会静默失效（不报错、只是不生效）。
+ */
 .banner {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
   background: #3a2020; border: 1px solid #5b2424; color: #ffd9d9;
@@ -99,3 +122,42 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .bar-fill { background: var(--accent); height: 100%; }
 .bar-fill.bad { background: var(--err); }
 .bar-val { width: 60px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+/* ─────────── 供应商网格 ─────────── */
+.prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.prov-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  cursor: pointer; background: var(--panel2); transition: border-color .12s;
+}
+.prov-card:hover { border-color: var(--accent); }
+.prov-card .prov-name { font-weight: 600; font-size: 13px; }
+.prov-card .prov-id { font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+.prov-card .caps { display: flex; flex-wrap: wrap; gap: 4px; }
+.cap { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+.cap.on { color: var(--ok); border-color: #1e5b3a; }
+.cap.off { color: #6b7280; text-decoration: line-through; }
+
+/* ─────────── 弹窗 ─────────── */
+.modal {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
+}
+.modal[hidden] { display: none !important; }
+.modal-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  width: min(760px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid var(--line);
+}
+.modal-head h3 { margin: 0; font-size: 15px; }
+.modal-tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
+.mtab {
+  background: transparent; border: 1px solid transparent; border-bottom: none;
+  color: var(--dim); padding: 6px 12px; border-radius: 6px 6px 0 0; cursor: pointer; font: inherit;
+}
+.mtab.active { color: var(--text); background: var(--panel2); border-color: var(--line); }
+.modal-body { padding: 14px 16px; overflow: auto; }
+.mtab-panel[hidden] { display: none !important; }
+.modal .card { background: var(--panel2); }

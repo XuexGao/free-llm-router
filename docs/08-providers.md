@@ -250,7 +250,7 @@ opencode(api_key) → opencode ✓
 ```bash
 npm run typecheck && npm test        # 231 条
 
-BASE=https://api.xiegao.top; KEY=<API_KEY>
+BASE=https://<你的域名>; KEY=<API_KEY>
 curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/providers" | jq '.providers | length'   # 11
 curl -s -H "Authorization: Bearer $KEY" "$BASE/v1/models" | jq '.data | length'              # 108（54 裸名 + 54 前缀）
 curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \

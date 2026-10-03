@@ -5,6 +5,7 @@
  */
 
 import { resolveUpstream, type Env } from '../env.js'
+import { DEFAULT_PROVIDER } from '../providers/index.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 
 /** 模型目录单条（OpenAI 兼容形状）。 */
@@ -27,13 +28,13 @@ export async function pickCredential(
    * 没有 workbuddy 账号」的部署会把 cline 的凭据拿去打 WorkBuddy 的端点，
    * 报的是上游 401 —— 看起来像「凭据坏了」，实际是选错了账号。
    */
-  providerId = 'workbuddy',
+  providerId = DEFAULT_PROVIDER,
 ): Promise<{ uid: string; credential: { accessToken: string } } | undefined> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await pool.listAccounts(realm, Date.now())
   for (const account of accounts) {
     if (account.disabled) continue
-    if ((account.provider ?? 'workbuddy') !== providerId) continue
+    if ((account.provider ?? DEFAULT_PROVIDER) !== providerId) continue
     const credential = (await pool.getCredential(account.uid)) as { accessToken?: string } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
       return { uid: account.uid, credential: { accessToken: credential.accessToken } }
@@ -119,7 +120,7 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       id,
       object: 'model',
       created: 0,
-      owned_by: 'workbuddy',
+      owned_by: DEFAULT_PROVIDER,
       ...(typeof m.name === 'string' && m.name !== '' ? { name: m.name } : {}),
     })
   }

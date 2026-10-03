@@ -76,6 +76,13 @@ export interface ProviderCapabilities {
    * 用户才知道该怎么办（例如「需本地回调监听，请从桌面端导出凭据」）。
    */
   loginBlockedReason?: string
+  /**
+   * 签到不可用时的**可读原因**。
+   *
+   * ⚠️ 与 `loginBlockedReason` 同理：`checkin: false` 必须能解释清楚，
+   * 否则用户会以为是本服务的缺陷（实测：国际版**上游本就没有**签到接口）。
+   */
+  checkinBlockedReason?: string
 }
 
 /** 对话请求（与 OpenAI 兼容，但由各供应商自行转换）。 */

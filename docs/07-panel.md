@@ -4,7 +4,7 @@
 
 ## ✅ 结论：面板已上线
 
-**访问地址**：`https://workbuddy-gateway.xiegao.workers.dev/panel/`
+**访问地址**：`https://workbuddy-gateway.<你的子域>.workers.dev/panel/`
 
 | 项 | 值 |
 |---|---|

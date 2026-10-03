@@ -9,7 +9,7 @@
 | 新增模块 | `upstream/events.ts`、`auth.ts`、`tasks.ts`、`checkin.ts`、`travel.ts`、`report.ts`、`store/crypto.ts` |
 | 单测 | **78/78 通过**（`npm test`） |
 | 类型检查 | 通过（`npm run typecheck`） |
-| 部署 | ✅ `https://workbuddy-gateway.xiegao.workers.dev` |
+| 部署 | ✅ `https://workbuddy-gateway.<你的子域>.workers.dev` |
 
 ### 线上实测验证
 
@@ -98,7 +98,7 @@ npm run deploy      # 部署
 
 # 线上验证登录流程
 KEY=$(cat /tmp/wb_api_key.txt)
-BASE=https://workbuddy-gateway.xiegao.workers.dev
+BASE=https://workbuddy-gateway.<你的子域>.workers.dev
 curl -s -H "Authorization: Bearer $KEY" -X POST "$BASE/admin/login/start" \
   -H 'content-type: application/json' -d '{"realm":"cn"}'
 # → 拿到 authUrl，在浏览器打开授权，再轮询：

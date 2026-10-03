@@ -43,14 +43,14 @@
   // 显式写 true 作为兜底入口。
   "workers_dev": true,
 
-  // ⚠️ 自定义域：api.xiegao.top 是对外入口。
+  // ⚠️ 自定义域：<你的域名> 是对外入口。
   //
   // 这里用 **route**（pattern）。注意：route 与 DNS 是两回事 ——
-  // 创建 route **不会**自动建 DNS 记录，故 api.xiegao.top 必须有一条
+  // 创建 route **不会**自动建 DNS 记录，故 <你的域名> 必须有一条
   // 同 zone 的 DNS 记录（见 DEPLOY.md）。若缺 DNS，route 不会生效，
   // 表现为「域名解析不了」（与 Worker 本身无关）。
   "routes": [
-    { "pattern": "api.xiegao.top/*", "zone_name": "xiegao.top" }
+    { "pattern": "<你的域名>/*", "zone_name": "<你的 zone>" }
   ],
 
   // 面板静态资源以**字符串**形式 import（见 src/panel/index.ts 的说明）。

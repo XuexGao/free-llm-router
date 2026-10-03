@@ -10,8 +10,8 @@
 
 **当前阶段：第 1–8 步全部完成。项目可交付。**
 
-- **服务**：`https://api.xiegao.top`（备用 `https://workbuddy-gateway.xiegao.workers.dev`）
-- **面板**：`https://api.xiegao.top/panel/`
+- **服务**：`https://<你的域名>`（备用 `https://workbuddy-gateway.<你的子域>.workers.dev`）
+- **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
 - **231 条单测通过**。
@@ -164,7 +164,7 @@
 | 不做 | 原因 |
 |---|---|
 | 移植 Go 项目全部功能 | Go 侧 21k 行含大量部署态能力（Docker、面板、归档），与 serverless 目标无关 |
-| 支持全部 13 个 provider | ✅ **已做 11 家**（第 8 步）。未做的 2 家是需要本地回调登录的同类，且其推理已以「导入凭据」方式可用 |
+| 支持全部 13 个 provider | ✅ **已做 11 家 + 腾讯双变体（共 12 个变体）**（第 8 步）。未做的 2 家是需要本地回调登录的同类，且其推理已以「导入凭据」方式可用 |
 | ~~zcode 签到~~ | 已确认**不可行**（需 headful Chromium 过阿里云 captcha）；推理不受影响 |
 | 管理面板的完整复刻 | 面板功能多；第一版只做**能验证闭环的最小 API** |
 | `Expert_Philanthropy` 任务 | 需真实捐款，Go 侧已实测无法绕过（`internal/panel/autotask.go:19`） |
@@ -532,15 +532,27 @@ TaskRunner DO
 | 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功**。见 [docs/05-task-engine.md](docs/05-task-engine.md) |
 | 6. 聚合网关 | ✅ **完成**：`/v1/models`（真实 54 个模型）+ 流式 `/v1/chat/completions`（含工具调用）+ **已接入账号池**（选号/记账/换号）。见 [docs/06-gateway.md](docs/06-gateway.md) |
 | 7. Web 面板 | ✅ **完成**：`/panel/` 已上线。**已重做为 8 视图**（账号池/任务中心/用量/积分包/模型/供应商/配置/日志），并修掉「无密钥时一片空白」。CSP 保持严格。见 [docs/07-panel.md](docs/07-panel.md) |
-| 8. 多供应商 | ✅ **完成**：**11 家**接入统一 `Provider` 接口（约 14.5k 行）。含 2 个自实现的密码学原语（MD5、AES-128-CFB，均与 OpenSSL 逐字节对拍）。见 [docs/08-providers.md](docs/08-providers.md) |
+| 8. 多供应商 | ✅ **完成**：**11 家 / 12 个变体**接入统一 `Provider` 接口（约 14.5k 行）。含 2 个自实现的密码学原语（MD5、AES-128-CFB，均与 OpenSSL 逐字节对拍）。见 [docs/08-providers.md](docs/08-providers.md) |
 
 **测试**：`npm test` → **231/231 通过**。`npm run typecheck` → 通过。
 
-### 📦 供应商能力矩阵（11 家）
+### 📦 供应商能力矩阵（**12 个变体**）
+
+> **命名口径**（对齐参考项目 `deepseek-harness-codearts/src/product.ts:76` 的
+> `id: 'buddy' | 'workbuddy'`）：
+> - **`buddy`** = 腾讯**国内版**（`copilot.tencent.com` / `www.codebuddy.cn`）—— **默认供应商**
+> - **`workbuddy`** = 腾讯**国际版**（`www.workbuddy.ai`）
+>
+> ⚠️ 本项目早期只有国内版，且当时的 id 就是 `workbuddy`。
+> 接入国际版后该 id 的含义变了，故**必须做数据迁移**
+> （`AccountPoolDO.migrateBuddyIds`，按凭据 `domain` 判据，
+> 惰性执行一次、幂等）—— 否则既有国内账号会被当成国际账号，
+> 拿国内凭据打 `www.workbuddy.ai`，**必然 401** 且看不出真实原因。
 
 | id | login | chat | checkin |
 |---|---|---|---|
-| `workbuddy`（默认） | ✓ | ✓ | ✓ |
+| `buddy`（国内版，**默认**） | ✓ | ✓ | ✓ |
+| `workbuddy`（国际版） | ✓ | ✓ | ✕ |
 | `cline` | ✕ | ✓ | ✕ |
 | `minimax` | ✕ | ✓ | ✓ |
 | `codearts` | ✕ | ✓ | ✓ |
@@ -557,6 +569,7 @@ TaskRunner DO
 - **codearts / lobsterai / trae**：登录需 `127.0.0.1` 回调监听，Workers 无监听 socket，且无轮询替代路径；
 - **zcode**：签到需 headful Chromium 过阿里云 captcha（推理不受影响）；
 - **raccoon**：无签到端点（每日额度由服务端自动发放）；
+- **workbuddy（国际版）**：上游**本就没有**每日签到接口（积分在 CodeBuddy 侧领）；
 - **cline / minimax / loomy / raccoon**：协议支持（或函数已实现）但本服务未接线发起流程。
 
 ### 🔴 第 8 步实测发现的 5 个真实缺陷
@@ -632,13 +645,13 @@ src/
 ├── taskrunner/           ③ 任务引擎（TaskRunnerDO + 11 个动作 + 领奖闭环）
 ├── upstream/             ④ 上游协议层（四套指纹 / 错误分类 / 登录 / 导入）
 ├── panel/                ⑤ 管理面板（8 视图 + 严格 CSP + 安全头）
-├── providers/            ⑥ **多供应商抽象层（11 家，约 14.5k 行）**
+├── providers/            ⑥ **多供应商抽象层（11 家 / 12 变体，约 14.5k 行）**
 │   ├── types.ts          Provider 接口 + 能力声明 + 判别式
 │   ├── index.ts          注册表 + 自动识别（含顺序纪律）
 │   ├── anthropic.ts      Anthropic ↔ OpenAI 转换（共享层）
 │   ├── md5.ts            纯 TS MD5（WebCrypto 没有）
 │   ├── aes-cfb.ts        纯 TS AES-128-CFB（WebCrypto 没有）
-│   ├── workbuddy.ts      ★ 参考实现
+│   ├── buddy.ts          ★ 参考实现（**一套工厂产出 buddy/workbuddy 两个变体**）
 │   └── qoder-auth-wasm.wasm  （wrangler 内建 CompiledWasm 规则）
 └── store/                ⑦ 存储（DO SQLite + AES-GCM 凭据加密 + 用量环形缓冲）
 ```

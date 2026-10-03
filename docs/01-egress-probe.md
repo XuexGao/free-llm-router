@@ -8,7 +8,7 @@
 
 | 项 | 值 |
 |---|---|
-| 探针地址 | `https://workbuddy-egress-probe.xiegao.workers.dev` |
+| 探针地址 | `https://workbuddy-egress-probe.<你的子域>.workers.dev` |
 | **Cloudflare 出口 IP** | **`2a06:98c0:3600::103`**（IPv6；`loc=SG`、`colo=SIN`） |
 | 请求总数 | 5 轮 × 3 目标 + 10 轮加压 = **25 次**，**0 次 WAF 拦截** |
 | `cn-auth-state` | **15/15 = HTTP 200 + `code:0`**，耗时 253–973 ms |
@@ -107,8 +107,8 @@ Cloudflare Workers 从**共享 IP 段**出网，Free 计划**无法指定出口 
 ### 复现方式（探针仍在线上）
 
 ```bash
-curl -s "https://workbuddy-egress-probe.xiegao.workers.dev/probe?rounds=5"
-curl -s "https://workbuddy-egress-probe.xiegao.workers.dev/probe?only=cn-auth-state&rounds=10"
+curl -s "https://workbuddy-egress-probe.<你的子域>.workers.dev/probe?rounds=5"
+curl -s "https://workbuddy-egress-probe.<你的子域>.workers.dev/probe?only=cn-auth-state&rounds=10"
 ```
 
 如需重新部署（改判据或换账号）：

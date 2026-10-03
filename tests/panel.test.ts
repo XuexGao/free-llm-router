@@ -156,6 +156,47 @@ test('⚠️ 面板不得使用 innerHTML 拼外部数据（XSS）', () => {
   assert.equal(assignments.length, 0, `发现 ${assignments.length} 处 innerHTML 赋值，应用 DOM API 构造`)
 })
 
+test('⚠️ 供应商卡片不得显示 loginBlockedReason 长文案（只留 ✓/✕ 标签）', () => {
+  // 用户要求：每个提供商下方那段说明文字删掉，只保留
+  // 「✓ 设备码登录 ✓ 列模型 ✓ 对话 ✓ 查余额 ✓ 每日签到」这样的能力标签。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(!js.includes('无法登录：'), '不应再渲染「无法登录：<长文案>」')
+  assert.ok(!/loginBlockedReason/.test(js), '面板不该引用 loginBlockedReason')
+  // 但要保留能力标签
+  assert.ok(js.includes('设备码登录') && js.includes('每日签到'), '能力标签必须保留')
+})
+
+test('⚠️ 供应商视图必须支持点开弹窗管理（账号 / 模型 / 添加）', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  for (const id of ['modal', 'modal-accounts', 'modal-models', 'modal-add']) {
+    assert.ok(html.includes(`id="${id}"`), `缺少弹窗容器：${id}`)
+  }
+  assert.ok(js.includes('openProviderModal'), '应有点开供应商的函数')
+  assert.ok(js.includes('/admin/providers/models'), '弹窗模型页应调按供应商列模接口')
+})
+
+test('⚠️ 登录下拉必须先清空再填（否则选项重复累积）', () => {
+  // 实测 bug：HTML 里硬编码了一个 option，JS 又追加且不清空，
+  // 而 loadProviders 会被多次调用 → 下拉项重复。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const html = panelAsset('/panel/')?.body ?? ''
+  // HTML 里不该有硬编码的登录供应商 option
+  const selectBlock = /<select id="login-provider">([\s\S]*?)<\/select>/.exec(html)
+  assert.notEqual(selectBlock, null, '应有 login-provider 下拉')
+  assert.ok(!selectBlock[1].includes('<option'), 'HTML 里不该硬编码 option（应由 JS 统一填）')
+  // JS 必须先 clear 再 append
+  assert.ok(/clear\(loginSelect\)/.test(js), '填选项前必须先 clear')
+})
+
+test('⚠️ CSS 必须有 [hidden] 的全局兜底（否则 display:flex 会压过它）', () => {
+  // 实测 bug：`.banner { display: flex }` 优先级高于 UA 的 `[hidden]{display:none}`，
+  // 导致 WAF 横幅**永远显示**，点「立即解除」也没用。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(css),
+    '必须有 [hidden] { display: none !important } 的全局兜底')
+})
+
 test('面板 JS 规模合理（不应该只是几十行的空壳）', () => {
   const js = panelAsset('/panel/app.js')?.body ?? ''
   const lines = js.split('\n').length

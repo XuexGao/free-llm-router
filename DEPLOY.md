@@ -4,9 +4,9 @@
 
 | 项 | 值 |
 |---|---|
-| **对外入口** | <https://api.xiegao.top> |
-| 备用入口 | <https://workbuddy-gateway.xiegao.workers.dev> |
-| 管理面板 | <https://api.xiegao.top/panel/> |
+| **对外入口** | <https://<你的域名>> |
+| 备用入口 | <https://workbuddy-gateway.<你的子域>.workers.dev> |
+| 管理面板 | <https://<你的域名>/panel/> |
 | 账号 | 2 个（CN 域），已导入 |
 
 > `/` 根路径返回 **401**（需密钥）—— 这是刻意的，避免被扫到。
@@ -42,7 +42,7 @@ npm run deploy
 ```bash
 curl -X PUT -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
   "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains" \
-  -d "{\"zone_id\":\"$ZONE\",\"hostname\":\"api.xiegao.top\",\"service\":\"workbuddy-gateway\",\"environment\":\"production\"}"
+  -d "{\"zone_id\":\"$ZONE\",\"hostname\":\"<你的域名>\",\"service\":\"workbuddy-gateway\",\"environment\":\"production\"}"
 ```
 
 **用自定义域 API 不需要 DNS 写权限** —— Cloudflare 会自动创建对应的 DNS 记录。
@@ -73,7 +73,7 @@ Connect to Git → 选 `XuexGao/workbuddy-serverless`。
 ## 自检
 
 ```bash
-BASE=https://api.xiegao.top
+BASE=https://<你的域名>
 KEY=<你的 API_KEY>
 
 curl -s "$BASE/healthz"                                          # {"ok":true}

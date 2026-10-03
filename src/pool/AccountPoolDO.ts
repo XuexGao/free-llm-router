@@ -140,8 +140,61 @@ export class AccountPoolDO extends DurableObject<Env> {
     return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
   }
 
+  /**
+   * 一次性数据迁移：把 `provider: 'workbuddy'`（当时指**国内版**）改成 `'buddy'`。
+   *
+   * ## ⚠️ 为什么必须做（否则是静默的数据错误）
+   *
+   * 本项目早期只有国内版，它当时的 id 就是 `workbuddy`。
+   * 接入国际版后 `workbuddy` 的含义**变成了国际版** ——
+   * 若不迁移，既有的国内账号会被当成国际账号，
+   * 于是拿国内凭据去打 `www.workbuddy.ai`，**必然 401**，
+   * 且用户看到的是「凭据失效」，真实原因（id 语义变了）完全看不出来。
+   *
+   * 判据：`provider === 'workbuddy'` **且**凭据里的 domain 不含 `workbuddy.ai`。
+   * 幂等：跑第二次时已经是 `buddy`，不再命中。
+   */
+  private async migrateBuddyIds(realm: string, now: number): Promise<number> {
+    const raws = listAccounts(this.ctx.storage.sql, realm)
+    let migrated = 0
+    for (const raw of raws) {
+      const state = normalizeAccountState(JSON.parse(raw))
+      if (state === undefined || state.provider !== 'workbuddy') continue
+
+      // 读凭据看 domain —— 国际版凭据的 domain 含 workbuddy.ai
+      const stored = readCredential(this.ctx.storage.sql, state.uid)
+      let domain = ''
+      if (stored !== undefined) {
+        try {
+          const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
+          const cred = (await decryptCredential(key, stored)) as { extras?: { domain?: string } } | undefined
+          domain = cred?.extras?.domain ?? ''
+        } catch {
+          // 凭据解不开（如换了 CREDENTIAL_KEY）→ 不猜，保持原样
+          continue
+        }
+      }
+
+      // 是国际账号就保留 workbuddy；否则迁到 buddy
+      if (domain.includes('workbuddy.ai')) continue
+      state.provider = 'buddy'
+      writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+      migrated += 1
+    }
+    return migrated
+  }
+
   /** 列出某 realm 的全部账号（惰性剪枝过期条目）。 */
   async listAccounts(realm: string, now: number): Promise<AccountState[]> {
+    // ⚠️ 惰性跑一次 id 迁移（幂等 + 用 storage 标志保证只跑一次）。
+    // 放在这里而不是启动钩子：DO 没有可靠的「启动」时机，而 listAccounts
+    // 是所有读路径的必经之处，天然覆盖「老数据第一次被访问」。
+    const migrated = await this.ctx.storage.get<boolean>('buddyIdMigrated')
+    if (migrated !== true) {
+      await this.migrateBuddyIds(realm, now).catch(() => 0)
+      await this.ctx.storage.put('buddyIdMigrated', true)
+    }
+
     const raws = listAccounts(this.ctx.storage.sql, realm)
     const out: AccountState[] = []
     for (const raw of raws) {

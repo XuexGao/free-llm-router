@@ -308,7 +308,9 @@ test('extractModels：从 /v3/config 双层结构提取', () => {
   assert.equal(models.length, 2)
   assert.equal(models[0]?.id, 'glm-5.2')
   assert.equal(models[0]?.object, 'model')
-  assert.equal(models[0]?.owned_by, 'workbuddy')
+  // ⚠️ owned_by 跟随**默认供应商**：接入国际版后默认是 `buddy`（国内版）。
+  // 命名口径对齐参考项目（buddy = 国内，workbuddy = 国际）。
+  assert.equal(models[0]?.owned_by, 'buddy')
   assert.equal(models[0]?.name, 'GLM-5.2')
   assert.equal(models[1]?.name, undefined, '缺 name 不该编造')
 })
