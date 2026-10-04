@@ -55,6 +55,7 @@ import {
   deleteLoginSession,
 } from '../store/db.js'
 import { decryptCredential, encryptCredential, requireCredentialKey } from '../store/crypto.js'
+import { cstDay } from '../upstream/travel.js'
 import {
   summarizeUsage,
   trimUsageRing,
@@ -489,6 +490,33 @@ export class AccountPoolDO extends DurableObject<Env> {
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
     return true
+  }
+
+  /**
+   * 记录「**今天已签到**」（首次成功与幂等命中都要调）。
+   *
+   * ## ⚠️ 为什么必须有这个方法
+   *
+   * `AccountState.lastCheckinDay` 早就存在（`state.ts:133`），面板也在读它
+   *（`src/panel/assets/app.js.txt:307` 的「签到 YYYY-MM-DD」）——
+   * 但**从来没有代码写过它**，于是那个标签永远不显示。
+   *
+   * 这与 Go 侧的能力不对等：Go 在签到成功与幂等两条分支后都调
+   * `Pool.NoteCheckinDone`（`internal/panel/panel.go:494,499`、
+   * `internal/scheduler/scheduler.go:445,453`）。本项目漏了这一步。
+   *
+   * 「幂等命中也算今天已签」的理由同 Go 侧（`panel.go:491-493`）：
+   * 上游对重复签到回的是业务码而不是错误，用户看到的状态就该是「已签」。
+   *
+   * ⚠️ 日期用**固定 UTC+8**（复用 `upstream/travel.ts:45` 的 `cstDay`，
+   * 与签到活动的日界口径一致），不取本机时区 —— Workerd 恒为 UTC。
+   */
+  async noteCheckinDone(uid: string, now: number): Promise<void> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return
+    const state = JSON.parse(raw) as AccountState
+    state.lastCheckinDay = cstDay(now)
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
   }
 
   /** 显式禁用（人工或 11140 这类强信号）。 */

@@ -150,27 +150,78 @@ async function withRefreshRetry<T>(
 }
 
 /**
+ * 把设备码登录拿到的凭据转成该供应商的 `ProviderCredential`。
+ *
+ * ## ⚠️ 为什么必须走供应商自己的 `parseCredential`（不要手搓字段）
+ *
+ * 手搓会漏掉 `extras`，而 `extras` 里有两个字段是**主流程必需**的：
+ * - `realm`：决定账号落到哪个 `AccountPoolDO` **分片** —— 落错分片等于
+ *   「账号存进去了，但按 realm 查永远查不到」（`/admin/import` 同样从
+ *   `credential.extras['realm']` 取分片，见本文件的导入端点）；
+ * - `enterpriseId`：续期请求的必填头 `X-Enterprise-Id`，漏了企业账号**永远续期失败**
+ *   （`src/providers/buddy.ts:194-196` 明确记了这条）。
+ *
+ * `domain` 也必须落实：`AccountPoolDO.migrateBuddyIds` 用
+ * 「`provider === 'workbuddy'` **且** domain 不含 `workbuddy.ai`」判定为
+ * 「本项目早期把国内版叫 workbuddy 时存下的账号」并迁到 `buddy`
+ * （`src/pool/AccountPoolDO.ts:178-181`）。国际版登录若 domain 为空串，
+ * 刚存进来的国际账号会被这条迁移**误判成国内账号**（静默、且要重新登录才能恢复）。
+ * 故国际版缺 domain 时补上本轮登录**实际使用**的固定域名 —— 这不是编造：
+ * 下面 `/admin/providers/login/start` 的 workbuddy 分支恒用该域名发起登录。
+ */
+function toProviderCredential(providerId: string, cred: LoginCredential): ProviderCredential {
+  const provider = findProvider(providerId)
+  if (provider === undefined) {
+    throw new Error(`未知供应商「${providerId}」，无法把登录结果转成凭据`)
+  }
+  return provider.parseCredential({
+    accessToken: cred.accessToken,
+    refreshToken: cred.refreshToken,
+    expiresAt: cred.expiresAt,
+    domain:
+      cred.domain !== ''
+        ? cred.domain
+        : providerId === WORKBUDDY_INTL.id
+          ? 'www.workbuddy.ai'
+          : '',
+    // ⚠️ realm 用**本轮登录请求的** realm，不靠 domain 猜：
+    // 上游 token 响应里未必带 domain，而 `parseAuthDocument` 在缺 domain 时会
+    // 回落 `cn`（`src/upstream/import.ts:166-167`）—— 国际版会被错判成国内版。
+    realm: cred.realm,
+    uid: cred.uid,
+    enterpriseId: cred.enterpriseId,
+    nickname: cred.nickname,
+  })
+}
+
+/**
  * 把供应商登录拿到的凭据加密落盘（与 `/admin/import` 同一套 key 规则）。
  *
  * ⚠️ 存储 key 的加前缀规则必须与导入路径**完全一致**，
  * 否则同一个账号会因为「登录进来」和「导入进来」而变成两条记录。
+ *
+ * ⚠️ **分片由凭据里的 `realm` 决定**（不是由调用方传进来的 stub 决定）：
+ * `realm` 是「这个账号属于哪个 `AccountPoolDO` 分片」的唯一真相源，
+ * 与 `/admin/import` 取分片的口径一致。若改为「调用方传哪个 stub 就存哪个分片」，
+ * 国际版（realm=global）登录会被存进 cn 分片 —— 表现为「登录成功，但账号列表为空」，
+ * 且极难归因。故这里自己按 `extras['realm']` 取 stub。
  */
 async function persistProviderCredential(
   env: Env,
-  pool: DurableObjectStub<AccountPoolDO>,
   credential: ProviderCredential,
   now: number,
 ): Promise<Record<string, unknown>> {
   const providerId = credential.provider
   const storageUid = providerId === DEFAULT_PROVIDER ? credential.uid : `${providerId}:${credential.uid}`
   const realm = credential.extras['realm'] ?? 'cn'
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   await pool.createAccount(
     { uid: storageUid, nickname: credential.nickname, realm, provider: providerId },
     now,
   )
   await pool.revive(storageUid, now)
   await pool.putCredential(storageUid, credential, now)
-  return { done: true, provider: providerId, uid: storageUid, nickname: credential.nickname }
+  return { done: true, provider: providerId, uid: storageUid, nickname: credential.nickname, realm }
 }
 
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -208,15 +259,20 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // ── 登录：发起（返回授权 URL 给前端/用户） ──
   if (path === '/admin/login/start' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string; provider?: string }
-    const realm = body.realm ?? 'cn'
     // ⚠️ 按供应商选登录域：
     // - `buddy`（国内版）→ `copilot.tencent.com`
     // - `workbuddy`（国际版）→ `www.workbuddy.ai`
     // 两家的 `/v2/plugin/auth/state` 协议完全相同，只是域名不同
     // （实测国际版返回 `https://www.workbuddy.ai/login?platform=CLI&state=...`）。
     const loginProvider = body.provider ?? DEFAULT_PROVIDER
+    // ⚠️ **realm 由供应商决定，不由客户端决定**。
+    // 国际版账号必须落 `global` 分片，且会话也必须存在同一个分片里，
+    // 否则轮询时找不到会话（轮询按 realm 分片逐个查）。
+    // 面板历史上对所有供应商都传 `realm: 'cn'` —— 一律照收的话，
+    // 国际版账号会被存进 `cn` 分片，表现为「登录成功但账号列表里没有它」。
+    const realm = loginProvider === WORKBUDDY_INTL.id ? 'global' : (body.realm ?? 'cn')
     const bases = resolveUpstream(env)
-    const chatBase = loginProvider === 'workbuddy' ? WORKBUDDY_INTL.chatBase : bases.chat
+    const chatBase = loginProvider === WORKBUDDY_INTL.id ? WORKBUDDY_INTL.chatBase : bases.chat
     try {
       const { state, authUrl } = await startLogin({ chatBase, realm })
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
@@ -245,13 +301,21 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     // 且账号数少（1–3 个）时开销可忽略。
     for (const realm of ['cn', 'global']) {
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-      const session = (await pool.getLoginSession(state, now)) as { realm: string; createdAt: number } | undefined
+      const session = (await pool.getLoginSession(state, now)) as
+        | { realm: string; provider?: string; createdAt: number }
+        | undefined
       if (session === undefined) continue
 
+      // ⚠️ 按**会话里记的供应商**选登录域与 realm：
+      // 会话是发起时写下的，比客户端在轮询阶段的任何输入都可信。
+      const providerId = session.provider ?? DEFAULT_PROVIDER
       const bases = resolveUpstream(env)
+      const chatBase = providerId === WORKBUDDY_INTL.id ? WORKBUDDY_INTL.chatBase : bases.chat
+      const sessionRealm = providerId === WORKBUDDY_INTL.id ? 'global' : session.realm
+
       let credential
       try {
-        credential = await pollLogin({ chatBase: bases.chat, realm: session.realm, state })
+        credential = await pollLogin({ chatBase, realm: sessionRealm, state })
       } catch (error) {
         return json(
           { error: { message: error instanceof Error ? error.message : String(error), type: 'login_poll_failed' } },
@@ -270,23 +334,21 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         )
       }
 
-      // 落盘：先建账号条目（清掉旧号遗留的惩罚态），再加密存凭据
-      await pool.createAccount(
-        { uid: credential.uid, nickname: credential.nickname, realm: session.realm },
-        now,
-      )
-      await pool.revive(credential.uid, now) // 全新登录 = 人工恢复口径
-      await pool.putCredential(credential.uid, credential, now)
+      // ⚠️ 落盘走与其它供应商**同一条路**（`persistProviderCredential`）。
+      //
+      // 之前这里直接存 `pollLogin` 的原始结果（`LoginCredential`），
+      // 它**没有 `provider` 与 `extras`** —— 于是：
+      // 1. `buddy.refresh()` 读 `credential.extras['realm']` 会抛 TypeError，
+      //    表现为「登录进来的账号一到期就废」；
+      // 2. 国际版凭据的 `extras.realm` 丢失，账号落不到 `global` 分片。
+      // 转换一次即两个问题同时消掉，且与 `/admin/import` 的落盘形状一致。
+      const providerCredential = toProviderCredential(providerId, { ...credential, realm: sessionRealm })
+      const result = await persistProviderCredential(env, providerCredential, now)
+      // 只有在**落盘成功之后**才清会话 —— 失败时保留，用户可继续轮询重试
       await pool.removeLoginSession(state)
 
       // ⚠️ 只回非敏感字段：**绝不回 token**
-      return json({
-        done: true,
-        uid: credential.uid,
-        nickname: credential.nickname,
-        realm: session.realm,
-        encrypted: true,
-      })
+      return json({ ...result, encrypted: true })
     }
 
     return json({ error: { message: 'unknown or expired state（请重新发起登录）', type: 'unknown_state' } }, 404)
@@ -318,9 +380,12 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // 其余家即便声明了 `login: true` 也无法从本服务发起 —— 见各 provider 的
   // `capabilities.loginBlockedReason`（这是刻意如实声明的，不是遗漏）。
   if (path === '/admin/providers/login/start' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { provider?: string }
+    const body = (await request.json().catch(() => ({}))) as { provider?: string; realm?: string }
     const providerId = body.provider ?? ''
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    // ⚠️ 会话分片必须与**账号将要落入的分片**一致，否则轮询时找不到会话
+    //（轮询按 realm 逐个分片查，见 `/admin/providers/login/poll`）。
+    const loginRealm = body.realm ?? (providerId === WORKBUDDY_INTL.id ? 'global' : 'cn')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(loginRealm))
 
     if (providerId === 'qoder') {
       const { startQoderLogin } = await import('./providers/qoder.js')
@@ -337,6 +402,50 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       await pool.saveLoginSession(state, { provider: 'zcode', kind: 'zcode', flow }, Date.now() + 15 * 60 * 1000)
       return json({ ok: true, provider: 'zcode', state, authUrl: flow.authorizeUrl })
     }
+    // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
+    //
+    // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
+    // 落到下面的 501（登录不支持）—— 国际版账号只能靠粘贴凭据导入。
+    //
+    // 协议逐项对照（国际版与国内版**完全同形**，只有域名不同）：
+    // - `POST {base}/v2/plugin/auth/state?platform=CLI` → `state` + `authUrl`
+    //   （参考实现 `deepseek-harness-codearts/src/buddy-oauth.ts:134-166`；
+    //    入口函数 `src/upstream/auth.ts:96-119` 的 `startLogin`，此处复用）；
+    // - 轮询 `GET /v2/plugin/auth/token`、取账号 `GET /v2/plugin/login/account`
+    //   （`src/upstream/auth.ts:129-200` 的 `pollLogin`）。
+    //
+    // ⚠️ realm 必须是 `global`：它决定账号落哪个 `AccountPoolDO` 分片，
+    // 也是 `refreshCredential` 选续期域的依据
+    //（`global` → `www.workbuddy.ai`，见 `src/upstream/auth.ts:266`）。
+    // 且国际版必须**显式传 realm**，不能靠 domain 兜底 —— 见 `toProviderCredential`。
+    if (providerId === WORKBUDDY_INTL.id) {
+      try {
+        const { state, authUrl } = await startLogin({ chatBase: WORKBUDDY_INTL.chatBase, realm: 'global' })
+        await pool.saveLoginSession(
+          state,
+          { realm: 'global', provider: WORKBUDDY_INTL.id, kind: 'buddy', createdAt: Date.now() },
+          Date.now() + LOGIN_STATE_TTL_MS,
+        )
+        return json({
+          ok: true,
+          provider: WORKBUDDY_INTL.id,
+          state,
+          authUrl,
+          realm: 'global',
+          expiresInMs: LOGIN_STATE_TTL_MS,
+        })
+      } catch (error) {
+        return json(
+          {
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+              type: 'login_start_failed',
+            },
+          },
+          502,
+        )
+      }
+    }
     return jsonError(
       501,
       `供应商「${providerId}」不支持从本服务发起登录（${providerId === DEFAULT_PROVIDER ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
@@ -347,25 +456,54 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // ── 轮询供应商登录结果 ──
   if (path === '/admin/providers/login/poll' && request.method === 'GET') {
     const state = url.searchParams.get('state') ?? ''
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const saved = (await pool.getLoginSession(state, Date.now())) as
-      | { provider: string; kind: string; session?: unknown; flow?: unknown }
-      | undefined
+    // ⚠️ 会话按 realm 分片存放。国际版（workbuddy）的会话在 `global` 分片，
+    // 其余家在 `cn` 分片。**不能只查 cn** —— 那样国际版登录会永远回
+    // 「会话不存在或已过期」（会话就在隔壁分片里）。
+    const saved = await (async (): Promise<{ realm: string; payload: Record<string, unknown> } | undefined> => {
+      for (const realm of ['cn', 'global']) {
+        const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+        const session = (await probe.getLoginSession(state, Date.now())) as Record<string, unknown> | undefined
+        if (session !== undefined) return { realm, payload: session }
+      }
+      return undefined
+    })()
     if (saved === undefined) return json({ done: false, message: '会话不存在或已过期' })
 
     const now = Date.now()
     try {
-      if (saved.kind === 'qoder') {
-        const { pollQoderLogin } = await import('./providers/qoder.js')
-        const credential = await pollQoderLogin(saved.session as never, AbortSignal.timeout(20_000))
-        if (credential === undefined) return json({ done: false, message: '等待授权中…' })
-        return json(await persistProviderCredential(env, pool, credential, now))
+      if (saved.payload['kind'] === 'buddy') {
+        // ── 设备码登录（buddy 国内版 / workbuddy 国际版），与 `/admin/login/poll` 同口径 ──
+        const realm = typeof saved.payload['realm'] === 'string' ? saved.payload['realm'] : saved.realm
+        const providerId = typeof saved.payload['provider'] === 'string' ? saved.payload['provider'] : DEFAULT_PROVIDER
+        const chatBase = providerId === WORKBUDDY_INTL.id ? WORKBUDDY_INTL.chatBase : resolveUpstream(env).chat
+        const cred = await pollLogin({ chatBase, realm, state })
+        // 还没完成授权：不是错误，继续轮询
+        if (cred === undefined) return json({ done: false, message: '等待授权中…' })
+        // 安全边界：uid 会被用作 storage key，必须校验
+        if (!isValidUid(cred.uid)) {
+          return json(
+            { error: { message: '上游返回的 uid 含非法字符，已拒绝入库', type: 'invalid_uid' } },
+            502,
+          )
+        }
+        const credential = toProviderCredential(providerId, cred)
+        const result = await persistProviderCredential(env, credential, now)
+        // 只有**落盘成功**后才清会话：失败时保留，让用户能继续轮询重试
+        const bound = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+        await bound.removeLoginSession(state)
+        return json(result)
       }
-      if (saved.kind === 'zcode') {
-        const { pollZcodeLogin } = await import('./providers/zcode.js')
-        const credential = await pollZcodeLogin(saved.flow as never, AbortSignal.timeout(20_000))
+      if (saved.payload['kind'] === 'qoder') {
+        const { pollQoderLogin } = await import('./providers/qoder.js')
+        const credential = await pollQoderLogin(saved.payload['session'] as never, AbortSignal.timeout(20_000))
         if (credential === undefined) return json({ done: false, message: '等待授权中…' })
-        return json(await persistProviderCredential(env, pool, credential, now))
+        return json(await persistProviderCredential(env, credential, now))
+      }
+      if (saved.payload['kind'] === 'zcode') {
+        const { pollZcodeLogin } = await import('./providers/zcode.js')
+        const credential = await pollZcodeLogin(saved.payload['flow'] as never, AbortSignal.timeout(20_000))
+        if (credential === undefined) return json({ done: false, message: '等待授权中…' })
+        return json(await persistProviderCredential(env, credential, now))
       }
     } catch (error) {
       return json({ done: false, message: error instanceof Error ? error.message : String(error) })
@@ -423,9 +561,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
           uid: account.uid, provider: providerId, nickname: account.nickname,
           ok: true, alreadyDone: r.alreadyDone, gained: r.gained, detail: r.detail,
         })
-        // 记录签到日（面板展示用）
+        // ⚠️ 记录**签到日**（面板「签到 YYYY-MM-DD」标签的数据源）。
+        //
+        // 原实现只调 `noteSuccess`，而它**不写** `lastCheckinDay` —— 于是那句
+        // 「记录签到日」的注释从来没有兑现，面板标签永远为空（实测
+        // `/admin/accounts` 上两个 buddy 账号的 `lastCheckinDay` 都是 `""`）。
+        // Go 侧对应的 `Pool.NoteCheckinDone`（`internal/panel/panel.go:494,499`）
+        // 与清熔断是两个独立动作，故这里也分两次调用。
         if (r.alreadyDone || r.gained >= 0) {
-          await pool.noteSuccess(account.uid, Date.now()).catch(() => {})
+          const at = Date.now()
+          await pool.noteCheckinDone(account.uid, at).catch(() => {})
+          await pool.noteSuccess(account.uid, at).catch(() => {})
         }
       } catch (error) {
         results.push({
@@ -882,7 +1028,15 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         fails: a.fails,
         breakerUntil: a.breakerUntil,
         softStreak: a.softStreak,
-        modelCooldowns: Object.keys(a.modelCooldowns),
+        // ⚠️ 不只给模型名，还要给**到期时间与原因** ——
+        // 面板的「模型限流」弹窗要显示「还剩多久 / 为什么被限」，
+        // 只给名字无法回答用户最关心的那两个问题。
+        modelCooldowns: Object.entries(a.modelCooldowns).map(([model, info]) => ({
+          model,
+          until: info?.until ?? 0,
+          reason: info?.reason ?? '',
+          hits: info?.hits ?? 0,
+        })),
       })),
     })
   }

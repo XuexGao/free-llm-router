@@ -561,7 +561,32 @@ async function handleProviderChat(input: {
     }
   }
 
-  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  // ⚠️ **realm 自动回退**（实测踩到：国际版登录成功却报「没有可用账号」）。
+  //
+  // 账号按凭据的 `extras.realm` 分片存放（WorkBuddy 国际版在 `global`），
+  // 而客户端选分片靠查询参数 `?realm=`，缺省 `cn`。
+  // 于是「国际版登录成功 → 用的时候报没有账号」，用户完全看不出
+  // 是分片选错了（账号明明在，只是在另一个分片）。
+  //
+  // 只在「该分片里这个供应商**一个账号都没有**」时回退 ——
+  // 否则会把「有账号但都在冷却」误判成「该换分片」，掩盖真实原因。
+  let activeRealm = realm
+  {
+    const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const hasHere = (await probe.listAccounts(realm, Date.now())).some(
+      (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+    )
+    if (!hasHere) {
+      const other = realm === 'cn' ? 'global' : 'cn'
+      const probeOther = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
+      const hasOther = (await probeOther.listAccounts(other, Date.now())).some(
+        (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+      )
+      if (hasOther) activeRealm = other
+    }
+  }
+
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(activeRealm))
   // ⚠️ 与 WorkBuddy 路径同理：请求体里的 `model` 必须换成**去前缀**的裸名。
   // 各 provider 的 `chat()` 会把它直接放进上游请求，带前缀会被上游判为
   // 「没有这个模型」—— 而这个错误又会被记成模型级冷却（见上面的长注释）。
@@ -577,7 +602,7 @@ async function handleProviderChat(input: {
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
     // **不要**在这里「先选中再筛掉」—— 那会让「池里有账号但当前供应商没账号」
     // 表现为「pick 返回了号、却被我丢掉」，最终误报「没有可用账号」（实测踩到）。
-    const picked = await pool.pick({ realm, provider: providerId, model, exclude: tried, now })
+    const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now })
     if (picked === undefined) break
     tried.push(picked.uid)
 
@@ -773,7 +798,7 @@ async function handleProviderChat(input: {
         // ⚠️ 区分「真的没账号」与「有账号但全在冷却/熔断」。
         // 实测踩到：账号因连续失败进了熔断，报的却是「请先导入凭据」——
         // 用户会去重新导入一份好凭据，而真实原因是**等几分钟就好**。
-        ? (await describeNoAccount(env, realm, providerId))
+        ? (await describeNoAccount(env, activeRealm, providerId))
         : `供应商「${provider.name}」请求失败：${lastError.message}`,
       'provider_error',
     ),

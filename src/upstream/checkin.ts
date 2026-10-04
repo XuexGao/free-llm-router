@@ -132,8 +132,30 @@ export async function dailyCheckin(
 
   const code = res.envelope?.code
 
-  // 幂等命中：已签到
-  if (code === 10001 || code === 1001) {
+  // 幂等命中：已签到。
+  //
+  // ⚠️ 判据比初版**多两路**，两条都来自协议权威（Go 侧），不是我方猜测：
+  // 1. **`14001` 也是「今日已签到」** —— Go 侧 `IsAlreadyCheckin` 把
+  //    `code=14001` + msg「今日已签到」当作幂等成功
+  //    （`internal/upstream/client.go:199-201`，用例
+  //    `internal/upstream/checkin_retry_test.go:67`）。初版只认 10001/1001，
+  //    于是上游若改用 14001，我们会对「其实已签」判**失败** ——
+  //    报错文案还会误导用户以为签到坏了。
+  // 2. **文案兜底**（`已签到` / `already checked in`）：Go 的
+  //    `alreadyCheckinMarkers`（`client.go:201,2071-2075`）就是按文案匹配的，
+  //    因为**码值由服务端下发**（`110` 那种「本地产物里没有硬编码」的情况已出现过），
+  //    上游改码是已知风险，只认码会在改码当天集体失灵。
+  //
+  //    ⚠️ 但英文侧**刻意收窄**成 `already checked/signed in`，不照抄 Go 的裸
+  //    `already`：裸词会命中 `activity already ended` 这类文案，而误报
+  //    「今天已签」的方向是**有害**的 —— 用户以为签过了、当天积分就真的错过
+  //    （与本项目 qoder 那条「把『服务端没下发数据』误报成『今天已领』」同因，
+  //    见 `upstream/checkin.ts` 头部第 2 条的同类教训）。
+  //    误报「未签」最多让用户多点一次（上游幂等，回业务码，无害）。
+  const msg = res.envelope?.msg ?? ''
+  const alreadyByCode = code === 10001 || code === 1001 || code === 14001
+  const alreadyByMsg = /已签到|already\s+(?:checked|signed)\s*in/i.test(msg)
+  if (alreadyByCode || alreadyByMsg) {
     return { claimed: false, alreadyDone: true, credit: 0 }
   }
 

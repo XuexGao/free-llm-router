@@ -137,6 +137,25 @@
 </main>
 
 <!-- ───────── 供应商详情弹窗 ───────── -->
+<!--
+  ⚠️ 通用信息弹窗（与供应商弹窗分开）。
+  用途：把「冷却中 / 模型限流」这类**计数**点开，列出具体是哪些账号、哪些模型。
+  用户报障：「冷却中和模型限流支持点击弹窗查看具体哪个账号和模型」。
+  分开的原因：供应商弹窗的标签页与数据都是按 provider 组织的，
+  而池计数是**跨供应商**的，硬塞进去会污染那套结构。
+-->
+<div id="info-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="info-title"></h3>
+      <button id="info-close" class="ghost icon-btn" title="关闭" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="info-body"></div>
+    </div>
+  </div>
+</div>
+
 <div id="modal" class="modal" hidden>
   <div class="modal-box">
     <div class="modal-head">

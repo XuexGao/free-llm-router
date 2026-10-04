@@ -68,25 +68,30 @@ import type {
 
 /** OpenCode Zen 的固定端点与产品常量。 */
 /**
- * ## ⚠️ 匿名通道（`Bearer public`）已被上游关闭（实测，2026-10 复核）
+ * ## ✅ 更正：匿名通道**仍然可用**（我先前的判断是错的）
  *
- * 参考项目把 `public` 当作「官方 CLI 无 key 时的字面量」，据此实现了匿名通道。
- * 但**实测该通道已失效**：
+ * 我曾写下「匿名通道已被上游关闭」的结论，依据是 `Bearer public` 返回
+ * `401 Missing API key`。**那个结论是错的** —— 真正的原因是**模型选错了**：
  *
+ * | 模型类型 | 匿名 `Bearer public` 的结果 |
+ * |---|---|
+ * | `space-bunny-free` | **200，正常返回**（匿名可用） |
+ * | 需付费 key 的模型（如 `deepseek-v4.1-flash`） | `401 Missing API key` |
+ * | 免费通道受限的模型（如 `big-pickle`） | `403 FreeTierError: only be used from within OpenCode` |
+ *
+ * ⚠️ 上游对「需要 key 的模型」返回的是 `Missing API key` —— 这个文案**极具误导性**：
+ * 它看起来像「没有提供 key」，实际含义是「**这个模型**不接受匿名访问」。
+ * 我据此误判成「整个匿名通道被关闭」，并写进了代码注释。
+ *
+ * **纪律**：判断「通道是否可用」必须用**明确标记为匿名可用**的模型去验证
+ *（如 `space-bunny-free`），不能随便挑一个模型就下结论。
+ *
+ * 复现（2026-10 实测，86 个模型全打一遍）：
  * ```
  * POST https://opencode.ai/zen/v1/chat/completions
  * authorization: Bearer public
- * → HTTP 401 {"type":"error","error":{"type":"AuthError","message":"Missing API key."}}
+ * body: {"model":"space-bunny-free",...}  → HTTP 200 ✅
  * ```
- *
- * 已排除的可能：换成 `x-api-key` 头、补 `user-agent`、换模型 —— 全部同样 401。
- * 故这是**上游的策略变更**，不是本项目的接线错误。
- *
- * 影响：`{"api_key":"public"}` 形态的凭据**仍然能导入、能列模型**（列模走静态表，
- * 不发请求），但**对话一定失败**。这不是「配错了」，是这条路已经不通。
- *
- * 处置：用户在 https://opencode.ai/auth 取真实 `sk-…` key 后重新导入即可。
- * 若要恢复匿名通道，得先确认上游是否重新放开 —— 不要再照着参考项目改回来。
  */
 export const OPENCODE = {
   baseUrl: 'https://opencode.ai/zen',
@@ -138,16 +143,24 @@ export interface OpencodeFallbackModel {
  * ⇒ 两条通道都不可用。留在目录里只会让用户点到一个必然失败的模型。
  */
 export const OPENCODE_FALLBACK_MODELS: readonly OpencodeFallbackModel[] = [
-  // ── 匿名可用（chat 端点，无需 key）──
-  { id: 'big-pickle', name: 'Big Pickle', isFree: true, contextWindow: 262144 },
+  // ── 匿名**实测可用**（2026-10 逐个复测，共 86 个模型全打一遍）──
+  //
+  // ⚠️ 只有这一个真的能匿名用。参考项目曾把 7 个标成 `isFree: true`，
+  // 但**上游已收紧**：其余 6 个现在返回
+  // `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`。
+  //
+  // ⚠️ 这条清单的正确性**直接影响排查方向**：标错的模型被选中时，
+  // 上游对「需要 key 的模型」返回的是 `401 Missing API key` ——
+  // 那个文案会把人误导成「匿名通道被关了」，而真相只是**模型选错了**。
+  // （我本人就被误导过一次，见本文件顶部的更正说明。）
   { id: 'space-bunny-free', name: 'Space Bunny Free', isFree: true, contextWindow: 262144 },
-  { id: 'longcat-2.5-preview-free', name: 'LongCat 2.5 Preview Free', isFree: true, contextWindow: 262144 },
-  { id: 'mimo-v2.6-flash-free', name: 'MiMo-V2.6-Flash Free', isFree: true, contextWindow: 262144 },
-  { id: 'mimo-v2.5-free', name: 'MiMo-V2.5 Free', isFree: true, contextWindow: 262144 },
-  // ⚠️ 这两个官方 docs 标注走 `/v1/models/{id}`（Gemini 风格），但**实测
-  // chat 端点也通** ⇒ 按 chat 处理。**以实测为准，不以 docs 为准。**
-  { id: 'nemotron-3-ultra-free', name: 'Nemotron 3 Ultra Free', isFree: true, contextWindow: 262144 },
-  { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning Free', isFree: true, contextWindow: 262144 },
+  // ── 曾标为匿名可用、**现已被上游限制**（保留在目录里但标记为非匿名）──
+  { id: 'big-pickle', name: 'Big Pickle', isFree: false, contextWindow: 262144 },
+  { id: 'longcat-2.5-preview-free', name: 'LongCat 2.5 Preview Free', isFree: false, contextWindow: 262144 },
+  { id: 'mimo-v2.6-flash-free', name: 'MiMo-V2.6-Flash Free', isFree: false, contextWindow: 262144 },
+  { id: 'mimo-v2.5-free', name: 'MiMo-V2.5 Free', isFree: false, contextWindow: 262144 },
+  { id: 'nemotron-3-ultra-free', name: 'Nemotron 3 Ultra Free', isFree: false, contextWindow: 262144 },
+  { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning Free', isFree: false, contextWindow: 262144 },
   // ── 需付费 key（chat 端点；实测匿名为 401）──
   { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', isFree: false, contextWindow: 262144 },
   { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', isFree: false, contextWindow: 262144 },

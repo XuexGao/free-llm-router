@@ -72,3 +72,35 @@ export const GAP = {
   /** `mpChatEventGap`：mp 对话事件间隔（**必须**够长，否则服务端回滚进度）。 */
   mpChatEvent: 45_000,
 } as const
+
+/**
+ * Cron 扇出会不会给出**空令牌**（即 DO 侧需要自己去账号池补取凭据）。
+ *
+ * ## ⚠️ 为什么这个判据必须存在（实测踩到的静默故障）
+ *
+ * `src/index.ts` 的 `scheduled()` 只做廉价扇出（Cron 只有 10ms CPU，
+ * 见 AGENTS.md §8.2.1），因此**刻意传 `accessToken: ''`**。
+ * 而 DO 若直接把空串当 Bearer 发出去，上游对**所有**请求都回 401。
+ *
+ * 实测证据（2026-10-04，线上 `/admin/tasks/status`）：10:00 UTC+8 那次 cron
+ * 运行的 `done[]` 里 `listTasks` / `first_buddy` 的原因清一色是 `upstream 401`
+ * —— 也就是说**自动任务从未真正执行过**，「自动签到」自然也从未生效。
+ * 用户报的「每日任务/签到不工作」正对应这个状态。
+ *
+ * 抽成纯函数是为了能被单测钉住：判据只有「是否为空串」，
+ * 不依赖网络、DO 或时间。
+ */
+export function needsCredentialFetch(contextAccessToken: string): boolean {
+  return contextAccessToken === ''
+}
+
+/**
+ * 取本次动作真正该用的令牌。
+ *
+ * 调用方在 `needsCredentialFetch` 为真时先去账号池取凭据，
+ * 取到就用它，取不到（账号无凭据）**保持空串** —— 让上游如实回 401，
+ * 而不是拿一个编造的令牌掩盖真实原因。
+ */
+export function effectiveAccessToken(contextAccessToken: string, fetchedAccessToken: string): string {
+  return needsCredentialFetch(contextAccessToken) ? fetchedAccessToken : contextAccessToken
+}

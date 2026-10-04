@@ -54,13 +54,46 @@ function show(id, value) {
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild) }
 
 /** 建一个计数块。 */
-function countBlock(label, value) {
+/**
+ * 一个计数块。
+ *
+ * @param onClick 传了就变成可点击（并在 hover 时给出手型与提示），
+ *   用于「冷却中 / 模型限流」—— 用户要求点开能看到**具体是哪些账号/模型**。
+ *   计数本身说明不了问题：看到「冷却中 3」但不知道是哪 3 个，等于没信息。
+ */
+function countBlock(label, value, onClick) {
   const d = document.createElement('div')
-  d.className = 'count'
+  d.className = onClick ? 'count clickable' : 'count'
   const b = document.createElement('b'); b.textContent = String(value)
   const s = document.createElement('span'); s.textContent = label
   d.appendChild(b); d.appendChild(s)
+  if (onClick) {
+    d.title = '点击查看明细'
+    d.onclick = onClick
+  }
   return d
+}
+
+/** 打开通用信息弹窗。 */
+function openInfo(title, nodes) {
+  $('info-title').textContent = title
+  const body = $('info-body')
+  clear(body)
+  if (nodes.length === 0) {
+    const p = document.createElement('p'); p.className = 'muted'; p.textContent = '（无）'
+    body.appendChild(p)
+  } else for (const n of nodes) body.appendChild(n)
+  $('info-modal').hidden = false
+}
+
+/** 把毫秒剩余时长说成人话。 */
+function humanWait(ms) {
+  if (ms <= 0) return '已恢复'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s} 秒后恢复`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} 分钟后恢复`
+  return `${Math.round(m / 60)} 小时后恢复`
 }
 
 /** 建一个表格。`cols` 是列名，`rows` 是二维数组；数字列右对齐。 */
@@ -131,9 +164,94 @@ async function loadPool() {
   const c = res.body.counts
   box.appendChild(countBlock('总账号', c.total))
   box.appendChild(countBlock('可用', c.healthy))
-  box.appendChild(countBlock('冷却中', c.cooling))
-  box.appendChild(countBlock('模型限流', c.modelExempt))
+  // ⚠️ 这两项**必须可点开**：只给一个数字，用户不知道是哪个账号/哪个模型，
+  // 也就无法判断「该等一会」还是「该重新登录」。
+  box.appendChild(countBlock('冷却中', c.cooling, () => showCoolingDetail()))
+  box.appendChild(countBlock('模型限流', c.modelExempt, () => showModelThrottleDetail()))
   box.appendChild(countBlock('已禁用', c.disabled))
+}
+
+/**
+ * 「冷却中」明细：列出**每个**在冷却的账号，含供应商、uid、剩余时间、原因。
+ *
+ * ⚠️ 数据来自 `/admin/accounts`（它已带 `until` / `breakerUntil` / `degradeUntil` /
+ * `coolKind` / `reason`），不需要新端点 —— 池计数的数字本来就是从这些算出来的。
+ */
+async function showCoolingDetail() {
+  const res = await api('/admin/accounts?realm=cn')
+  if (!res.ok || !res.body) return openInfo('冷却中的账号', [])
+  const now = Date.now()
+  const hot = res.body.accounts.filter((a) => {
+    const u = Math.max(a.until || 0, a.breakerUntil || 0, a.degradeUntil || 0)
+    return u > now
+  })
+  hot.sort((a, b) => {
+    const ua = Math.max(a.until || 0, a.breakerUntil || 0, a.degradeUntil || 0)
+    const ub = Math.max(b.until || 0, b.breakerUntil || 0, b.degradeUntil || 0)
+    return ub - ua
+  })
+  const rows = hot.map((a) => {
+    const u = Math.max(a.until || 0, a.breakerUntil || 0, a.degradeUntil || 0)
+    const kind = a.until === u ? '账号冷却' : a.breakerUntil === u ? '熔断' : '降权'
+    return [
+      a.provider || '(默认)',
+      shortUid(a.uid),
+      `${humanWait(u - now)}（${new Date(u).toLocaleTimeString()}）`,
+      kind,
+      (a.reason || '').slice(0, 60),
+    ]
+  })
+  const nodes = []
+  const tip = document.createElement('p')
+  tip.className = 'muted'
+  tip.textContent = '这些账号因连续失败被自动退避，到期后会自动恢复，无需人工干预。'
+  nodes.push(tip)
+  if (rows.length > 0) nodes.push(buildTable(['供应商', '账号', '剩余', '类型', '原因'], rows, []))
+  openInfo(`冷却中的账号（${rows.length}）`, nodes)
+}
+
+/**
+ * 「模型限流」明细：列出**具体哪个账号的哪个模型**被限流。
+ *
+ * ⚠️ 与「冷却中」不同：模型级限流是**按模型**记的（`modelCooldowns`），
+ * 一个账号可以有多个模型各自限流。故这里按「账号 × 模型」展开成行。
+ */
+async function showModelThrottleDetail() {
+  const res = await api('/admin/accounts?realm=cn')
+  if (!res.ok || !res.body) return openInfo('模型级限流', [])
+  const now = Date.now()
+  const rows = []
+  for (const a of res.body.accounts) {
+    // 后端给的是 [{model, until, reason, hits}]；
+    // 兼容纯字符串数组（旧格式），避免面板与后端版本错配时整个弹窗空掉。
+    const raw = a.modelCooldowns
+    const items = Array.isArray(raw)
+      ? raw.map((m) => (typeof m === 'string' ? { model: m, until: 0 } : m))
+      : Object.entries(raw || {}).map(([model, info]) => ({ model, ...(info || {}) }))
+    for (const it of items) {
+      const u = typeof it.until === 'number' ? it.until : 0
+      rows.push([
+        a.provider || '(默认)',
+        shortUid(a.uid),
+        it.model,
+        u > now ? humanWait(u - now) : '已恢复',
+        it.reason ? String(it.reason).slice(0, 50) : '',
+      ])
+    }
+  }
+  const nodes = []
+  const tip = document.createElement('p')
+  tip.className = 'muted'
+  tip.textContent = '这些「账号 + 模型」组合被上游限流，只会影响该组合，同一账号的其它模型仍可用。'
+  nodes.push(tip)
+  if (rows.length > 0) nodes.push(buildTable(['供应商', '账号', '模型', '剩余', '原因'], rows, []))
+  openInfo(`模型级限流（${rows.length}）`, nodes)
+}
+
+/** uid 太长时截断显示（保留尾部，尾部才有区分度）。 */
+function shortUid(uid) {
+  const s = String(uid || '')
+  return s.length > 26 ? '…' + s.slice(-24) : s
 }
 
 async function loadAccounts() {
@@ -837,6 +955,8 @@ async function startModalLogin(providerId, out) {
 }
 
 $('modal-close').onclick = () => { $('modal').hidden = true }
+$('info-close').onclick = () => { $('info-modal').hidden = true }
+$('info-modal').onclick = (e) => { if (e.target === $('info-modal')) $('info-modal').hidden = true }
 $('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true }
 for (const b of document.querySelectorAll('.mtab')) b.onclick = () => switchModalTab(b.dataset.mtab)
 
@@ -1011,7 +1131,13 @@ async function bootstrap() {
   }
 
   setAuth('密钥有效', true)
-  switchView(localStorage.getItem('wb_view') || 'accounts')
+  // ⚠️ 默认视图必须是**真实的导航项**（`providers`），不能是 `accounts`。
+  //
+  // 实测踩到：`accounts` 曾是独立视图名，后来账号池并入了「供应商与账号」，
+  // 导航里不再有 `accounts`，但这里的默认值没跟着改 —— 于是
+  // `VIEW_LOADERS['accounts']` 是 `undefined`，**加载器从不执行**，
+  // 刷新后页面一片空白；切到别的卡片再切回来才显示（那时用的是真实视图名）。
+  switchView(localStorage.getItem('wb_view') || 'providers')
   loadWaf()
   setInterval(loadWaf, 20000)
 }

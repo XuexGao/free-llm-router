@@ -326,3 +326,24 @@ test('面板 JS 规模合理（不应该只是几十行的空壳）', () => {
   const lines = js.split('\n').length
   assert.ok(lines > 300, `面板 JS 只有 ${lines} 行，过薄（参考项目 2600+ 行）`)
 })
+
+test('⚠️ 默认视图必须是真实导航项（否则刷新后空白）', () => {
+  // 实测踩到：默认视图写成 `accounts`，但账号池已并入「供应商与账号」，
+  // 导航里没有 `accounts` → `VIEW_LOADERS['accounts']` 是 undefined →
+  // 加载器从不执行 → 刷新后页面空白，切到别的卡片再切回来才显示。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const html = panelAsset('/panel/')?.body ?? ''
+
+  const navs = new Set([...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1]))
+  const loaders = new Set([...js.matchAll(/^\s{2}(\w+):\s*\(\)\s*=>/gm)].map((m) => m[1]))
+
+  assert.ok(navs.size > 0, '应能解析出导航项')
+  // ① 每个加载器都要对应一个真实导航项（`accounts` 这类残留会在这里暴露）
+  for (const l of loaders) {
+    assert.ok(navs.has(l), `加载器「${l}」不是导航项（会永远不执行）`)
+  }
+  // ② 默认视图必须落在加载器里
+  const def = /switchView\(localStorage\.getItem\('wb_view'\)\s*\|\|\s*'(\w+)'\)/.exec(js)
+  assert.notEqual(def, null, '应能找到默认视图')
+  assert.ok(loaders.has(def?.[1] ?? ''), `默认视图「${def?.[1]}」没有加载器（会空白）`)
+})

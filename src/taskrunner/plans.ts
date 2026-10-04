@@ -83,6 +83,16 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
   const steps: TaskStep[] = [
     // 先拉一次列表，确认账号可用并拿到当前进度
     { code: '_probe', action: 'listTasks', delayMs: GAP.report },
+    // ⚠️ **签到必须在本计划里**。面板与文档都承诺「签到 → 成长任务 → 领奖」
+    //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`），
+    // 但早期 `planGrowth` **没有这一步** —— 用户点「执行每日任务」时只跑了成长任务，
+    // **从未签到**。实测证据（2026-10-04，线上 `/admin/tasks/status`）：
+    // 该按钮对应的一次运行 `done` 里有 23 步、`chat_5`/`first_buddy`/… 全在，
+    // 却**没有任何 checkin 步骤**。
+    //
+    // 签到是**幂等**的（已签到时上游回业务码 10001，见 `upstream/checkin.ts:9-10`），
+    // 故与 `daily` 计划重复执行无副作用。
+    { code: 'checkin', action: 'checkin', delayMs: GAP.report },
   ]
 
   const actions = includeRealChat

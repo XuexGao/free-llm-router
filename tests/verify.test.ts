@@ -18,6 +18,26 @@ import assert from 'node:assert/strict'
 import { CLAIM_POLL_ATTEMPTS, CLAIM_POLL_GAP_MS } from '../src/taskrunner/verify.ts'
 import { planByName, planGrowth, zeroCostActions } from '../src/taskrunner/plans.ts'
 import { NEEDS_REAL_CHAT, registeredActions } from '../src/taskrunner/actions.ts'
+import { effectiveAccessToken, needsCredentialFetch } from '../src/taskrunner/steps.ts'
+import type { Env } from '../src/env.ts'
+
+// ─────────────────── Cron 空令牌的凭据补取 ───────────────────
+//
+// 这两个判据对应的是一次**静默故障**：Cron 扇出刻意传空令牌（省 10ms CPU），
+// 而 DO 若无条件把它当 Bearer 发出去，所有上游请求都回 401 ——
+// 自动任务从未真正执行，自动签到自然从未生效。实测证据见
+// `steps.ts` 里 `needsCredentialFetch` 的说明（线上 `/admin/tasks/status`）。
+
+test('⚠️ Cron 的空令牌必须触发凭据补取（否则所有动作 401）', () => {
+  assert.equal(needsCredentialFetch(''), true, '空串必须触发补取')
+  assert.equal(needsCredentialFetch('real-token'), false, '有令牌时不该多一次 DO 往返')
+})
+
+test('⚠️ 补取的令牌必须真的被用上；取不到时保持空串（如实 401，不编造）', () => {
+  assert.equal(effectiveAccessToken('', 'fetched'), 'fetched', '补取成功必须替换掉空串')
+  assert.equal(effectiveAccessToken('', ''), '', '无凭据时保持空串，让上游如实回 401')
+  assert.equal(effectiveAccessToken('explicit', 'fetched'), 'explicit', '显式令牌优先，不被覆盖')
+})
 
 // ─────────────────── 回读参数 ───────────────────
 
@@ -31,6 +51,111 @@ test('回读总预算在 10–20 秒量级（对齐 Go 侧实测的 5–8s 落�
   const budgetMs = (CLAIM_POLL_ATTEMPTS - 1) * CLAIM_POLL_GAP_MS
   assert.ok(budgetMs >= 6000, `预算 ${budgetMs}ms 太短，覆盖不了实测落定时间`)
   assert.ok(budgetMs <= 30000, `预算 ${budgetMs}ms 太长，会拖住 alarm`)
+})
+
+// ─────────────────── 签到动作：幂等判据与签到日记账 ───────────────────
+//
+// ⚠️ 这两条锁的是**上游业务码**（不是 HTTP 状态码）—— 上游对重复签到返回
+// HTTP 400 + `code:10001`（本地实测原文：
+// `{"code":10001,"msg":"今天已签到，请明天再来"}`）。
+// 只看 HTTP 状态码会把「今天已签」误报成**失败**，于是用户以为签到坏了。
+
+/** 构造一个最小的 Env 替身：只提供 checkin 动作会碰的两个面。 */
+function makeCheckinEnv(recorded: string[]): Env {
+  return {
+    ACCOUNT_POOL: {
+      idFromName: (name: string) => name,
+      get: () => ({
+        noteCheckinDone: async (uid: string, now: number) => {
+          recorded.push(`${uid}@${new Date(now + 8 * 3600_000).toISOString().slice(0, 10)}`)
+        },
+      }),
+    },
+  } as unknown as Env
+}
+
+test('⚠️ 签到幂等：HTTP 400 + code 10001 必须判为「今日已签到」而非失败', async () => {
+  const { executeAction } = await import('../src/taskrunner/actions.ts')
+  const recorded: string[] = []
+  const env = makeCheckinEnv(recorded)
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response('{"code":10001,"msg":"今天已签到，请明天再来"}', {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch
+  try {
+    const r = await executeAction({ code: 'checkin', action: 'checkin', delayMs: 0 }, {
+      uid: 'u1', nickname: 'n', realm: 'cn', accessToken: 't', now: Date.now(),
+    }, env)
+    assert.equal(r.ok, true, '幂等命中不算失败（否则用户以为签到坏了）')
+    assert.match(r.detail, /已签到/, `说理应说明已签到：${r.detail}`)
+    assert.equal(recorded.length, 1, '幂等命中也要记录签到日（面板标签依赖它）')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('⚠️ 签到成功：code 0 必须报出获得积分，并记录签到日', async () => {
+  const { executeAction } = await import('../src/taskrunner/actions.ts')
+  const recorded: string[] = []
+  const env = makeCheckinEnv(recorded)
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response('{"code":0,"msg":"OK","data":{"credit":100}}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch
+  try {
+    const r = await executeAction({ code: 'checkin', action: 'checkin', delayMs: 0 }, {
+      uid: 'u1', nickname: 'n', realm: 'cn', accessToken: 't', now: Date.now(),
+    }, env)
+    assert.equal(r.ok, true)
+    assert.match(r.detail, /\+100/, `应报出获得积分：${r.detail}`)
+    assert.equal(recorded.length, 1, '签到成功必须记录签到日')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+// ⚠️ 这两条锁「幂等判据要认哪些码/文案」。判据来自协议权威 Go 侧
+// `IsAlreadyCheckin`（`internal/upstream/client.go:199-201,2071-2075`）。
+
+test('⚠️ 14001 也是「今日已签到」（Go 侧已实测的码，初版只认 10001/1001）', async () => {
+  const { dailyCheckin } = await import('../src/upstream/checkin.ts')
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response('{"code":14001,"msg":"今日已签到"}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch
+  try {
+    const r = await dailyCheckin({ uid: 'u1', accessToken: 't' }, {} as Env)
+    assert.equal(r.alreadyDone, true, '14001 必须判为已签到，否则会误报失败')
+    assert.equal(r.claimed, false)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('⚠️ 文案兜底只认「已签到」，不能把「活动已结束」误判成已签', async () => {
+  const { dailyCheckin } = await import('../src/upstream/checkin.ts')
+  const original = globalThis.fetch
+  // 未知码 + 英文「活动已结束」文案：必须**不**被判为已签到。
+  // 误报「已签」的方向是有害的 —— 用户以为签过了，当天积分就真的错过。
+  globalThis.fetch = (async () =>
+    new Response('{"code":99999,"msg":"activity already ended"}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch
+  try {
+    await assert.rejects(
+      () => dailyCheckin({ uid: 'u1', accessToken: 't' }, {} as Env),
+      '未知码不得被当成签到成功',
+    )
+  } finally {
+    globalThis.fetch = original
+  }
 })
 
 // ─────────────────── 计划表 ───────────────────
@@ -68,8 +193,30 @@ test('⚠️ 成长计划：绝不包含需要真实对话的任务（会消耗�
 test('成长计划：零消耗动作数与动作表一致', () => {
   const actions = zeroCostActions()
   const steps = planGrowth()
-  // 每个动作 2 步（动作 + 回读领奖）+ 1 个初始探测
-  assert.equal(steps.length, actions.length * 2 + 1)
+  // 每个动作 2 步（动作 + 回读领奖）+ 1 个初始探测 + **1 个签到**。
+  //
+  // ⚠️ `+1` 的签到步是**修缺陷后新增**的：早期 `planGrowth` 没有它，
+  // 于是面板「执行每日任务」按承诺做「签到 → 成长任务」，实际**从未签到**。
+  // 这条断言刻意把签到计入总步数 —— 若有人再把它删掉，这里会立刻变红。
+  assert.equal(steps.length, actions.length * 2 + 2)
+})
+
+test('⚠️ 成长计划（「执行每日任务」按钮）必须包含签到步骤', () => {
+  // 面板文案与后端注释都承诺「签到 → 全部成长任务 → 领奖」
+  //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`）。
+  // 实测证据（2026-10-04，线上 `/admin/tasks/status`）：该按钮触发的运行里有
+  // 23 步、若干成长任务，却**没有任何 checkin 步骤** —— 这就是用户报的
+  // 「每日任务/签到不工作」。签到是幂等的，入队无副作用。
+  const steps = planGrowth()
+  assert.ok(
+    steps.some((s) => s.action === 'checkin'),
+    'growth 计划必须含 checkin（否则「执行每日任务」不会签到）',
+  )
+  // 开启真实对话时同样要含签到（两条分支不能分叉）
+  assert.ok(
+    planGrowth({ includeRealChat: true }).some((s) => s.action === 'checkin'),
+    'includeRealChat=true 时也必须含 checkin',
+  )
 })
 
 test('⚠️ 所有步骤的 delayMs 必须 ≥ 0（负数会让 alarm 立即重排，形成忙循环）', () => {

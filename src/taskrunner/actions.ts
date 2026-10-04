@@ -113,6 +113,17 @@ const ACTIONS: Record<string, ActionHandler> = {
   async checkin(ctx, _step, env): Promise<ActionResult> {
     try {
       const result = await dailyCheckin({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      // ⚠️ 记录签到日（面板「签到 YYYY-MM-DD」标签的数据源）。
+      // 任务引擎这条路与 `/admin/checkin/all` 是**两条独立入口**，
+      // 只在一处记录会让另一条路径下面板标签永远为空。
+      // 幂等命中也算「今天已签」—— 上游对重复签到回业务码而非错误，
+      // 与 Go 侧 `NoteCheckinDone`（`internal/panel/panel.go:491-494`）同口径。
+      //
+      // 记账失败**不改变签到结果**：签到本身已经成功了，
+      // 因为写状态失败就报错会让用户重跑一次真实签到（虽然幂等，但无谓）。
+      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(ctx.realm))
+        .noteCheckinDone(ctx.uid, ctx.now)
+        .catch(() => {})
       if (result.alreadyDone) return { ok: true, detail: '今日已签到（幂等命中）' }
       return { ok: true, detail: `签到成功${result.credit > 0 ? ` +${result.credit} 积分` : ''}` }
     } catch (error) {

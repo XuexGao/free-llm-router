@@ -35,7 +35,7 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../env.js'
 import { migrate, readProgress, writeProgress } from '../store/db.js'
 import { executeAction, type ActionContext, type ActionResult } from './actions.js'
-import { GAP, type RunContext, type RunState, type TaskStep } from './steps.js'
+import { GAP, needsCredentialFetch, effectiveAccessToken, type RunContext, type RunState, type TaskStep } from './steps.js'
 
 export class TaskRunnerDO extends DurableObject<Env> {
   /** 当前运行状态（内存镜像；权威副本在 SQLite）。 */
@@ -135,11 +135,33 @@ export class TaskRunnerDO extends DurableObject<Env> {
 
     let result: ActionResult
     try {
+      // ⚠️ Cron 扇出时刻意**不读凭据**（`src/index.ts` 的 scheduled() 传
+      // `accessToken: ''`），因为 Cron 只有 10ms CPU（AGENTS.md §8.2.1），
+      // 在那里解密凭据会超预算。代价是 DO 侧拿到的令牌是空串 ——
+      // 而空串会让**所有**上游请求 401。
+      //
+      // 实测证据（2026-10-04，线上 `/admin/tasks/status`）：10:00 UTC+8 那次
+      // cron growth 运行的 `done[]` 里 `listTasks` / `first_buddy` 全是
+      // `upstream 401` —— 即**自动任务从未真正跑通**，自动签到自然也从未生效。
+      //
+      // 故在这里惰性补取：只有令牌为空时才问账号池要凭据（DO 间串行调用，
+      // 且只在必要时发生）。放在 try 内是为了让取凭据失败也如实落到该步的
+      // error 里，不静默。
+      let accessToken = effectiveAccessToken(context.accessToken, '')
+      if (needsCredentialFetch(context.accessToken)) {
+        const pool = this.env.ACCOUNT_POOL.get(this.env.ACCOUNT_POOL.idFromName(context.realm))
+        const credential = (await pool.getCredential(context.uid)) as { accessToken?: unknown } | undefined
+        accessToken = effectiveAccessToken(
+          context.accessToken,
+          typeof credential?.accessToken === 'string' ? credential.accessToken : '',
+        )
+      }
+
       const actionContext: ActionContext = {
         uid: context.uid,
         nickname: context.nickname,
         realm: context.realm,
-        accessToken: context.accessToken,
+        accessToken,
         now,
       }
       result = await executeAction(step, actionContext, this.env)
