@@ -102,6 +102,60 @@ interface Candidate {
 }
 
 /** 走账号池选号（**排除已试过的**，跨重试保留）。 */
+/**
+ * 派生**会话粘性 key**（用于把同一会话固定到同一账号，命中上游 prompt cache）。
+ *
+ * ## key 的选取（按可靠性排序）
+ *
+ * 1. **客户端显式给的 `user` 字段** —— OpenAI 规范里它就是这个用途
+ *    （「代表最终用户的稳定标识符」）。最可靠，且跨轮次稳定。
+ * 2. **首条消息的指纹** —— 客户端没给 `user` 时的回落。
+ *    取首条 `role+content` 的短哈希：同一会话的后续轮次首条消息**不变**，
+ *    故指纹稳定；不同会话几乎必然不同。
+ *
+ * ⚠️ 刻意**不**用「全部消息的哈希」：那样每加一轮消息 key 就变，
+ * 粘性等于没有（每轮都当新会话）。这是最容易写错的地方。
+ *
+ * ⚠️ 返回空串 = 「无法判定会话」，此时**不做粘性**（回落到常规加权随机）。
+ * 编造一个 key 会让不同会话互相干扰，比不做更糟。
+ */
+async function deriveSessionKey(rawBody: unknown): Promise<string> {
+  if (rawBody === null || typeof rawBody !== 'object') return ''
+  const body = rawBody as Record<string, unknown>
+
+  // ① 客户端显式的 user 字段（最可靠）
+  const user = body.user
+  if (typeof user === 'string' && user.trim() !== '') {
+    return `u:${(await sha256Hex(user.trim())).slice(0, 32)}`
+  }
+
+  // ② 首条消息的指纹
+  const messages = body.messages
+  if (!Array.isArray(messages) || messages.length === 0) return ''
+  const first = messages[0]
+  if (first === null || typeof first !== 'object') return ''
+  const f = first as Record<string, unknown>
+  const role = typeof f.role === 'string' ? f.role : ''
+  // content 可能是字符串或多模态数组 —— 两种都序列化进来
+  const content = f.content
+  const material =
+    typeof content === 'string'
+      ? content
+      : content === undefined || content === null
+        ? ''
+        : JSON.stringify(content)
+  if (role === '' && material === '') return ''
+  // ⚠️ 只取前 512 字符：超长首条（如带图的多模态）没必要全哈希，
+  // 且能避免在大请求上多花 CPU（Free 计划 10ms 铁律）。
+  return `m:${(await sha256Hex(`${role}\n${material.slice(0, 512)}`)).slice(0, 32)}`
+}
+
+/** SHA-256 → 小写 hex（WebCrypto）。 */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 async function pickCandidate(
   pool: DurableObjectStub<AccountPoolDO>,
   realm: string,
@@ -109,8 +163,13 @@ async function pickCandidate(
   exclude: string[],
   now: number,
   provider: string,
+  /** 会话粘性的优先账号（仅首轮传；见 `deriveSessionKey` 的说明）。 */
+  preferred?: string,
 ): Promise<Candidate | undefined> {
-  const result = await pool.pick({ realm, provider, model, exclude, now })
+  const result = await pool.pick({
+    realm, provider, model, exclude, now,
+    ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
+  })
   if (result === undefined) return undefined
   const credential = (await pool.getCredential(result.uid)) as LoginCredential | undefined
   if (credential === undefined || credential.accessToken === '') return undefined
@@ -145,6 +204,10 @@ export async function handleChatCompletions(
     return { response: jsonError(400, '请求体必须是合法 JSON', 'invalid_request_error') }
   }
 
+  // 会话粘性 key（空串 = 无法判定会话，此时不做粘性）。
+  // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。
+  const sessionKey = await deriveSessionKey(rawBody)
+
   const rawModel =
     typeof (rawBody as Record<string, unknown>).model === 'string'
       ? ((rawBody as Record<string, unknown>).model as string)
@@ -177,7 +240,7 @@ export async function handleChatCompletions(
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [] })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -231,7 +294,13 @@ export async function handleChatCompletions(
     const now = Date.now()
     // ⚠️ 限定默认供应商：池里可能同时有 cline 等家的账号，
     // 拿它们的凭据去打 WorkBuddy 端点必然 401（看起来像「凭据坏了」）。
-    const candidate = await pickCandidate(pool, realm, model, tried, now, DEFAULT_PROVIDER)
+    // 会话粘性：只首轮用（换号后还粘回去会死循环）
+    const buddyPreferred =
+      tried.length === 0 && sessionKey !== '' ? await pool.getSession(sessionKey, now) : ''
+    const candidate = await pickCandidate(
+      pool, realm, model, tried, now, DEFAULT_PROVIDER,
+      buddyPreferred === undefined ? '' : buddyPreferred,
+    )
     if (candidate === undefined) {
       // 没有可用账号了：若之前有过失败，报最后一次的真实原因（更有信息量）
       if (lastError !== undefined) {
@@ -542,8 +611,10 @@ async function handleProviderChat(input: {
   realm: string
   ctx?: ExecutionContext
   tried: string[]
+  /** 会话粘性 key（由 `handleChatCompletions` 统一派生，空串 = 不做粘性）。 */
+  sessionKey: string
 }): Promise<GatewayResult> {
-  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx } = input
+  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
 
   const provider = findProvider(providerId)
   if (provider === undefined) {
@@ -602,7 +673,11 @@ async function handleProviderChat(input: {
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
     // **不要**在这里「先选中再筛掉」—— 那会让「池里有账号但当前供应商没账号」
     // 表现为「pick 返回了号、却被我丢掉」，最终误报「没有可用账号」（实测踩到）。
-    const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now })
+    // ⚠️ **会话粘性**：优先用该会话已绑定的账号（命中上游 prompt cache）。
+    // `preferred` 只是「排到最前」，不可用时自然回落 —— 不会因为它挂了就报「无可用账号」。
+    // ⚠️ 只在**首轮**（`tried` 为空）用粘性：已经在换号了还粘回去会死循环。
+    const preferred = tried.length === 0 ? (sessionKey === '' ? '' : await pool.getSession(sessionKey, now)) : ''
+    const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now, ...(preferred !== undefined && preferred !== '' ? { preferred } : {}) })
     if (picked === undefined) break
     tried.push(picked.uid)
 
@@ -643,6 +718,11 @@ async function handleProviderChat(input: {
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // ⚠️ 首帧到达即绑定会话 —— 此后同一会话优先落这个账号，
+                  // 从第二轮起命中上游 prompt cache（更快、更省）。
+                  if (sessionKey !== '' && ctx !== undefined) {
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                  }
                 },
                 onError: (m) => {
                   const t = pool
@@ -708,6 +788,10 @@ async function handleProviderChat(input: {
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // 会话粘性：首帧到达即绑定，后续轮次优先落同一账号
+                  if (sessionKey !== '' && ctx !== undefined) {
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                  }
                 },
                 onError: (message) => {
                   const t = pool

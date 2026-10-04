@@ -15,6 +15,7 @@
  */
 
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
 import {
@@ -605,4 +606,52 @@ test('⚠️ aggregateSse 必须容忍 `data:` 不带空格（CodeArts 就是这
     'data: [DONE]',
   ].join('\n')
   assert.equal(aggregateSse(withSpace, { model: 'm', now: 0 }).choices[0]?.message.content, 'AB')
+})
+
+// ─────────────────── 会话粘性（prompt cache 命中） ───────────────────
+
+test('⚠️ pick 的 preferred 必须只「排到最前」，不可绕过健康检查', () => {
+  // 语义是「优先」不是「只要」：粘性账号若已冷却/熔断/模型限流，
+  // 它压根不在 candidates 里 ⇒ 自然回落到其余候选。
+  // ⚠️ 绝不能因为「粘性的那个挂了」就报「没有可用账号」。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const i = src.indexOf('const preferred = request.preferred')
+  assert.ok(i > 0, 'pick 应读取 request.preferred')
+  const block = src.slice(i, i + 400)
+  // 必须是在 candidates 里 find —— 而不是在原始账号表里直接取
+  assert.ok(block.includes('candidates.find'), '必须从**候选集**里找（保证健康检查已通过）')
+})
+
+test('⚠️ 会话粘性 key 不得用「全部消息」的哈希（那样每轮都变）', () => {
+  // 最容易写错的地方：用全部 messages 哈希 ⇒ 每加一轮消息 key 就变，
+  // 粘性等于没有（每轮都当新会话）。必须只用首条消息 + user 字段。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf('async function deriveSessionKey')
+  const block = src.slice(i, i + 1800)
+  assert.ok(block.includes('messages[0]'), '应只取**首条**消息做指纹')
+  assert.ok(block.includes("body.user"), '应优先用客户端给的 user 字段')
+  // 不得出现对整个 messages 数组做序列化/哈希
+  assert.ok(!/JSON\.stringify\(messages\)/.test(block), '不得序列化整个 messages 数组')
+  assert.ok(!/messages\.map\(/.test(block), '不得对全部 messages 做映射后哈希')
+})
+
+test('⚠️ 会话粘性只在首轮生效（换号后还粘回去会死循环）', () => {
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  // 两条路径都必须是「tried 为空才用粘性」
+  const hits = [...src.matchAll(/tried\.length === 0[^\n]*sessionKey/g)].length
+  assert.ok(hits >= 2, `两条路径都应限定首轮，实际匹配 ${hits} 处`)
+})
+
+test('⚠️ 绑定会话必须在成功后（首帧到达）才做，且用 waitUntil 托住', () => {
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const binds = [...src.matchAll(/bindSession\(/g)].length
+  assert.ok(binds >= 2, `两条成功路径都应绑定会话，实际 ${binds} 处`)
+  // ⚠️ 记账/绑定都是「流结束后才发生的事」，不用 waitUntil 会被 Worker 取消
+  for (const m of src.matchAll(/([^\n]*)bindSession\(/g)) {
+    const line = m[1] ?? ''
+    assert.ok(
+      /waitUntil/.test(line) || line.includes('ctx.waitUntil'),
+      `bindSession 必须包在 waitUntil 里（否则流一结束就被取消）：${line.trim().slice(0, 80)}`,
+    )
+  }
 })

@@ -22,10 +22,14 @@
  * - 签到与余额：`src/minimax-credits.ts:1-461`；
  * - 思考档位的三种 mode：`AGENTS.md` 的「8.1」一节。
  *
- * ## 登录（本轮**不实现**，状态机已定，供后续 `loginStart`/`loginPoll` 照抄）
+ * ## 登录（**已接线**到 `/admin/providers/login/{start,poll}`）
  *
  * 走 **OAuth 设备码 + PKCE**（`src/minimax-oauth.ts`）：申请设备码 → 用户授权
  * → 轮询换 token。**不起本地监听端口** ⇒ 可在 Workers 跑，故 `login: true`。
+ *
+ * ⚠️ 轮询是**每请求一次**（面板每 3 秒发独立 HTTP 请求），不是循环：
+ * `intervalSec` / `nextPollAt` / `deadline` / `deviceCode` / `codeVerifier`
+ * **全部持久化在登录会话载荷**里 —— Workers 无跨请求内存，放模块变量会静默失效。
  *
  * ⚠️ 三个实测判据（写错会得到「用户还没来得及点授权就报失败」）：
  * 1. **`pending` 是 HTTP 200 + `status: "pending"`**，而标准 OAuth 是
@@ -64,6 +68,25 @@ const ID = 'minimax'
 
 /** API 主机（目录 / 签到 / 积分 / 推理都挂它下面）。 */
 const API_HOST = 'https://agent.minimax.cn'
+
+/**
+ * **账号域**（OAuth 专用）。
+ *
+ * ⚠️ 与 {@link API_HOST} **不是同一个 host，不可混用**：
+ * 设备码与 token 轮询挂 `account.minimax.cn`，业务端点挂 `agent.minimax.cn`
+ *（`src/minimax-product.ts:127-130`）。
+ */
+const ACCOUNT_HOST = 'https://account.minimax.cn'
+/** 设备码申请路径。 */
+const DEVICE_CODE_PATH = '/oauth2/device/code'
+/** token 轮询 / 续期路径。 */
+const TOKEN_PATH = '/oauth2/token'
+/** OAuth client_id（官方常量，取自 `auth.json` 与 asar）。 */
+const MINIMAX_CLIENT_ID = 'mcode-public'
+/** OAuth audience（asar `contracts.js` 的 `MCODE_OAUTH_AUDIENCE`）。 */
+const MINIMAX_AUDIENCE = 'agent-backend'
+/** OAuth scope（**凭据校验要求必须含它**，否则 `invalid_token_response`）。 */
+const MINIMAX_SCOPE = 'agent.default'
 
 /** 目录查询参数（远端要求显式 region/buildEnv，否则目录为空）。 */
 const REGION = 'cn'
@@ -366,6 +389,241 @@ function timezoneOf(credential: ProviderCredential): string {
  * 它只用于本地主键，拿不到稳定身份时用令牌派生 —— 那**不会**让人误以为
  * 「账号身份已知」，也不会产生空 uid（空 uid 会让账号池的键塌成同一个）。
  */
+// ─────────────────────── 设备码登录（OAuth 2.0 Device Grant + PKCE） ───────────────────────
+
+/** 一次设备码授权的材料（**必须整体持久化**，见 `pollMinimaxLogin` 的说明）。 */
+export interface MinimaxDeviceAuth {
+  /** 服务端下发的设备码（轮询时回传）。 */
+  deviceCode: string
+  /** PKCE 的 verifier —— ⚠️ 轮询时**必须**带上，丢了换不到 token。 */
+  codeVerifier: string
+  /** 展示给用户的短码（如 `ABCD-1234`）。 */
+  userCode: string
+  /** 用户要在浏览器打开的地址。 */
+  verificationUri: string
+  /** 带短码的完整地址（有就用它，省得用户手输）。 */
+  verificationUriComplete: string
+  /** 设备码有效期（秒）。 */
+  expiresInSec: number
+  /** 服务端要求的轮询间隔（秒）。 */
+  intervalSec: number
+}
+
+/** 一次性轮询的结果。 */
+export type MinimaxPollOutcome =
+  | { kind: 'pending'; intervalSec: number }
+  | { kind: 'success'; credential: ProviderCredential }
+  | { kind: 'failed'; message: string }
+
+/** PKCE：生成 `code_verifier` 与它的 S256 `code_challenge`（base64url）。 */
+async function createMinimaxPkce(): Promise<{ codeVerifier: string; codeChallenge: string }> {
+  // 43–128 字符的 URL-safe 随机串（RFC 7636）。这里用 32 字节 → base64url 43 字符。
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  const codeVerifier = base64Url(bytes)
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))
+  return { codeVerifier, codeChallenge: base64Url(new Uint8Array(digest)) }
+}
+
+/** base64url（无填充）—— PKCE 与 JWT 段都用这个形态。 */
+function base64Url(bytes: Uint8Array): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+}
+
+/** 从 JSON 里安全读非空字符串。 */
+function mmString(source: Record<string, unknown>, key: string): string {
+  const v = source[key]
+  return typeof v === 'string' && v !== '' ? v : ''
+}
+
+/** 从 JSON 里安全读正数。 */
+function mmNumber(source: Record<string, unknown>, key: string): number | undefined {
+  const v = source[key]
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined
+}
+
+/**
+ * 申请设备码。
+ *
+ * ⚠️ 走 **`account.minimax.cn`**，不是业务域 `agent.minimax.cn`（两个 host 不可混用）。
+ */
+export async function startMinimaxLogin(
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<MinimaxDeviceAuth> {
+  const pkce = await createMinimaxPkce()
+  const body = new URLSearchParams({
+    client_id: MINIMAX_CLIENT_ID,
+    scope: MINIMAX_SCOPE,
+    audience: MINIMAX_AUDIENCE,
+    code_challenge: pkce.codeChallenge,
+    // ⚠️ 必须是 `S256`（**不是** RFC 标准的 `S256` 缩写之外的写法）；
+    // 错值会被服务端当成明文 challenge 比对，永远授权失败。
+    code_challenge_method: 'S256',
+  })
+
+  const res = await fetcher(`${ACCOUNT_HOST}${DEVICE_CODE_PATH}`, {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    signal,
+  })
+  if (!res.ok) {
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      message: `MiniMax 设备码申请失败（HTTP ${res.status}）：${(await res.text().catch(() => '')).slice(0, 160)}`,
+    })
+  }
+  const payload = (await res.json().catch(() => undefined)) as Record<string, unknown> | undefined
+  if (payload === undefined) {
+    throw new ProviderError({ provider: ID, message: 'MiniMax 设备码响应不是 JSON' })
+  }
+  const deviceCode = mmString(payload, 'device_code')
+  const userCode = mmString(payload, 'user_code')
+  const verificationUri = mmString(payload, 'verification_uri') || mmString(payload, 'verification_url')
+  const expiresInSec = mmNumber(payload, 'expires_in')
+  if (deviceCode === '' || userCode === '' || verificationUri === '' || expiresInSec === undefined) {
+    throw new ProviderError({
+      provider: ID,
+      message: 'MiniMax 设备码响应缺少必要字段（device_code / user_code / verification_uri / expires_in）',
+    })
+  }
+  return {
+    deviceCode,
+    codeVerifier: pkce.codeVerifier,
+    userCode,
+    verificationUri,
+    verificationUriComplete: mmString(payload, 'verification_uri_complete') || verificationUri,
+    expiresInSec,
+    // ⚠️ `interval` 单位是**秒**，缺省 5 秒（照 asar 的默认值）。
+    intervalSec: mmNumber(payload, 'interval') ?? 5,
+  }
+}
+
+/**
+ * **轮询一次**授权结果（不是循环 —— 面板每 3 秒发一个独立请求）。
+ *
+ * ## ⚠️ 两种「还在等」的形态都要认（实测判据）
+ *
+ * 1. **HTTP 200 + `status: "pending"`** —— MiniMax 自己的形态；
+ * 2. **非 200 + `error: "authorization_pending"`** —— OAuth 标准形态。
+ *
+ * 只看状态码会把「还在等授权」误判成「拿到令牌了」，报错是
+ * `令牌响应缺少 access_token`（用户还没来得及点授权就看到失败）。
+ *
+ * ⚠️ `slow_down` 的退避是 **`intervalSec += 5`**（与 Cline 的 +1 不同），
+ * 且**必须累积**跨请求保留 —— 故返回值带回新的 `intervalSec`，由调用方写回会话。
+ */
+export async function pollMinimaxLoginOnce(
+  auth: MinimaxDeviceAuth,
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<MinimaxPollOutcome> {
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    device_code: auth.deviceCode,
+    client_id: MINIMAX_CLIENT_ID,
+    // ⚠️ code_verifier 必须带上：服务端拿它的 S256 与申请时的 challenge 比对。
+    code_verifier: auth.codeVerifier,
+  })
+
+  let res: Response
+  try {
+    res = await fetcher(`${ACCOUNT_HOST}${TOKEN_PATH}`, {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal,
+    })
+  } catch (error) {
+    // 网络层失败**不判终态**（抖动量不构成「授权失败」的证据）
+    return {
+      kind: 'pending',
+      intervalSec: auth.intervalSec,
+      // 说明见函数的 `pending` 约定：这里刻意不报错，让面板继续轮询
+    }
+  }
+
+  const payload = (await res.json().catch(() => undefined)) as Record<string, unknown> | undefined
+  const record = payload ?? {}
+  const status = mmString(record, 'status')
+  const error = mmString(record, 'error')
+
+  // ── 形态一：HTTP 200 + status ──
+  if (res.ok && status === 'pending') return { kind: 'pending', intervalSec: auth.intervalSec }
+  if (res.ok && status === 'slow_down') {
+    // ⚠️ +5 秒且**累积**（`src/minimax-oauth.ts:276-280`）
+    return { kind: 'pending', intervalSec: auth.intervalSec + 5 }
+  }
+  if (res.ok && (status === 'denied' || status === 'access_denied')) {
+    return { kind: 'failed', message: '用户拒绝了授权，请重新发起登录' }
+  }
+  if (res.ok && (status === 'expired' || status === 'expired_token')) {
+    return { kind: 'failed', message: '设备码已过期，请重新发起登录' }
+  }
+
+  // ── 形态二：非 200 + error（OAuth 标准形态）──
+  if (error === 'authorization_pending') return { kind: 'pending', intervalSec: auth.intervalSec }
+  if (error === 'slow_down') return { kind: 'pending', intervalSec: auth.intervalSec + 5 }
+  if (error === 'access_denied') return { kind: 'failed', message: '用户拒绝了授权，请重新发起登录' }
+  if (error === 'expired_token') return { kind: 'failed', message: '设备码已过期，请重新发起登录' }
+
+  // ── 成功：HTTP 200 且有 access_token ──
+  if (res.ok && mmString(record, 'access_token') !== '') {
+    const credential = parseMinimaxTokenGrant(record, auth)
+    if (credential === undefined) {
+      return { kind: 'failed', message: 'MiniMax 令牌响应无法解析（缺 access_token / scope 不含 agent.default）' }
+    }
+    return { kind: 'success', credential }
+  }
+
+  return {
+    kind: 'failed',
+    message: `MiniMax 授权失败：${error !== '' ? error : `HTTP ${res.status}`}`,
+  }
+}
+
+/**
+ * 把令牌响应转成凭据。
+ *
+ * ⚠️ **硬校验照抄参考实现**（`src/minimax-oauth.ts:150-190`）：
+ * - `access_token` 非空；
+ * - `token_type.toLowerCase() === 'bearer'`；
+ * - `scope` 必须含 `agent.default`（否则 `invalid_token_response`）；
+ * - 过期时间用 `expires_in` **自算** —— 实测 `access_token` **不是 JWT**
+ *   （前缀 `mmoat_`、60 字符、0 个点），从 JWT 解 `exp` **恒失败**。
+ */
+function parseMinimaxTokenGrant(
+  record: Record<string, unknown>,
+  auth: MinimaxDeviceAuth,
+): ProviderCredential | undefined {
+  const accessToken = mmString(record, 'access_token')
+  if (accessToken === '') return undefined
+  const tokenType = mmString(record, 'token_type')
+  if (tokenType.toLowerCase() !== 'bearer') return undefined
+  const scope = mmString(record, 'scope')
+  if (!scope.includes(MINIMAX_SCOPE)) return undefined
+  const expiresInSec = mmNumber(record, 'expires_in')
+  if (expiresInSec === undefined) return undefined
+
+  const refreshToken = mmString(record, 'refresh_token')
+  // ⚠️ uid 优先用服务端下发的 `account_id`。没有它时 `buildCredential`
+  // 会回落到 `stableKeyOf(accessToken)`（**对同一 token 恒同值**），
+  // 故不会因为重复轮询而在池里堆出重复账号。
+  const accountId = mmString(record, 'account_id') || mmString(record, 'accountId')
+
+  return buildCredential(
+    accessToken,
+    accountId === '' ? undefined : accountId,
+    refreshToken === '' ? undefined : refreshToken,
+    Date.now() + expiresInSec * 1000,
+    { scope },
+  )
+}
+
 export function parseCredential(input: unknown): ProviderCredential {
   if (typeof input === 'string') {
     const token = input.trim()
@@ -1396,19 +1654,15 @@ export const minimaxProvider: Provider = {
   name: 'MiniMax Code（中国版）',
   capabilities: {
     /**
-     * ✅ **OAuth 设备码 + PKCE**：无本地回调监听 ⇒ 可在 Workers 跑
-     * （`src/minimax-oauth.ts:3-8`）。状态机见文件头注释。
-     */
-    /**
-     * ⚠️ **本构建为 `false`，尽管协议本身支持设备码 + PKCE 登录**。
+     * ✅ **OAuth 设备码 + PKCE，已接线**（`/admin/providers/login/{start,poll}`）。
      *
-     * 含义同 cline：`login` 指「本服务能发起」，不是「上游允许」。
-     * MiniMax 的流程（`src/minimax-oauth.ts:204,242`）可移植，但尚未接线。
+     * 无本地回调监听 ⇒ 可在 Workers 跑（`src/minimax-oauth.ts:3-8`）。
+     * 面板显示**用户码 + 授权链接**（同 cline 形态）。
+     *
+     * ⚠️ 三个判据写在文件头注释里（`pending` 两种形态 / PKCE 是 S256 /
+     * `slow_down` 是 +5 秒且累积）—— 改这里之前先读那段。
      */
-    login: false,
-    loginBlockedReason:
-      '本服务暂未接线 MiniMax 的设备码登录（协议支持，但未实现发起流程）。'
-      + '请从已登录的 MiniMax 客户端导出 access_token 后粘贴导入。',
+    login: true,
     listModels: true,
     chat: true,
     /** ✅ 有真实余额端点 `/minimax-cloud/api/v1/credit/details`。 */

@@ -1,7 +1,10 @@
 # 项目指令：free-llm-router
 
-> 项目原名 `workbuddy-serverless`（仓库与 Worker 名仍是它，见 `wrangler.jsonc` 的说明）。
 > **对外名称统一用 `free-llm-router`**：多供应商账号池 → 一个 OpenAI 兼容入口。
+>
+> ⚠️ 历史名称：`workbuddy-serverless` → `hivegate` → **`free-llm-router`**。
+> **仓库名、Worker 名、`package.json` 名现在三者一致**，不再有历史遗留。
+>（Worker 名在网页端改过，`wrangler.jsonc` 已同步 —— 见该文件开头的说明。）
 
 ## 语言约束
 
@@ -13,11 +16,11 @@
 
 **当前阶段：第 1–8 步全部完成。项目可交付。**
 
-- **服务**：`https://<你的域名>`（备用 `https://workbuddy-gateway.<你的子域>.workers.dev`）
+- **服务**：`https://<你的域名>`（备用 `<worker 名>.<你的子域>.workers.dev`）
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
-- **389 条单测通过**（`npm test`）。
+- **406 条单测通过**（`npm test`）。
 
 **第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
 原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
@@ -524,7 +527,7 @@ TaskRunner DO
 
 ## 九、实施进度与实测发现
 
-**第 1–8 步全部完成，项目可交付。** `npm test` → **389/389 通过**；`npm run typecheck` → 通过。
+**第 1–8 步全部完成，项目可交付。** `npm test` → **406/406 通过**；`npm run typecheck` → 通过。
 
 > 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
 > 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
@@ -1179,16 +1182,107 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 
 ### 9.14 仍未消除的风险（诚实记录，优先级从高到低）
 
+> ⚠️ 本节在 **2026-10-04 做过一轮「把没做的补上」**，已完成的项移到下方
+> 「本节更新记录」；仍列在这里的是**确实还没做**的。
+
 | 项 | 影响 | 状态 |
 |---|---|---|
 | **带真实凭据的高频请求是否会被 IP 级拦截** | 第 1 步只验证了**无凭据只读**请求；第 8 步的实测也以低频为主 | ⚠️ 未验证（护栏已实现，但触发条件本身未被真实命中过） |
-| **opencode 每账号代理丢弃** | 参考实现靠「不同匿名槽配不同出口 IP」扩容免费额度；Workers 的 `fetch` 不接受 `dispatcher` ⇒ 多个匿名槽共享同一出口 IP，**额度不再能通过多开扩容** | ❌ 真实功能损失 |
+| **opencode 每账号代理丢弃** | 参考实现靠「不同匿名槽配不同出口 IP」扩容免费额度；Workers 的 `fetch` 不接受 `dispatcher` ⇒ 多个匿名槽共享同一出口 IP，**额度不再能通过多开扩容** | ❌ 真实功能损失（平台限制，无法绕过） |
 | **流内换号（trae / lobsterai）** | 需先消费整个 SSE 才能决定重发，与逐帧透传（10ms CPU 铁律）冲突 | ❌ 未实现（流内错误转成错误帧；换号由 HTTP 状态驱动） |
-| **会话粘性** | `AccountPoolDO` 已有 `getSession` / `bindSession` / `unbindSession` / `pruneSessions`，但**网关侧没有调用点** ⇒ 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） | ❌ 未接线 |
-| **图片入站** | Free 计划 10ms CPU 下 base64 图片解码可能超限 | ❌ 未实现 |
-| **连登兑换 / 抽奖 / 旅行** | `upstream/travel.ts` 已实现（`travelStatus` / `travelDepart` / `travelClaim` / `streakStatus` / `redeemTier` / `lotteryDraw` / `drawAllLottery`），但**未接入计划表或动作表**（当前计划只覆盖 11 个零消耗动作 + 5 个真实对话动作） | ❌ 未接线 |
-| **minimax / lobsterai / opencode 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
-| **codearts / trae 的登录** | 上游协议限制（服务端死循环 / 强制 `127.0.0.1` 回调），**架构上不可行**，非本服务缺失 | 已如实声明 `login:false`，只能导入凭据 |
+| **lobsterai 的登录发起** | 它的登录是 browser-redirect + 本机回调组合，**未接线** | ❌ 未接线（已如实声明 `login:false`） |
+| **opencode 的登录发起** | **本就没有登录流程**（只能用 API key） | ✅ 无需接线（如实声明 `login:false`） |
+| **codearts / trae 的登录** | 上游协议限制（codearts 服务端死循环；trae 强制 `127.0.0.1` 回调），**架构上不可行** | ❌ 已如实声明 `login:false`，只能导入凭据 |
+| **连登兑换 / 抽奖 / 旅行未接入计划表** | — | ✅ **已修**，见下方更新记录 |
+| **会话粘性** | — | ✅ **已修**，见下方更新记录 |
+| **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
+
+#### 本节更新记录（2026-10-04）
+
+**1. 图片入站 —— 从来就是通的，旧文档写错了**
+
+旧文档把它列为「❌ 未实现（Free 计划 10ms CPU 下 base64 解码可能超限）」，
+并据此认为需要专门实现。**实测澄清：网关把请求体原样透传，图片本来就能用**：
+
+| 实测项 | 结果 |
+|---|---|
+| 40 KB JPEG（640×480） | ✅ 正确识别（"橙色木板纹理背景"） |
+| 1.9 MB JPEG（1600×1200） | ✅ 成功 |
+| **6.6 MB JPEG（2400×1800）** | ✅ **成功**（prompt_tokens 正常） |
+| PNG 格式 | ✅ 同样可用 |
+
+⇒ **没有 10ms CPU 问题**，无需任何改动。旧结论的错因：
+把「自己没有显式处理图片」当成了「不支持图片」——而**透传本身就是处理**。
+⚠️ 一次早期测试用**合成渐变 PNG** 得到 `image_invalid`，那是上游的内容校验
+（纯色/渐变被判定为无效图片），**不是格式或能力问题**。换真实内容即通过。
+
+**2. 会话粘性 —— 已接线（DO 早有方法，网关一直没有调用点）**
+
+- `AccountPoolDO.pick()` 新增 `preferred` 字段：把粘性账号**排到候选集最前**。
+  ⚠️ 语义是「优先」不是「只要」—— 它不可用时**自然回落到**其余候选，
+  不会因为「粘性的那个挂了」就报「没有可用账号」。
+- 新增 `deriveSessionKey()`：优先用客户端的 `user` 字段，
+  否则用**首条消息**的指纹。⚠️ 刻意**不**用「全部消息」的哈希 ——
+  那样每加一轮消息 key 就变，粘性等于没有（每轮都当新会话）。
+- 绑定在**首帧到达**时做（`ctx.waitUntil`），只**首轮**用粘性
+  （换号后还粘回去会死循环）。
+- 收益：同一会话固定落同一账号 ⇒ 从第二轮起**命中上游 prompt cache**（更快、更省）。
+
+**3. 旅行 / 连登兑换 / 抽奖 —— 已接入计划表**
+
+`upstream/travel.ts` 的函数早就齐了，但计划表里一直没有。现新增 3 个动作
+（`travel` / `redeemStreak` / `lottery`）并放进 `DAILY_ACTIVITY_ACTIONS`：
+
+- **单独一张表**，因为它们**没有 task code** ⇒ **不能**配 `verifyAndClaim`
+  （那会去任务列表里找一个不存在的任务，白跑一轮 ~12 秒并留下假的「未达标」）。
+- 排在**成长任务之前**：它们是**直接发积分**的，先拿确定性收益，
+  万一后面超时/中断，用户至少已经拿到活动的积分。
+- ⚠️ `travel` 动作内部**先领取、再出发** —— 顺序不能反（先出发会覆盖「可领取」状态，白丢奖励）。
+- ⚠️ `redeemStreak` **逐档**兑换而不是取最高档：取最高档会在
+  「高档已兑换、低档还没」时**漏掉低档**；且**单档失败不中断**其余档位。
+- 实测（线上任务运行）：`checkin` ✅ / `redeemStreak` ✅「连登 2 天，没有待兑换的档位」/
+  `lottery` ✅「没有可抽奖次数」/ `travel` 修正后不再报红色错误。
+- ⚠️ **顺带修掉一个真缺陷**：上游对「没有可领奖励」回的是 `no unclaimed travel`，
+  而旧判据 `/not|arriv|未|还没/` **一个词都没命中**
+  （`unclaimed` 不含 `not`、`travel` 不含 `arriv`）⇒ 被当成未知错误抛出，
+  面板上那一步显示**红色 ERR**，而真实情况是**正常**。
+  已抽成纯函数 `isNoUnclaimedTravel` / `isAlreadyDeparted` 并加单测
+  （判据散在 async 函数里时只能做脆弱的源码正则断言，那种测试锁不住行为）。
+
+**4. minimax 设备码登录 —— 已接线**
+
+- 新增 `startMinimaxLogin` / `pollMinimaxLoginOnce`（PKCE S256 + 设备码轮询）。
+- 路由接进 `/admin/providers/login/{start,poll}`，`capabilities.login` 改为 `true`。
+- 实测：返回 `userCode: GQX2-78DE` + `https://account.minimax.cn/oauth-authorize`。
+- ⚠️ 三处判据与 cline **不同**，写错会得到「用户还没来得及点授权就报失败」：
+  1. `pending` 是 **HTTP 200 + status**，而标准 OAuth 是**非 200 + error** —— **两种都要认**；
+  2. PKCE 是 **S256**（`crypto.subtle`，无需 `node:crypto`）；
+  3. `slow_down` 退避是 **+5 秒**（cline 是 +1），且**累积**。
+- ⚠️ 账号域是 `account.minimax.cn`、业务域是 `agent.minimax.cn`，**不可混用**。
+- ⚠️ 轮询是**每请求一次**（面板每 3 秒发独立请求）：
+  `intervalSec` / `nextPollAt` / `deadline` / `deviceCode` / `codeVerifier`
+  **全部持久化在会话载荷**里 —— Workers 无跨请求内存。
+
+**5. ⚠️ 一个高代价的排查教训：`routes` 里的脱敏占位符会让部署失败**
+
+本仓库是公开的，真实域名被替换成 `<你的域名>` / `<你的 zone>`。
+但 `wrangler deploy` 会拿 `routes` 的 pattern 去 CF **查 zone** ⇒ 查不到 ⇒ 报：
+
+```
+Error Occurred: Unable to fetch bindings, routes, or services metadata
+from the dashboard. Please try again later.
+```
+
+⚠️ **该报错极具误导性**：它说「稍后重试」，但重试一百次都一样 ——
+真实原因是**配置里的域名是占位符**。我在这上面浪费了 5 轮部署。
+
+**修法**：`routes` 默认**注释掉**。自定义域只需在 CF 上**绑一次**
+（网页端或 `PUT /workers/domains`），**部署脚本不需要每次带 routes**。
+
+⚠️ 另一个同型教训：Worker 名与线上不一致时，报错是
+`Durable Object namespace name 'xxx_AccountPoolDO' already in use [code: 10065]`
+—— 那个报错**与 DO 重名毫无关系**，只是「worker 名对不上」的副产物。
+排查时别往 DO 配置上找。
 
 ### 9.15 项目结构（最终）
 

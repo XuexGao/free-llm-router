@@ -1346,6 +1346,69 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         )
       }
     }
+
+    // ── minimax（MiniMax Code 中国版）：OAuth 设备码 + PKCE 轮询 ──
+    //
+    // ⚠️ 与 cline 同型（设备码 + 用户码），但三处判据不同，写错会得到
+    //「用户还没来得及点授权就报失败」：
+    // 1. `pending` 是 **HTTP 200 + status**，而标准 OAuth 是
+    //    **非 200 + error=authorization_pending** —— **两种都要认**；
+    // 2. PKCE 是 **S256**（`crypto.subtle.digest`，无需 `node:crypto`）；
+    // 3. `slow_down` 退避是 **+5 秒**（cline 是 +1），且**累积**。
+    // 依据：`deepseek-harness-codearts/src/minimax-oauth.ts:10-16,196-201,276-280`。
+    //
+    // ⚠️ 账号域是 `account.minimax.cn`，业务域是 `agent.minimax.cn` —— 不可混用。
+    if (providerId === 'minimax') {
+      const { startMinimaxLogin } = await import('./providers/minimax.js')
+      try {
+        const started = await startMinimaxLogin(AbortSignal.timeout(30_000))
+        const state = crypto.randomUUID()
+        const now = Date.now()
+        const deadline = now + started.expiresInSec * 1000
+        const sessionTtl = deadline + CLINE_LOGIN_SESSION_GRACE_MS
+        await pool.saveLoginSession(
+          state,
+          {
+            provider: 'minimax',
+            kind: 'minimax',
+            realm: loginRealm,
+            // ⚠️ 设备码 + PKCE verifier 都必须持久化：Workers 无跨请求内存，
+            // 放在模块变量里 isolate 一回收就丢，续期/轮询会静默失败。
+            deviceCode: started.deviceCode,
+            codeVerifier: started.codeVerifier,
+            userCode: started.userCode,
+            verificationUri: started.verificationUri,
+            verificationUriComplete: started.verificationUriComplete,
+            intervalSec: started.intervalSec,
+            // 首次轮询也要等满一个 interval（设备码规范要求）
+            nextPollAt: now + started.intervalSec * 1000,
+            deadline,
+            createdAt: now,
+          },
+          sessionTtl,
+        )
+        return json({
+          ok: true,
+          provider: 'minimax',
+          state,
+          userCode: started.userCode,
+          verificationUri: started.verificationUri,
+          verificationUriComplete: started.verificationUriComplete,
+          expiresInMs: started.expiresInSec * 1000,
+          realm: loginRealm,
+        })
+      } catch (error) {
+        return json(
+          {
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+              type: 'login_start_failed',
+            },
+          },
+          502,
+        )
+      }
+    }
     // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
     //
     // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
@@ -1550,6 +1613,65 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
             message: error instanceof Error ? error.message : String(error),
           })
         }
+      }
+
+      // ── minimax：设备码 + PKCE 轮询（与 cline 同型，判据不同） ──
+      if (saved.payload['kind'] === 'minimax') {
+        const { pollMinimaxLoginOnce } = await import('./providers/minimax.js')
+
+        const deviceCode = sessionString(saved.payload, 'deviceCode')
+        const codeVerifier = sessionString(saved.payload, 'codeVerifier')
+        if (deviceCode === '' || codeVerifier === '') {
+          // ⚠️ `codeVerifier` 也要查：丢了它轮询**必然换不到 token**
+          //（服务端拿它的 S256 与申请时的 challenge 比对），
+          // 而错误会显示成「授权失败」，完全看不出是会话缺字段。
+          return json({ done: false, status: 'failed', message: '登录会话缺少设备码或 PKCE verifier，请重新发起登录' })
+        }
+        const deadline = sessionNumber(saved.payload, 'deadline') ?? now
+        if (now > deadline) {
+          await saved.pool.removeLoginSession(state)
+          return json({ done: false, status: 'failed', message: '设备码已过期，请重新发起登录' })
+        }
+
+        // ⚠️ 面板 3 秒一轮，而上游要求 5 秒起（`slow_down` 后更长）。
+        // 未到点就**直接回 pending，不打上游** —— 省配额也避免被限流。
+        const intervalSec = sessionNumber(saved.payload, 'intervalSec') ?? 5
+        const nextPollAt = sessionNumber(saved.payload, 'nextPollAt') ?? now
+        if (now < nextPollAt) {
+          return json({
+            done: false,
+            status: sessionString(saved.payload, 'lastStatus') || 'pending',
+            message: `等待授权中…（${Math.ceil((nextPollAt - now) / 1000)} 秒后重试）`,
+          })
+        }
+
+        const auth = {
+          deviceCode,
+          codeVerifier,
+          userCode: sessionString(saved.payload, 'userCode'),
+          verificationUri: sessionString(saved.payload, 'verificationUri'),
+          verificationUriComplete: sessionString(saved.payload, 'verificationUriComplete'),
+          expiresInSec: Math.max(1, Math.round((deadline - now) / 1000)),
+          intervalSec,
+        }
+        const outcome = await pollMinimaxLoginOnce(auth, AbortSignal.timeout(20_000))
+
+        if (outcome.kind === 'pending') {
+          // ⚠️ 每轮都把新间隔写回会话：`slow_down` 的 **+5 秒累积退避**
+          // 必须跨请求保留（Workers 无跨请求内存，放模块变量会静默失效）。
+          // ⚠️ TTL 也要带同一个宽限值 —— 用 `deadline` 当 TTL 会把宽限在第一轮抹掉。
+          await saved.pool.saveLoginSession(
+            state,
+            { ...saved.payload, intervalSec: outcome.intervalSec, nextPollAt: Date.now() + outcome.intervalSec * 1000, lastStatus: outcome.kind },
+            deadline + CLINE_LOGIN_SESSION_GRACE_MS,
+          )
+          return json({ done: false, status: 'pending', message: '等待授权中…' })
+        }
+        if (outcome.kind === 'failed') {
+          await saved.pool.removeLoginSession(state)
+          return json({ done: false, status: 'failed', message: outcome.message })
+        }
+        return json(await persistProviderCredential(env, outcome.credential, now))
       }
       // ── codearts：浏览器回跳 + ticket 换取凭据 ──
       // `{done:false, status}` 是**约定形状**：面板据此区分「等浏览器」

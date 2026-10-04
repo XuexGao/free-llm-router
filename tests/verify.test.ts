@@ -1,3 +1,4 @@
+import { isAlreadyDeparted, isNoUnclaimedTravel } from '../src/upstream/travel.ts'
 /**
  * 进度回读与领奖的单测（含**异步计分**这个最难排查的坑）。
  *
@@ -193,12 +194,48 @@ test('⚠️ 成长计划：绝不包含需要真实对话的任务（会消耗�
 test('成长计划：零消耗动作数与动作表一致', () => {
   const actions = zeroCostActions()
   const steps = planGrowth()
-  // 每个动作 2 步（动作 + 回读领奖）+ 1 个初始探测 + **1 个签到**。
+  // 每个成长任务 2 步（动作 + 回读领奖）+ 1 个初始探测 + **1 个签到**
+  // + **3 个活动类动作**（旅行 / 连登兑换 / 抽奖，各 1 步、无回读领奖）。
   //
   // ⚠️ `+1` 的签到步是**修缺陷后新增**的：早期 `planGrowth` 没有它，
   // 于是面板「执行每日任务」按承诺做「签到 → 成长任务」，实际**从未签到**。
   // 这条断言刻意把签到计入总步数 —— 若有人再把它删掉，这里会立刻变红。
-  assert.equal(steps.length, actions.length * 2 + 2)
+  //
+  // ⚠️ `+3` 的活动步同理：它们也是「承诺了但没接线」的功能
+  //（`upstream/travel.ts` 早就实现了，计划表里却一直没有）。
+  const activitySteps = steps.filter((s) =>
+    ['travel', 'redeemStreak', 'lottery'].includes(s.action),
+  )
+  assert.equal(activitySteps.length, 3, '三个活动动作都必须在计划里')
+  assert.equal(steps.length, actions.length * 2 + 2 + 3)
+})
+
+test('⚠️ 活动类动作**不得**带 verifyAndClaim（它们没有 task code）', () => {
+  // 旅行/连登/抽奖是**独立活动**，奖励由活动接口直接发放，没有 task code。
+  // 若给它们配 verifyAndClaim，会去任务列表里找一个不存在的任务 ——
+  // 白跑一轮回读（约 12 秒）并留下一条假的「进度未达标」。
+  const steps = planGrowth()
+  for (let i = 0; i < steps.length; i += 1) {
+    const s = steps[i]
+    if (s === undefined) continue
+    if (!['travel', 'redeemStreak', 'lottery'].includes(s.action)) continue
+    const next = steps[i + 1]
+    assert.notEqual(
+      next?.action,
+      'verifyAndClaim',
+      `活动动作 ${s.action} 后面不该跟 verifyAndClaim`,
+    )
+  }
+})
+
+test('⚠️ 活动类动作必须排在成长任务之前（先拿确定性收益）', () => {
+  // 旅行/连登/抽奖是**直接发积分**的；成长任务要靠回读确认、耗时更长。
+  // 先做确定性收益，万一后面超时/中断，用户至少已经拿到活动的积分。
+  const steps = planGrowth()
+  const firstTaskIdx = steps.findIndex((s) => s.code === 'chat_5')
+  const travelIdx = steps.findIndex((s) => s.action === 'travel')
+  assert.ok(firstTaskIdx > 0 && travelIdx > 0, '两类步骤都应存在')
+  assert.ok(travelIdx < firstTaskIdx, '活动动作应排在成长任务之前')
 })
 
 test('⚠️ 成长计划（「执行每日任务」按钮）必须包含签到步骤', () => {
@@ -280,4 +317,31 @@ test('注册的动作表里含关键动作', () => {
   for (const action of ['checkin', 'balance', 'listTasks', 'verifyAndClaim']) {
     assert.ok(registered.includes(action), `缺少动作 ${action}`)
   }
+})
+
+
+// ─────────────────── 旅行动作的「正常状态」不得报错 ───────────────────
+
+test('⚠️ 旅行的「无可领取」必须判为正常（实测文案 no unclaimed travel）', () => {
+  // 实测（2026-10-04 线上任务运行）：上游对「没有可领奖励」回
+  // `no unclaimed travel`，而旧判据 `/not|arriv|未|还没/` **一个词都没命中**
+  //（`unclaimed` 不含 `not`，`travel` 不含 `arriv`）⇒ 被当成未知错误抛出，
+  // 面板上那一步显示**红色 ERR**，而真实情况是「正常，只是还没到领的时候」。
+  assert.equal(isNoUnclaimedTravel(undefined, 'no unclaimed travel'), true, '必须匹配实测文案')
+  assert.equal(isNoUnclaimedTravel(undefined, '尚未到达目的地'), true)
+  assert.equal(isNoUnclaimedTravel(undefined, 'not arrived'), true)
+  assert.equal(isNoUnclaimedTravel(10001, ''), true, '业务码 10001 是幂等码')
+  // ⚠️ 真正的错误不能被误判成正常 —— 否则会**静默吞掉**真实故障
+  assert.equal(isNoUnclaimedTravel(undefined, 'internal server error'), false)
+  assert.equal(isNoUnclaimedTravel(500, 'unknown failure'), false)
+})
+
+test('⚠️ travelDepart 的判据要覆盖多种「已派过」文案', () => {
+  assert.equal(isAlreadyDeparted(undefined, 'daily limit reached'), true)
+  assert.equal(isAlreadyDeparted(undefined, 'already departed'), true)
+  assert.equal(isAlreadyDeparted(undefined, 'cat is traveling'), true)
+  assert.equal(isAlreadyDeparted(undefined, '今日已达上限'), true)
+  assert.equal(isAlreadyDeparted(10001, ''), true)
+  // 真错误不得被吞
+  assert.equal(isAlreadyDeparted(500, 'internal error'), false)
 })

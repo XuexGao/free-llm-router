@@ -56,6 +56,28 @@ export const REAL_CHAT_ACTIONS: ReadonlyArray<{ code: string; action: string }> 
 ]
 
 /**
+ * **非任务类**的日常动作（不挂在任何 task code 上，故没有 `verifyAndClaim`）。
+ *
+ * ## 为什么单独一张表
+ *
+ * `ZERO_COST_ACTIONS` 里每一项都对应一个**成长任务**（有 task code，
+ * 做完要回读 + 领奖）。而猫猫旅行 / 连登兑换 / 抽奖是**独立的活动**：
+ * 它们没有 task code，奖励由活动接口直接发放，故**不能**走 `verifyAndClaim`
+ * （那会去任务列表里找一个不存在的任务，白跑一轮并留下一条假的「未达标」）。
+ *
+ * ⚠️ 全部**零对话消耗** —— 可以安全地进挂 cron 的自动计划。
+ * ⚠️ 全部**幂等**：重复执行不会重复领奖（上游对已领取回业务码）。
+ */
+const DAILY_ACTIVITY_ACTIONS: ReadonlyArray<{ code: string; action: string }> = [
+  // 先领上一次的旅行奖励，再出发为下一次准备（动作内部保证顺序）
+  { code: 'travel', action: 'travel' },
+  // 连登档位兑换（逐档、单档失败不中断）
+  { code: 'redeem_streak', action: 'redeemStreak' },
+  // 抽奖（次数为 0 时不打上游）
+  { code: 'lottery', action: 'lottery' },
+]
+
+/**
  * 每日计划：只读探测 → 签到 → 解冻相关查询。
  *
  * 顺序即执行顺序：先只读探测（确认账号可用 + 拿到进度），
@@ -98,6 +120,13 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
   const actions = includeRealChat
     ? [...ZERO_COST_ACTIONS, ...REAL_CHAT_ACTIONS]
     : ZERO_COST_ACTIONS
+
+  // ⚠️ **活动类动作放在成长任务之前**。理由：旅行/连登/抽奖是**直接发积分**的，
+  // 而成长任务要靠回读确认、耗时更长。先做「确定性收益」再去做「需要回读的」，
+  // 万一后面某步超时或中断，用户至少已经拿到活动的积分。
+  for (const { code, action } of DAILY_ACTIVITY_ACTIONS) {
+    steps.push({ code, action, delayMs: GAP.report })
+  }
 
   for (const { code, action } of actions) {
     // 双保险：零消耗计划里绝不出现需要真实对话的任务

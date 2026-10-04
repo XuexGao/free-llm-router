@@ -25,6 +25,15 @@ import { billingHeaders, desktopHeaders, mpHeaders, webHeaders, deriveDeviceId, 
 import { callUpstream, UpstreamError } from '../upstream/client.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
 import { listTasks, mergeTaskLists } from '../upstream/tasks.js'
+import {
+  drawAllLottery,
+  lotteryDraw,
+  redeemTier,
+  streakStatus,
+  travelClaim,
+  travelDepart,
+  travelStatus,
+} from '../upstream/travel.js'
 import { reportCli, reportDesktop, reportWeb, sanitizeEvents, withFingerprint } from '../upstream/report.js'
 import {
   cliChatRequestEvent,
@@ -614,6 +623,100 @@ const ACTIONS: Record<string, ActionHandler> = {
    * ⚠️ 上游计分**异步**（实测 5–8s 才落定），故必须有界轮询
    * （见 `verify.ts` 的详细说明）。只读一次会误判「未达标」而**跳过领奖**。
    */
+  /**
+   * 猫猫旅行：**先领取上一次的成果，再出发**（为下一次准备）。
+   *
+   * ⚠️ 顺序不能反：先出发会覆盖掉「可领取」状态，白丢一次奖励。
+   *
+   * ⚠️ 合并在一个动作里而不是拆成「出发 / 领取」两步：上游的旅行需要
+   * 出发后经过一段时间才能领，而任务引擎的步进间隔由 alarm 控制（最短 1 秒）。
+   * 拆两步会得到「刚出发就领 → 必然领不到」的**假失败**；
+   * 真实领取时机是下一次运行（几小时后），而 `travelClaim` 是幂等的。
+   */
+  async travel(ctx, _step, env): Promise<ActionResult> {
+    try {
+      const before = await travelStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      const claimed = await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      const departed = await travelDepart({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      const parts: string[] = [
+        claimed.claimed ? `已领取（${claimed.detail}）` : `无可领取（${claimed.detail}）`,
+        departed.departed ? `已出发（${departed.detail}）` : `未出发（${departed.detail}）`,
+      ]
+      // `TravelStatus` 只有 state / destination / dailyLimitReached（没有「剩余次数」）
+      if (before.destination !== '') parts.push(`目的地 ${before.destination}`)
+      if (before.dailyLimitReached) parts.push('今日已达上限')
+      return { ok: true, detail: parts.join('；') }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, '猫猫旅行') }
+    }
+  },
+
+  /**
+   * 连登兑换：把**已达成的每个档位**都兑换掉。
+   *
+   * ⚠️ 逐档尝试而不是「取最高档」：取最高档会在
+   * 「高档已兑换、低档还没」时**漏掉低档**。每档都幂等，重复调用无副作用。
+   *
+   * ⚠️ 单档失败**不中断**其余档位 —— 档位相互独立，
+   * 一个失败不该让其它可兑换的也拿不到。
+   */
+  async redeemStreak(ctx, _step, env): Promise<ActionResult> {
+    try {
+      const status = await streakStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      // ⚠️ `redeemableTiers` **上游已经过滤好**（只含「已解锁但未兑换」的档位）——
+      // 不要自己再判一遍「是否达成/是否已兑换」，那会与上游口径分叉。
+      const tiers = status.redeemableTiers ?? []
+      if (tiers.length === 0) {
+        return { ok: true, detail: `连登 ${status.days} 天，没有待兑换的档位` }
+      }
+      const results: string[] = []
+      let redeemed = 0
+      for (const tier of tiers) {
+        try {
+          const r = await redeemTier({ uid: ctx.uid, accessToken: ctx.accessToken }, env, tier)
+          if (r.redeemed) { redeemed += 1; results.push(`${tier} ✓`) }
+        } catch (error) {
+          // ⚠️ 单档失败**不中断**其余档位 —— 档位相互独立。
+          results.push(`${tier} ✗（${describeError(error, '兑换').slice(0, 40)}）`)
+        }
+      }
+      if (redeemed === 0 && results.length === 0) return { ok: true, detail: '连登档位都已兑换' }
+      return {
+        ok: true,
+        detail: `连登 ${status.days} 天，兑换 ${redeemed} 个档位`
+          + (results.length > 0 ? `（${results.join('、')}）` : ''),
+      }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, '连登兑换') }
+    }
+  },
+
+  /**
+   * 抽奖：把当前可用次数**全部**用完（上游支持一次抽多次）。
+   *
+   * ⚠️ 先查 `lotteryChances` 再抽：次数为 0 时**不打上游**。
+   * 抽奖是**写操作**，无谓地打它既浪费配额也增加风控暴露面。
+   */
+  async lottery(ctx, _step, env): Promise<ActionResult> {
+    try {
+      const status = await streakStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      if (status.lotteryChances <= 0) {
+        return { ok: true, detail: '没有可抽奖次数' }
+      }
+      // ⚠️ 上限 20 次：上游单次最多接受这么多，且避免「次数被误报成极大值」时
+      // 在一步里打上百次上游（会触发风控，也超 10ms CPU 预算）。
+      const result = await drawAllLottery({ uid: ctx.uid, accessToken: ctx.accessToken }, env, 20, 20)
+      if (result.drawn > 0) {
+        return { ok: true, detail: `抽了 ${result.drawn} 次：${result.details.slice(0, 3).join('；')}` }
+      }
+      // 单次兜底：批量接口在某些账号形态下不可用，单抽一次再试。
+      const one = await lotteryDraw({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      return { ok: true, detail: one.drawn ? `已抽奖（${one.detail}）` : `无可抽次数（${one.detail}）` }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, '抽奖') }
+    }
+  },
+
   async verifyAndClaim(ctx, step, env): Promise<ActionResult> {
     try {
       const outcome = await verifyAndClaim(

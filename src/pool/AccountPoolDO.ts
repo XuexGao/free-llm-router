@@ -109,6 +109,23 @@ export interface PickRequest {
   provider?: string
   /** 目标模型；空串表示「还没定模型」——此时不做模型级过滤。 */
   model: string
+  /**
+   * **优先**使用的账号（会话粘性）。
+   *
+   * ⚠️ 语义是「优先」不是「只要」：它在候选集里**排到最前**，
+   * 但若它已不可用（冷却/熔断/模型限流/被 exclude），
+   * 会**自然回落到**其余候选 —— 绝不能因为「粘性的那个挂了」就报「没有可用账号」。
+   *
+   * ## 为什么值得做（上游 prompt cache）
+   *
+   * 同一会话若每次都落不同账号，上游的 prompt cache **永远不命中**：
+   * 每一轮都要重新处理整个上下文 ⇒ **更慢、更贵**（按 token 计费时尤其明显）。
+   * 绑定会话到账号后，第二轮起就能命中缓存。
+   *
+   * ⚠️ 只在**候选集内**提升优先级，不绕过任何健康检查 ——
+   * 粘性不该让一个正在冷却的账号被强行使用。
+   */
+  preferred?: string
   /** 已尝试过的 uid，必须排除（跨重试保留，否则会在账号间无限来回）。 */
   exclude: string[]
   now: number
@@ -259,6 +276,18 @@ export class AccountPoolDO extends DurableObject<Env> {
 
     // 权重：积分越多越优先（温和偏好，不是硬门槛）。
     // ⚠️ 刻意**不**用 `Math.random()` 之外的全局状态：DO 单线程，无需防并发。
+    // ⚠️ **会话粘性**：把 `preferred` 提到候选集最前，**直接返回**。
+    //
+    // 为什么直接返回而不是「加权倾斜」：加权仍会**随机落到别的账号**，
+    // 那样 prompt cache 照样不命中 —— 粘性就失去意义了。
+    // 而「优先账号挂了怎么办」已由上游的候选过滤解决：
+    // 它不可用时压根不在 `candidates` 里，自然回落到其余候选。
+    const preferred = request.preferred ?? ''
+    if (preferred !== '') {
+      const hit = candidates.find((s) => s.uid === preferred)
+      if (hit !== undefined) return { uid: hit.uid, state: hit }
+    }
+
     const weights = candidates.map((s) => 1 + Math.max(0, s.credits) / 100)
     const total = weights.reduce((a, b) => a + b, 0)
     let roll = Math.random() * total
