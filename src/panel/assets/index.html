@@ -10,9 +10,8 @@
 <header>
   <div class="brand"><h1>WorkBuddy Serverless</h1><span id="auth-status" class="pill"></span></div>
   <div class="auth">
-    <input id="apikey" type="password" placeholder="API_KEY" autocomplete="off">
-    <button id="save-key">保存密钥</button>
     <button id="toggle-theme" class="ghost icon-btn" title="切换主题（自动/浅色/深色）">🌗</button>
+    <button id="logout" class="ghost icon-btn" title="退出登录" aria-label="退出登录">⏻</button>
   </div>
 </header>
 
@@ -31,12 +30,6 @@
     <strong>⚠️ 出口 IP 疑似被上游 WAF 拦截</strong>
     <span id="waf-detail"></span>
     <button id="clear-waf" class="ghost">立即解除</button>
-  </div>
-
-  <div id="setup-hint" class="notice" hidden>
-    <strong>请先在右上角填入 API_KEY</strong>
-    <p>密钥用于访问本服务的管理接口。填好后点「保存密钥」，页面会自动加载数据。</p>
-    <p class="hint">密钥存在浏览器 localStorage，每个请求通过 <code>Authorization</code> 头发送（不用 cookie，因此免疫 CSRF）。</p>
   </div>
 
   <!-- ───────── 任务中心 ───────── -->

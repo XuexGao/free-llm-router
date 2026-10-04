@@ -33,3 +33,11 @@ declare module '*.wasm' {
   const mod: WebAssembly.Module
   export default mod
 }
+declare module '*/assets/login.html' {
+  const content: string
+  export default content
+}
+declare module '*/assets/login.js.txt' {
+  const content: string
+  export default content
+}

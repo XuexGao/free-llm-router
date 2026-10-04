@@ -13,6 +13,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import { CSP, panelAsset, securityHeaders } from '../src/panel/index.ts'
 
@@ -129,15 +130,56 @@ test('面板 HTML 不内联脚本（保 CSP 严格性）', () => {
 
 // ─────────────────── 面板可用性（用户报障后新增） ───────────────────
 
-test('⚠️ 面板必须有无密钥的引导（否则用户看到一片空白）', () => {
+test('⚠️ 必须有**独立的登录页**（不在面板顶部塞密钥框）', () => {
+  // 用户要求：单独一个登录页验证密钥，放在面板里不好看。
+  const login = panelAsset('/login')
+  assert.notEqual(login, undefined, '应有 /login 页面')
+  assert.ok(login?.body.includes('login-form'), '登录页应有表单')
+  assert.ok(login?.body.includes('apikey'), '登录页应有密钥输入框')
+  const loginJs = panelAsset('/panel/login.js')
+  assert.notEqual(loginJs, undefined, '应有登录页脚本')
+  assert.ok(loginJs?.body.includes('/admin/pool'), '登录页应真实验证密钥')
+  assert.ok(loginJs?.body.includes("location.href = '/panel/'"), '验证通过后应跳转面板')
+
+  // 面板顶部**不该**再有密钥输入框
   const html = panelAsset('/panel/')?.body ?? ''
+  assert.ok(!html.includes('id="apikey"'), '面板顶部不该再有密钥框')
+  assert.ok(!html.includes('setup-hint'), '不该再有「请填密钥」的顶部提示')
+  // 未登录应重定向到登录页
   const js = panelAsset('/panel/app.js')?.body ?? ''
-  // 必须有提示区块
-  assert.ok(html.includes('setup-hint'), 'HTML 应有引导区块')
-  assert.ok(html.includes('API_KEY'), '应提示用户填密钥')
-  // 且 JS 在无密钥时也要渲染视图（而不是 return 什么都不做）
-  assert.ok(/key === ''/.test(js) || /key === ""/.test(js), 'JS 应显式处理「无密钥」分支')
-  assert.ok(js.includes('switchView'), '无密钥时也应切换视图（让用户看到界面结构）')
+  assert.ok(js.includes("location.href = '/login'"), '未登录/失效应跳登录页')
+  assert.ok(html.includes('id="logout"'), '应有退出登录按钮')
+})
+
+test('⚠️ 能力标签不该列「列模型」「对话」（全部供应商都支持，是噪音）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const capsBlock = /const CAPS = \[([\s\S]*?)\n\]/.exec(js)
+  assert.notEqual(capsBlock, null, '应有 CAPS 定义')
+  const body = capsBlock[1]
+  // ⚠️ 断言的是**数组元素**（形如 ['listModels', ...]），不是注释文字 ——
+  // 注释里解释「为什么不列」时会出现这两个词，不能误判。
+  assert.ok(!/\[\s*'listModels'/.test(body), '不该列「列模型」')
+  assert.ok(!/\[\s*'chat'/.test(body), '不该列「对话」')
+  // 保留有区分度的三项
+  assert.ok(/\[\s*'login'/.test(body), '应保留「设备码登录」')
+  assert.ok(/\[\s*'balance'/.test(body), '应保留「查余额」')
+  assert.ok(/\[\s*'checkin'/.test(body), '应保留「每日签到」')
+})
+
+test('⚠️ /v1/models 必须只列「有账号」的供应商的模型（登录后才显示）', () => {
+  // 用户要求：没登录的提供商默认不在 API 里显示，登录后再显示。
+  //
+  // ⚠️ 实现方式**不是**「预先关闭模型」—— 没有账号时根本拉不到模型目录
+  //（列模需要凭据），所以无法预先知道要关哪些 id。
+  // 正确做法是 /v1/models **按账号聚合**：遍历有账号的供应商逐个拉目录，
+  // 没账号的自然不出现。这也让「登录后再显示」自动成立。
+  // ⚠️ 单测是**打包后**在 `.build/tests/` 下跑的，故相对路径要指回源码根。
+  // 用 process.cwd()（脚本从仓库根运行）最稳。
+  const src = readFileSync('src/index.ts', 'utf8')
+  // 简单起见：断言关键标识符存在（比跨行正则更稳）
+  assert.ok(src.includes('byProvider'), '/v1/models 应按供应商分组账号')
+  assert.ok(/for \(const \[providerId, list\] of byProvider\)/.test(src), '应逐个有账号的供应商拉目录')
+  assert.ok(src.includes('provider.capabilities.listModels'), '应只对有列模能力的供应商拉目录')
 })
 
 test('⚠️ 面板视图（账号池已并入供应商）', () => {

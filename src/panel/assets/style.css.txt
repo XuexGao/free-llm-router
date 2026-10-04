@@ -268,3 +268,21 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) .model-row.off .mid,
   html:not([data-theme]) .model-row.off .mname { color: #9aa3b2; }
 }
+
+/* ─────────── 登录页 ─────────── */
+.login-body {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; margin: 0;
+}
+.login-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 28px 26px; width: min(400px, 100%);
+}
+.login-card h1 { font-size: 17px; margin: 0 0 6px; }
+.login-card form { display: flex; flex-direction: column; gap: 10px; margin: 16px 0 10px; }
+.login-card input { padding: 10px 12px; font-size: 14px; }
+.login-card button { padding: 10px 12px; font-size: 14px; }
+.login-msg { font-size: 13px; min-height: 20px; margin: 0 0 8px; }
+.login-msg.ok { color: var(--ok); }
+.login-msg.err { color: var(--err); }
+.login-foot { font-size: 11px; line-height: 1.6; }

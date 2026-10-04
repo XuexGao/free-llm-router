@@ -489,10 +489,15 @@ async function loadModels() {
 // ─────────────────────────── 供应商 ───────────────────────────
 
 /** 能力标签（只显示 ✓/✕ + 名称，**不显示说明文案**）。 */
+/**
+ * 卡片上展示的能力标签。
+ *
+ * ⚠️ 刻意**不列** `listModels` 与 `chat` —— 所有 12 个变体都支持这两项，
+ * 每个卡片都挂两个永远为 ✓ 的标签只是噪音，反而淹没了真正有区分度的
+ * 「登录 / 余额 / 签到」。
+ */
 const CAPS = [
   ['login', '设备码登录'],
-  ['listModels', '列模型'],
-  ['chat', '对话'],
   ['balance', '查余额'],
   ['checkin', '每日签到'],
 ]
@@ -511,6 +516,10 @@ let providerCache = []
  * 否则会无谓地消耗上游配额并可能触发风控。
  */
 let creditCache = {}
+/** 是否已成功拉过一次积分（避免每次切视图都真打上游）。 */
+let creditsLoaded = false
+/** 各供应商的账号数（决定是否要自动关闭模型）。 */
+let accountCounts = {}
 
 async function loadProviderCredits() {
   const res = await api('/admin/packages?realm=cn')
@@ -522,6 +531,7 @@ async function loadProviderCredits() {
     byProvider[pid] = (byProvider[pid] || 0) + a.total
   }
   creditCache = byProvider
+  creditsLoaded = true
   // 只更新徽标，不重建整张卡片（避免闪烁）
   for (const [pid, total] of Object.entries(byProvider)) {
     const el = document.querySelector(`.prov-card[data-provider="${pid}"] .prov-credits`)
@@ -531,6 +541,18 @@ async function loadProviderCredits() {
 
 async function loadProviders() {
   loadPool()      // 计数渲染在视图顶部
+  // 先取各供应商的账号数（决定是否自动关闭模型 + 卡片是否显示积分）
+  accountCounts = {}
+  const accRes = await api('/admin/accounts?realm=cn')
+  if (accRes.ok && accRes.body) {
+    for (const a of accRes.body.accounts || []) {
+      const pid = a.provider || 'buddy'
+      accountCounts[pid] = (accountCounts[pid] || 0) + 1
+    }
+  }
+  // ⚠️ 首次进入视图时要自动拉一次积分，否则卡片右上角永远是空的
+  //（之前只在点「刷新」时才拉 —— 用户看到的就是「有账号也不显示余额」）。
+  if (!creditsLoaded) void loadProviderCredits()
   const res = await api('/admin/providers')
   const box = $('providers')
   clear(box)
@@ -917,6 +939,11 @@ function applyTheme(theme) {
   localStorage.setItem('wb_theme', theme)
 }
 
+$('logout').onclick = () => {
+  localStorage.removeItem('wb_api_key')
+  location.href = '/login'
+}
+
 $('toggle-theme').onclick = () => {
   const cur = localStorage.getItem('wb_theme') || 'auto'
   // 循环：auto → light → dark → auto
@@ -924,11 +951,6 @@ $('toggle-theme').onclick = () => {
   applyTheme(next)
 }
 
-$('save-key').onclick = () => {
-  localStorage.setItem('wb_api_key', $('apikey').value.trim())
-  setAuth('已保存，正在验证…', true)
-  bootstrap()
-}
 $('do-import').onclick = doImport
 $('do-login').onclick = doLogin
 $('run-checkin-all').onclick = runCheckinAll
@@ -974,18 +996,17 @@ async function bootstrap() {
   const key = apiKey()
 
   if (key === '') {
-    $('setup-hint').hidden = false
-    setAuth('未设置密钥', false)
-    // 仍然显示导航与空状态，让用户看到「这里有东西，只是缺密钥」
-    switchView(localStorage.getItem('wb_view') || 'accounts')
+    // ⚠️ 未登录 → 跳到独立登录页（而不是在面板顶部塞一个密码框）。
+    location.href = '/login'
     return
   }
 
   $('setup-hint').hidden = true
   const res = await api('/admin/pool?realm=cn')
   if (!res.ok) {
-    setAuth('密钥无效', false)
-    $('setup-hint').hidden = false
+    // 密钥失效 → 也回登录页（避免停在一个空面板上）
+    localStorage.removeItem('wb_api_key')
+    location.href = '/login'
     return
   }
 
@@ -998,5 +1019,4 @@ async function bootstrap() {
 // ⚠️ 主题要在**最早期**应用（在任何渲染之前），否则浅色用户会看到深色闪烁。
 applyTheme(localStorage.getItem('wb_theme') || 'dark')
 
-$('apikey').value = apiKey()
 bootstrap()

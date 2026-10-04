@@ -883,46 +883,75 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // ── OpenAI 兼容：模型列表 ──
   if (path === '/v1/models' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const picked = await pickCredential(env, realm, DEFAULT_PROVIDER)
-    if (picked === undefined) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+
+    // ⚠️ **只列「有账号」的供应商的模型**（用户要求）。
+    //
+    // 没有账号的供应商，其模型选了也只会报「没有可用账号」——
+    // 列出来只会让客户端挑到一个必然失败的模型。
+    // 这也让「登录后再显示」自然成立：登录后 accountCounts 变化，模型即出现。
+    //
+    // 只对声明 `listModels` 的家拉目录；逐家**串行**（同时出站连接上限 6，
+    // 且并行打上游更容易触发风控）。
+    const byProvider = new Map<string, typeof accounts>()
+    for (const a of accounts) {
+      const pid = a.provider ?? DEFAULT_PROVIDER
+      const list = byProvider.get(pid) ?? []
+      list.push(a)
+      byProvider.set(pid, list)
+    }
+
+    const data: Array<Record<string, unknown>> = []
+    const errors: Array<{ provider: string; error: string }> = []
+    let disabledTotal = 0
+
+    for (const [providerId, list] of byProvider) {
+      const provider = findProvider(providerId)
+      if (provider === undefined || !provider.capabilities.listModels) continue
+      const account = list.find((a) => !a.disabled)
+      if (account === undefined) continue
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) continue
+
+      const disabled = new Set(await pool.getDisabledModels(providerId))
+      disabledTotal += disabled.size
+
+      try {
+        const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+        for (const m of models) {
+          if (disabled.has(m.id)) continue
+          const base = m as unknown as Record<string, unknown>
+          // ⚠️ 同时暴露**裸名**与 **`provider/` 前缀名**：
+          // - 裸名保持既有用户兼容（他们已经在用 `deepseek-v4-flash`）；
+          // - 带前缀名让多供应商场景无歧义（多家可能有同名模型）。
+          data.push({ ...base, id: `${providerId}/${m.id}` })
+          // 裸名只给**默认供应商**（否则多家重名会互相覆盖，客户端拿到谁不确定）
+          if (providerId === DEFAULT_PROVIDER) data.push(base)
+        }
+      } catch (error) {
+        // ⚠️ 逐家兜错：一家失败不该让整个目录 500（用户可能只想用另一家）
+        errors.push({
+          provider: providerId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    if (data.length === 0 && errors.length === 0) {
       return jsonError(
         503,
-        `没有可用的 ${DEFAULT_PROVIDER} 账号（请先通过 /admin/login/start 登录或 /admin/import 导入凭据）`,
+        '没有任何可用账号（请先在面板登录或导入凭据）',
         'no_available_account',
       )
     }
-    try {
-      const models = await listModels(
-        { uid: picked.uid, accessToken: picked.credential.accessToken },
-        env,
-      )
-      // ⚠️ **过滤掉用户手动停用的模型**（面板的开关）。
-      // 用户明确要求：「关了之后是真的在 api 上看不见」——
-      // 只在面板上隐藏是不够的，客户端仍然会拿到并可能调用它。
-      //
-      // ⚠️ 只作用于**默认供应商**的裸名/前缀名；其它供应商的模型不在这个端点里。
-      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-      const disabled = new Set(await pool.getDisabledModels(DEFAULT_PROVIDER))
-
-      // ⚠️ 同时暴露**裸名**与 **`provider/` 前缀名**：
-      // - 裸名保持既有用户兼容（他们已经在用 `deepseek-v4-flash`）；
-      // - 带前缀名让多供应商场景无歧义（多家可能有同名模型）。
-      // 只暴露前缀会破坏兼容性；只暴露裸名则多供应商重名时无法区分。
-      const data: Array<Record<string, unknown>> = []
-      for (const m of models) {
-        if (disabled.has(m.id)) continue
-        const base = m as unknown as Record<string, unknown>
-        data.push(base)
-        data.push({ ...base, id: `${DEFAULT_PROVIDER}/${m.id}` })
-      }
-      return json({ object: 'list', data, disabledCount: disabled.size })
-    } catch (error) {
-      return jsonError(
-        502,
-        `模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`,
-        'upstream_error',
-      )
-    }
+    return json({
+      object: 'list',
+      data,
+      ...(errors.length === 0 ? {} : { errors }),
+      disabledCount: disabledTotal,
+    })
   }
 
   // ── OpenAI 兼容：对话（**流式 SSE 透传**） ──

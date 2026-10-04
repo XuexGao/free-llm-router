@@ -37,6 +37,8 @@ import panelCss from './assets/style.css.txt'
 // 用 `.js.txt` 让 Text 规则生效；服务时仍以 `application/javascript` 返回
 // （见下方 panelAsset 的 content-type），因此浏览器侧完全无感。
 import panelJs from './assets/app.js.txt'
+import loginHtml from './assets/login.html'
+import loginJs from './assets/login.js.txt'
 
 /**
  * 内容安全策略（严格版，**无需 unsafe-inline**）。
@@ -79,6 +81,11 @@ export function panelAsset(path: string): { body: string; contentType: string } 
       return { body: panelCss, contentType: 'text/css; charset=utf-8' }
     case '/panel/app.js':
       return { body: panelJs, contentType: 'application/javascript; charset=utf-8' }
+    case '/login':
+    case '/login/':
+      return { body: loginHtml, contentType: 'text/html; charset=utf-8' }
+    case '/panel/login.js':
+      return { body: loginJs, contentType: 'application/javascript; charset=utf-8' }
     default:
       return undefined
   }

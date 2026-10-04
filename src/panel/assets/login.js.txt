@@ -1,0 +1,62 @@
+/*
+ * 独立登录页。
+ *
+ * ## 为什么要单独一页（而不是把密钥框放面板顶部）
+ *
+ * 面板顶部塞一个密钥输入框有两个问题：
+ * 1. **不好看**：管理界面常驻一个密码框，像是没做完；
+ * 2. **职责混淆**：面板是「已登录后的工作台」，登录是入口。
+ *
+ * 这里做成独立页，验证通过才跳转到面板；未登录访问面板会被重定向回来。
+ */
+'use strict'
+
+const $ = (id) => document.getElementById(id)
+
+function setMsg(text, ok) {
+  const el = $('login-msg')
+  el.textContent = text
+  el.className = 'login-msg ' + (ok ? 'ok' : 'err')
+}
+
+/** 验证密钥：调一个需要鉴权的轻量端点。 */
+async function verify(key) {
+  try {
+    const res = await fetch('/admin/pool?realm=cn', {
+      headers: { authorization: 'Bearer ' + key },
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+$('login-form').onsubmit = async (e) => {
+  e.preventDefault()
+  const key = $('apikey').value.trim()
+  if (key === '') { setMsg('请输入密钥', false); return }
+
+  const btn = $('login-btn')
+  btn.disabled = true
+  setMsg('验证中…', true)
+
+  const ok = await verify(key)
+  btn.disabled = false
+
+  if (!ok) {
+    setMsg('密钥无效，请检查后重试', false)
+    return
+  }
+  localStorage.setItem('wb_api_key', key)
+  setMsg('验证通过，正在进入…', true)
+  location.href = '/panel/'
+}
+
+// 已存密钥时先自动验一次（免去每次手输）
+const saved = localStorage.getItem('wb_api_key') || ''
+if (saved !== '') {
+  $('apikey').value = saved
+  void verify(saved).then((ok) => {
+    if (ok) { setMsg('已保存的密钥有效，正在进入…', true); location.href = '/panel/' }
+  })
+}

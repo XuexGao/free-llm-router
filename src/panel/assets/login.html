@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · WorkBuddy Serverless</title>
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body class="login-body">
+<div class="login-card">
+  <h1>WorkBuddy Serverless</h1>
+  <p class="hint">请输入 API 密钥以进入管理面板。</p>
+
+  <form id="login-form" autocomplete="off">
+    <input id="apikey" type="password" placeholder="API 密钥" autocomplete="current-password" autofocus>
+    <button type="submit" id="login-btn">登录</button>
+  </form>
+
+  <p id="login-msg" class="login-msg"></p>
+
+  <p class="hint login-foot">
+    密钥在部署时通过 <code>wrangler secret put API_KEY</code> 设置。<br>
+    它只存在本机浏览器（localStorage），每个请求以 <code>Authorization</code> 头发送。
+  </p>
+</div>
+
+<script src="/panel/login.js"></script>
+</body>
+</html>
