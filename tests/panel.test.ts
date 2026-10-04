@@ -423,8 +423,13 @@ test('⚠️ 面板不得使用可能缺字形的 Unicode 图标（手机上会�
 
   // 退出按钮必须是 SVG
   assert.ok(/id="logout"[\s\S]{0,220}<svg/.test(html), '退出按钮必须用内联 SVG')
-  // 主题按钮也必须是 SVG（三态图标）
-  assert.ok(/THEME_ICON\s*=\s*\{[\s\S]{0,400}<svg/.test(js), '主题图标必须是 SVG')
+  // 主题按钮也必须是 SVG（三态图标）。
+  // ⚠️ 这里改成**先取出 THEME_ICON 块再查**，而不是用固定距离的
+  // `[\s\S]{0,400}` —— 后者会因为块内注释变长而误报（注释也是维护的一部分，
+  // 不该反过来限制注释长度）。
+  const iconBlock = /const THEME_ICON = \{([\s\S]*?)\n\}/.exec(js)
+  assert.notEqual(iconBlock, null, '应有 THEME_ICON 定义')
+  assert.ok(iconBlock?.[1].includes('<svg'), '主题图标必须是 SVG')
 })
 
 test('⚠️ 所有表格必须包在 .table-wrap 里（否则手机上横向溢出）', () => {
@@ -489,4 +494,196 @@ test('⚠️ 页面标题必须用当前项目名（不能留历史名）', () =
   // 标题必须含当前项目名
   assert.ok(/<title>[^<]*free-llm-router[^<]*<\/title>/.test(index), '面板标题应含当前项目名')
   assert.ok(/<title>[^<]*free-llm-router[^<]*<\/title>/.test(login), '登录页标题应含当前项目名')
+})
+
+// ─────────────── 悬空 DOM 引用与渲染回归（2026-10-05 线上实测后新增） ───────────────
+//
+// 这一组测试全部来自**真实的线上事故**，每一条都对应一个曾经存在、
+// 且**不会自己报错**的缺陷（静默失效比崩溃更难发现）。
+
+/**
+ * 剥掉 JS 注释（块注释 + 整行行注释）。
+ *
+ * ⚠️ 这些静态检查的注释里会**引用违规写法本身**当反例
+ *（例如 loadAccounts 的说明里写着 `$('accounts')`），
+ * 不剥注释就会把自己的说明误判成违规。
+ */
+function stripJsComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/** 剥掉 CSS 注释（注释里可能出现 `}`，会让 `[^}]*` 提前截断）。 */
+function stripCssComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '')
+}
+
+test('⚠️ app.js 里 $(id) 引用的每个 id 都必须真实存在于面板 HTML', () => {
+  // ## 这是什么级别的缺陷
+  //
+  // 线上事故（P0）：登录成功后**整个面板空白**，且没有任何报错。
+  // 根因是 bootstrap() 里一行 `$('setup-hint').hidden = true` ——
+  // `#setup-hint` 已在「独立登录页」那次改动中从 index.html 删掉，
+  // 但引用留了下来。`$()` 返回 null，赋值抛 TypeError，而它恰好在
+  // setAuth() / switchView() **之前**，于是整个启动流程中断。
+  //
+  // 同一批还有一个 `const box = $('accounts'); clear(box)`：账号池视图早已
+  // 并入供应商视图，`#accounts` 不存在 —— 它被同视图的另一个加载器掩盖成
+  // **静默失效**，函数后续逻辑一行都没执行，而 7 个调用点都在白调。
+  //
+  // 结论：`$(...)` 的返回值**既可能为 null，又不会在编译期被发现**。
+  // 唯一能拦住它的就是这条静态不变式。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+
+  // ⚠️ 必须先剥注释：本文件的注释里会**提到** `$('accounts')` 作为反例
+  //（见 loadAccounts 的说明），不剥会把说明文字误判成真实引用。
+  const jsCode = stripJsComments(js)
+
+  const htmlIds = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]))
+  assert.ok(htmlIds.size > 10, `应能从 HTML 解析出 id（实际 ${htmlIds.size} 个）`)
+
+  // 只校验**字面量**形式 `$('xxx')`；动态形式（如拼接）天然无法静态校验。
+  const refs = [...jsCode.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1])
+  assert.ok(refs.length > 20, `应能解析出若干 id 引用（实际 ${refs.length} 个）`)
+
+  const missing = [...new Set(refs)].filter((id) => !htmlIds.has(id))
+  assert.deepEqual(
+    missing,
+    [],
+    `以下 id 在面板 HTML 里不存在，$() 会返回 null（后续操作抛 TypeError → 面板可能整片空白）：${missing.join(', ')}`,
+  )
+
+  // 显式钉住这次事故本身，让回归时一眼能看懂是哪一行
+  assert.ok(!jsCode.includes('setup-hint'), '不得再引用已删除的 #setup-hint（曾导致登录后面板全空）')
+})
+
+test('⚠️ 主题图标 SVG 必须自带 xmlns（XML 解析不会隐式补命名空间）', () => {
+  // 线上实测（P1）：顶栏主题按钮是个**空框**，图标完全不显示。
+  //
+  // 根因：图标串用 `DOMParser(..., 'image/svg+xml')` 解析，而 **XML 解析
+  // 不像 HTML 解析那样隐式把 `<svg>` 放进 SVG 命名空间**。缺 `xmlns` 时
+  // 根元素只是 `namespaceURI: null` 的普通 Element，浏览器按 **0×0** 渲染。
+  // 实测对照：
+  //   无 xmlns → { ctor: 'Element',     ns: null,                           0×0 }
+  //   有 xmlns → { ctor: 'SVGSVGElement', ns: 'http://www.w3.org/2000/svg', 16×16 }
+  //
+  // 连带后果：图标 0×0 后按钮只剩 padding，缩成 **20×10px** ——
+  // 手机上基本点不中（远低于 44×44 的触控下限）。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const block = /const THEME_ICON = \{([\s\S]*?)\n\}/.exec(js)
+  assert.notEqual(block, null, '应有 THEME_ICON 定义')
+
+  const svgs = [...(block?.[1] ?? '').matchAll(/'<svg[^']*'/g)].map((m) => m[0])
+  assert.ok(svgs.length >= 3, `三个主题态都应有图标，实际解析到 ${svgs.length} 个`)
+  for (const s of svgs) {
+    assert.ok(
+      /xmlns="http:\/\/www\.w3\.org\/2000\/svg"/.test(s),
+      `主题图标缺 xmlns（会被渲染成 0×0）：${s.slice(0, 70)}`,
+    )
+  }
+
+  // setSvg 还必须有兜底注入，免得以后新增图标时重蹈覆辙
+  assert.ok(/function setSvg\(/.test(js), '应有 setSvg')
+  const setSvg = /function setSvg\([\s\S]*?\n\}/.exec(js)?.[0] ?? ''
+  assert.ok(/xmlns/.test(setSvg), 'setSvg 应对缺失的 xmlns 做兜底注入')
+})
+
+test('⚠️ 顶栏图标按钮的可点区域必须大于图标本身', () => {
+  // 图标 0×0 那次的连带伤害：按钮只剩 padding → 20×10px。
+  // 可点区域不该由图标尺寸决定。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(
+    /header\s+\.icon-btn\s*\{[^}]*min-(width|height)/.test(css),
+    '顶栏图标按钮必须设最小尺寸（否则图标一变，触控目标就跟着缩）',
+  )
+})
+
+test('⚠️ .table-wrap 内的表格必须按内容取宽（否则横向滚动永不触发）', () => {
+  // 实测（P1）：`.table-wrap { overflow-x: auto }` 是**空转的**。
+  // 全局 `table { width: 100% }` 让表格永远塞满容器、永不溢出，
+  // 于是 overflow-x 形同虚设 —— 表格不是滚动，而是**被压缩**：
+  // 五列明细表的表头被挤成竖排单字（「类/型」），`codearts` 断成 `codea/rts`。
+  //
+  // 实测对照：原样式下 表格宽 309px == 容器 309px（不滚动）；
+  //          width: max-content 下 表格宽 397px > 容器 340px（真正可滚动）。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const cssCode = stripCssComments(css)
+  const rule = /\.table-wrap\s*>\s*table\s*\{([^}]*)\}/.exec(cssCode)
+  assert.notEqual(rule, null, '应有 .table-wrap > table 规则')
+  assert.ok(/width:\s*max-content/.test(rule?.[1] ?? ''), '必须 width: max-content（否则永远不会溢出）')
+  assert.ok(/min-width:\s*100%/.test(rule?.[1] ?? ''), '必须 min-width: 100%（保证窄表仍占满容器）')
+
+  // ⚠️ 光有上面两条还不够，还要允许网格项收缩。
+  //
+  // `main` 是 `display: grid`，网格项默认 `min-width: auto`（不小于内容的最小宽度）。
+  // 表格一旦按 max-content 取宽，这个最小值就跟着变大、把网格轨道撑开 ——
+  // 结果是**整个页面横向溢出**。实测（390px 视口，用量视图）：
+  //   不加 min-width: 0 → docScrollW 422 > 视口 375，.table-wrap 自己被撑到
+  //                       376px，横向滚动依旧不触发（修了个寂寞，还引入了新问题）；
+  //   加上之后          → section 351px、wrap 317px、表格 335px，页面溢出归零。
+  assert.ok(
+    /main\s*>\s*\*\s*\{[^}]*min-width:\s*0/.test(cssCode),
+    '必须给网格项 min-width: 0，否则宽表格会把整个页面顶宽',
+  )
+})
+
+test('⚠️ 计数块的「单列」断点必须 ≤360px（420px 会覆盖几乎所有在用手机）', () => {
+  // 实测（P2）：单列规则原先挂在 420px 上，注释写「极窄屏（老机型/分屏）」，
+  // 但 420 实际覆盖 375/390/393/402/412 —— 几乎所有在用手机。
+  // 后果：5 个计数块纵排占 344px，首个供应商卡片被推到 578px
+  //（844 高的屏上已过半；667 高的机型直接落到首屏之外）。
+  // 逐宽度实测每行几个：375→1、390→1、412→1，仅 430 及以上为 2 列。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const m = /@media\s*\(max-width:\s*(\d+)px\)\s*\{[^@]*?\.count\s*\{[^}]*flex:\s*1\s+1\s+100%/.exec(css)
+  assert.notEqual(m, null, '应存在把计数块收成一列的断点')
+  assert.ok(Number(m?.[1]) <= 360, `单列断点应在 ≤360px，实际 ${m?.[1]}px（会误伤 375/390/412 的机型）`)
+})
+
+test('⚠️ 柱状图时间标签必须放得下（"10-03 20:00" 折行会让每行高度翻倍）', () => {
+  // 实测：该文案在 10px 字号下的自然宽度是 **55px**，
+  // 而原样式在 ≤720px 给 52px、≤420px 给 44px —— 都会折成两行
+  //（行高 15.5px → 实际高度 31px，柱状图整体观感变差）。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const m = /@media\s*\(max-width:\s*720px\)[\s\S]*?\.bar-label\s*\{[^}]*width:\s*(\d+)px/.exec(css)
+  assert.notEqual(m, null, '手机断点里应有 .bar-label 宽度')
+  assert.ok(Number(m?.[1]) >= 56, `.bar-label 应 ≥56px 才容得下 "10-03 20:00"（自然宽 55px），实际 ${m?.[1]}px`)
+})
+
+test('⚠️ 积分包必须显式处理 skipped（否则渲染成「可用 undefined」）', () => {
+  // 线上实测（P2）：opencode 匿名通道那行显示 **「可用 undefined」**。
+  // 后端其实是对的 —— 它对该账号返回
+  // `{skipped:true, reason:'该供应商不支持查余额'}`（既无 error 也无 total），
+  // 是前端只判 `a.error` 就落到 else 分支，把 undefined 拼进了字符串。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(/a\.skipped/.test(js), '应处理 skipped（后端用它标记「该供应商不支持查余额」）')
+  // 同时要有 total 非数字的兜底（与 loadProviderCredits 同口径）
+  assert.ok(/typeof a\.total !== 'number'/.test(js), '应对非数字 total 兜底，不让 undefined 流到界面')
+})
+
+test('⚠️ 错误文案不得硬截断（会切掉「请重新登录」这类可行动的尾巴）', () => {
+  // 线上实测（P2）：积分包页的失败原因被 `slice(0, 60)` 切成了
+  // 「Unauthorized: Please make sure you're」—— 恰好在最需要的信息前断掉，
+  // 用户看不出该重新登录、还是等一会、还是换账号。
+  //
+  // ⚠️ 断言前必须**剥掉注释** —— 代码注释里正拿 `a.error.slice(0, 60)`
+  // 当反例讲解（说明「为什么不再这么写」），不剥会把自己的说明误判成违规。
+  const jsCode = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(!/a\.error\.slice\(/.test(jsCode), '错误文案不得用 slice 硬截断')
+  assert.ok(jsCode.includes('err-msg'), '长错误应走 .err-msg 块级样式换行显示')
+})
+
+test('⚠️ 空的输出框不该画出空边框', () => {
+  // 实测（P3）：#login-result / #import-result 在无内容时仍渲染成
+  // 22px 高的带边框空盒子，看起来像「有东西没加载出来」。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(/\.out:empty\s*\{[^}]*display:\s*none/.test(css), '空的 .out 应不显示')
+})
+
+test('⚠️ 登录卡片必须留页面内边距（否则手机上顶到屏幕边缘、圆角被切）', () => {
+  // ⚠️ 必须先剥 CSS 注释：注释里会写出 `* { box-sizing: border-box }`
+  // 这类示例规则，其中的 `}` 会让 `[^}]*` 提前截断，导致断言假失败。
+  const cssCode = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const rule = /\.login-body\s*\{([^}]*)\}/.exec(cssCode)
+  assert.notEqual(rule, null, '应有 .login-body 规则')
+  assert.ok(/padding:/.test(rule?.[1] ?? ''), '登录页容器必须有内边距')
 })

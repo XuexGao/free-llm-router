@@ -111,7 +111,12 @@ function buildTable(cols, rows, numericFrom) {
     const tr = document.createElement('tr')
     r.forEach((cell, i) => {
       const td = document.createElement('td')
-      td.textContent = String(cell)
+      // ⚠️ 单元格可以是 `[显示文本, 悬浮全文]` 两元组。
+      // 用途：表格里不得不截断的长文案（如失败原因），截断后仍能通过
+      // `title` 悬浮看到全文 —— 否则用户只看到半句话，无从判断该怎么办。
+      const text = Array.isArray(cell) ? cell[0] : cell
+      td.textContent = String(text)
+      if (Array.isArray(cell) && cell[1]) td.title = String(cell[1])
       if (numericFrom !== undefined && i >= numericFrom) td.className = 'num'
       tr.appendChild(td)
     })
@@ -143,9 +148,11 @@ function wrapTable(table) {
 
 const VIEW_LOADERS = {
   // ⚠️ 账号池已**并入**供应商视图（用户要求合并）：账号在各自的供应商弹窗里管理，
-  // 顶层不再单独列一遍。这里保留 loadAccounts 是为了给任务中心的下拉填账号。
+  // 顶层不再单独列一遍。
   providers: () => loadProviders(),
-  tasks: () => { loadAccounts(); loadTaskUids() },
+  // loadAccounts 现在只负责刷新「任务进度」的账号下拉（内部委托 loadTaskUids），
+  // 故这里**只调它一个** —— 两个都调会对同一份账号列表白打两遍上游。
+  tasks: () => loadAccounts(),
   usage: () => loadUsage(),
   packages: () => { /* 手动触发（实时查上游，有成本） */ },
   models: () => { /* 手动触发 */ },
@@ -224,12 +231,16 @@ async function showCoolingDetail() {
   const rows = hot.map((a) => {
     const u = Math.max(a.until || 0, a.breakerUntil || 0, a.degradeUntil || 0)
     const kind = a.until === u ? '账号冷却' : a.breakerUntil === u ? '熔断' : '降权'
+    const reason = a.reason || ''
+    // ⚠️ 原因列在密集表格里仍截断，但**用两元组带上全文** ——
+    // 表格内截断是为了不让一列把整张表撑得极宽，而 `title` 保证信息不丢。
+    // 表格本身现在可横向滚动（见 style.css 的 .table-wrap > table 规则）。
     return [
       a.provider || '(默认)',
       shortUid(a.uid),
       `${humanWait(u - now)}（${new Date(u).toLocaleTimeString()}）`,
       kind,
-      (a.reason || '').slice(0, 60),
+      reason.length > 60 ? [reason.slice(0, 60) + '…', reason] : reason,
     ]
   })
   const nodes = []
@@ -264,12 +275,14 @@ async function showModelThrottleDetail() {
       : Object.entries(raw || {}).map(([model, info]) => ({ model, ...(info || {}) }))
     for (const it of items) {
       const u = typeof it.until === 'number' ? it.until : 0
+      const reason = it.reason ? String(it.reason) : ''
       rows.push([
         a.provider || '(默认)',
         shortUid(a.uid),
         it.model,
         u > now ? humanWait(u - now) : '已恢复',
-        it.reason ? String(it.reason).slice(0, 50) : '',
+        // 同「冷却中」：表格内截断，但用两元组带上全文供悬浮查看
+        reason.length > 50 ? [reason.slice(0, 50) + '…', reason] : reason,
       ])
     }
   }
@@ -347,83 +360,28 @@ async function fetchPackages() {
   return accounts
 }
 
+/**
+ * 刷新任务中心的「账号」下拉（任务进度用）。
+ *
+ * ⚠️ 本函数**曾经**还会往 `#accounts` 里渲染账号卡片，但那个容器早已随
+ * 「账号池并入供应商视图」一起删掉了，只剩下面两行：
+ *
+ *     const box = $('accounts')   // → null（index.html 里没有这个 id）
+ *     clear(box)                  // → 抛 TypeError
+ *
+ * 这与 P0 那次「登录后空白」是**同一类缺陷**：删了元素没删引用。
+ * 区别是这里被同视图的 `loadTaskUids()` 掩盖成了**静默失效** ——
+ * 任务中心看着正常（下拉由 loadTaskUids 填），但本函数的后续逻辑一行都没执行，
+ * 而导入 / 登录 / 删除后共 7 个调用点都在白调它。
+ *
+ * 现在它只做仍然需要的唯一一件事：刷新下拉。真正的填充逻辑复用
+ * `loadTaskUids()`（它更严格：只列可用的 buddy 账号，且有明确的空状态文案）。
+ *
+ * 回归测试：panel.test.ts 里有一条不变式 —— `$('literal')` 引用的 id
+ * 必须真实存在于 HTML，本行这类悬空引用会被直接拦下。
+ */
 async function loadAccounts() {
-  const res = { ok: true, body: { accounts: await fetchAccounts() } }
-  const box = $('accounts')
-  clear(box)
-  const select = $('task-uid')
-  clear(select)
-
-  if (!res.ok) {
-    const p = document.createElement('p')
-    p.className = 'hint'
-    p.textContent = '加载账号失败（401 = 密钥无效）'
-    box.appendChild(p)
-    return
-  }
-
-  const accounts = (res.body && res.body.accounts) || []
-  if (accounts.length === 0) {
-    const p = document.createElement('p')
-    p.className = 'hint'
-    p.textContent = '还没有账号。请在下方「导入凭据」或「添加账号」。'
-    box.appendChild(p)
-    return
-  }
-
-  for (const a of accounts) {
-    const card = document.createElement('div')
-    card.className = 'card'
-
-    const left = document.createElement('div')
-    left.className = 'grow'
-    const name = document.createElement('strong')
-    name.textContent = a.nickname || '(无昵称)'
-    const uid = document.createElement('div')
-    uid.className = 'uid'
-    uid.textContent = a.uid
-    left.appendChild(name); left.appendChild(uid)
-    card.appendChild(left)
-
-    const tag = document.createElement('span')
-    const cooling = a.until && a.until > Date.now()
-    if (a.disabled) { tag.className = 'tag err'; tag.textContent = '已禁用' + (a.reason ? '：' + a.reason : '') }
-    else if (cooling) {
-      tag.className = 'tag warn'
-      tag.textContent = '冷却中（约 ' + Math.max(1, Math.round((a.until - Date.now()) / 60000)) + ' 分钟）'
-    } else { tag.className = 'tag ok'; tag.textContent = '正常' }
-    card.appendChild(tag)
-
-    const metrics = document.createElement('span')
-    metrics.className = 'metrics'
-    const bits = ['成功 ' + a.successCount, '错误 ' + a.errTotal]
-    if (a.lastCheckinDay) bits.push('签到 ' + a.lastCheckinDay)
-    if (a.modelCooldowns && a.modelCooldowns.length) bits.push('模型冷却 ' + a.modelCooldowns.join(','))
-    metrics.textContent = bits.join(' · ')
-    card.appendChild(metrics)
-
-    const del = document.createElement('button')
-    del.className = 'danger'
-    del.textContent = '删除'
-    del.onclick = async () => {
-      if (!confirm('删除账号 ' + a.uid + '（含凭据），不可恢复。确认？')) return
-      const r = await api('/admin/accounts/remove', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ uid: a.uid, realm: 'cn', confirm: true }),
-      })
-      if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
-      loadAccounts(); loadPool()
-    }
-    card.appendChild(del)
-
-    box.appendChild(card)
-
-    const opt = document.createElement('option')
-    opt.value = a.uid
-    opt.textContent = (a.nickname || a.uid.slice(0, 12)) + (a.disabled ? '（已禁用）' : '')
-    select.appendChild(opt)
-  }
+  await loadTaskUids()
 }
 
 // ─────────────────────────── 导入 / 登录 ───────────────────────────
@@ -541,19 +499,12 @@ function renderLoginPrompt(el, body, providerId) {
 
     const box = document.createElement('div')
     box.className = 'qr-box'
-    // ⚠️ 用 `DOMParser` 解析 SVG，**不用 innerHTML**。
-    // ① `DOMParser` 解析出的文档**从不执行脚本**，即便上游返回的 SVG
-    //    被污染也只会得到一个死节点；
-    // ② 本仓库有既有不变量测试**禁止任何 `innerHTML` 赋值**，不为这处破例。
-    try {
-      const doc = new DOMParser().parseFromString(qrSvg, 'image/svg+xml')
-      const svg = doc.documentElement
-      if (svg && svg.nodeName.toLowerCase() === 'svg') {
-        box.appendChild(document.importNode(svg, true))
-      }
-    } catch {
-      // 解析失败：不显示二维码，靠下面的链接兜底
-    }
+    // ⚠️ 统一走 setSvg()：它用 `DOMParser` 解析（**不用 innerHTML**），
+    // 且对缺失的 `xmlns` 做了兜底注入。
+    // 本项目的二维码 SVG 由 `raccoon-qr.ts` 生成、自带 xmlns，本来就能显示；
+    // 但这里不再手写一份解析逻辑 —— 同一段代码出现了两遍就容易只修一处
+    //（主题图标那次就是这样漏掉的）。
+    setSvg(box, qrSvg)
     el.appendChild(box)
 
     const status = document.createElement('div')
@@ -837,8 +788,28 @@ async function loadPackages() {
     left.appendChild(name); left.appendChild(uid)
     card.appendChild(left)
 
-    if (a.error) {
-      const t = document.createElement('span'); t.className = 'tag err'; t.textContent = a.error.slice(0, 60)
+    // ⚠️ 三种状态都要显式处理，**不能只判 error**。
+    //
+    // 线上实测（P2）：后端对「该供应商不支持查余额」（如 opencode 匿名通道）
+    // 回的是 `{skipped:true, reason:'该供应商不支持查余额'}` —— 既没有 error
+    // 也没有 total。只判 `a.error` 会落到 else 分支，把 total 拼进字符串，
+    // 页面上显示成 **「可用 undefined」**（既没信息量，还像是坏了）。
+    if (a.skipped) {
+      const t = document.createElement('span'); t.className = 'tag'
+      t.textContent = a.reason || '未查询余额'
+      card.appendChild(t)
+    } else if (a.error) {
+      // ⚠️ 错误文案**整段显示，不再截断**。
+      // 原先 `a.error.slice(0, 60)` 会把可行动的尾巴切掉 ——
+      // 实测线上剩「Unauthorized: Please make sure you're」这种半句话，
+      // 用户看不出该「重新登录」还是「等一会」。改用 .err-msg 块级样式换行显示。
+      const t = document.createElement('div'); t.className = 'err-msg'
+      t.textContent = a.error
+      t.title = a.error
+      card.appendChild(t)
+    } else if (typeof a.total !== 'number') {
+      // 与 `loadProviderCredits` 同口径的兜底：绝不让 undefined/null 流到界面上
+      const t = document.createElement('span'); t.className = 'tag'; t.textContent = '余额未知'
       card.appendChild(t)
     } else {
       const t = document.createElement('span'); t.className = 'tag ok'
@@ -1343,12 +1314,22 @@ async function loadWaf() {
  * 内联 SVG 不依赖系统字体，尺寸完全可控。
  */
 const THEME_ICON = {
+  // ⚠️ 每条字符串都必须带 `xmlns`！
+  //
+  // 根因（线上实测，P1）：这些串是用 `image/svg+xml` 交给 DOMParser 解析的，
+  // 而 **XML 解析不像 HTML 解析那样隐式补上 SVG 命名空间** —— 缺 `xmlns` 时
+  // 根元素只是一个 `namespaceURI: null` 的普通 Element，浏览器按 **0×0** 渲染。
+  // 于是主题按钮的图标完全不显示，按钮因只剩 padding 而缩成 20×10px
+  //（既看不见、也很难点到）。实测对照：
+  //   无 xmlns → { ctor: 'Element',     ns: null,                           0×0 }
+  //   有 xmlns → { ctor: 'SVGSVGElement', ns: 'http://www.w3.org/2000/svg', 16×16 }
+  // setSvg() 另有兜底注入，但图标自带 xmlns 才是最直白的写法。
   // 自动：半明半暗的圆
-  auto: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>',
+  auto: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>',
   // 浅色：太阳
-  light: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>',
+  light: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>',
   // 深色：月亮
-  dark: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
+  dark: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
 }
 
 /**
@@ -1371,9 +1352,16 @@ const THEME_ICON = {
 function setSvg(el, svg) {
   clear(el)
   try {
-    const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
+    // ⚠️ 兜底注入 `xmlns`：`image/svg+xml` 是 **XML** 解析，不会像 HTML 解析
+    // 那样隐式把 `<svg>` 放进 SVG 命名空间。缺 xmlns 时根元素是普通 Element，
+    // 浏览器按 **0×0** 渲染 —— 图标看起来「莫名其妙消失了」，且不报任何错。
+    //（THEME_ICON 的三条串已各自带 xmlns，这里是防止以后新增图标时重蹈覆辙。）
+    const withNs = /<svg[^>]*\sxmlns\s*=/.test(svg)
+      ? svg
+      : svg.replace(/<svg/, '<svg xmlns="http://www.w3.org/2000/svg"')
+    const doc = new DOMParser().parseFromString(withNs, 'image/svg+xml')
     const node = doc.documentElement
-    if (node && node.nodeName.toLowerCase() === 'svg') {
+    if (node && node.nodeName.toLowerCase() === 'svg' && node.namespaceURI) {
       el.appendChild(document.importNode(node, true))
     }
   } catch {
@@ -1462,7 +1450,17 @@ async function bootstrap() {
     return
   }
 
-  $('setup-hint').hidden = true
+  // ⚠️ 这里**不要**再去操作顶部提示元素。
+  //
+  // 历史（一次 P0 级事故）：这里曾有一行 `$('setup-hint').hidden = true`。
+  // 后来「独立登录页」把 `#setup-hint` 从 index.html 删掉了，这行却留着 ——
+  // `$()` 返回 null，赋值抛 `TypeError: Cannot set properties of null`。
+  // 它恰好位于 setAuth() 与 switchView() **之前**，于是 bootstrap() 整个中断：
+  // 登录明明成功，面板却只剩顶栏与导航，正文一片空白、且**没有任何报错**。
+  //
+  // 教训：bootstrap 里引用 DOM id 时，删元素必须同步删引用；
+  // 这类悬空引用不会自己暴露（不报错只是不生效），只能靠测试锁住（见 panel.test.ts）。
+  //
   // ⚠️ 这里只为**验证密钥有效**，查 cn 即可（密钥对所有 realm 通用）；
   // 真正的数据加载在 switchView 里，那里会查两个 realm。
   const res = await api('/admin/pool?realm=cn')

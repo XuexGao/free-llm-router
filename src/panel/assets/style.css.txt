@@ -67,6 +67,14 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   padding: 10px; font-family: ui-monospace, monospace; font-size: 12px;
   white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto;
 }
+/*
+ * ⚠️ 空的输出框不该画出一个空框。
+ *
+ * 实测（P3）：`#login-result` / `#import-result` 在无内容时仍渲染成
+ * 22px 高的带边框空盒子 —— 看起来像「有个东西没加载出来」。
+ * 这些容器是**先占位、后填内容**的，所以空的时候直接不显示。
+ */
+.out:empty { display: none; }
 
 .notice {
   background: #1a2432; border: 1px solid #2a3d57; border-radius: 10px; padding: 14px 16px;
@@ -124,6 +132,23 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .tag.warn { color: var(--warn); border-color: #5b4a1e; }
 .tag.err { color: var(--err); border-color: #5b2424; }
 .metrics { color: var(--dim); font-size: 11px; font-family: ui-monospace, monospace; }
+
+/*
+ * ⚠️ 整段错误文案（积分包页）。
+ *
+ * 用块级而不是 `.tag`（999px 药丸）：错误原因往往是一整句话，
+ * 塞进药丸形标签里既难看又会把卡片挤变形。
+ * 这里显式允许换行 —— 原先前端把错误 `slice(0, 60)` 硬截断，
+ * 用户只看到「Unauthorized: Please make sure you're」这种半句话，
+ * 完全不知道该重新登录还是等一会。
+ */
+.err-msg {
+  flex: 1 1 100%; font-size: 11px; line-height: 1.5;
+  color: var(--err); background: rgba(239, 95, 95, 0.08);
+  border: 1px solid #5b2424; border-radius: 8px; padding: 6px 9px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+html[data-theme='light'] .err-msg { background: #fdecec; border-color: #f0a0a0; }
 
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
@@ -244,6 +269,16 @@ html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
   display: inline-flex; align-items: center; justify-content: center;
 }
 
+/*
+ * ⚠️ 顶栏图标按钮的**可点区域必须大于图标本身**。
+ *
+ * 实测（P1）：主题按钮曾因图标 SVG 渲染成 0×0 而缩到 **20×10px** ——
+ * 20×10 在手机上基本点不中（远低于 44×44 的触控下限）。
+ * 图标大小不该决定可点区域，故这里给按钮一个独立的最小尺寸，
+ * 图标仍居中保持 16px。用 min-* 而不是固定 px，桌面端不受影响。
+ */
+header .icon-btn { min-width: 40px; min-height: 40px; }
+
 /* 供应商卡片：积分放右上角 */
 .prov-card { position: relative; }
 .prov-card .prov-credits {
@@ -288,6 +323,10 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
 .login-body {
   display: flex; align-items: center; justify-content: center;
   min-height: 100vh; margin: 0;
+  /* ⚠️ 必须留页面内边距：否则 `.login-card { width: min(400px, 100%) }`
+   * 在 390px 宽的手机上会**顶到屏幕左右边缘**，圆角被切掉、看着像没做完。
+   * 全局 `* { box-sizing: border-box }` 让 min-height 含 padding，不会溢出。 */
+  padding: 16px;
 }
 .login-card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
@@ -358,26 +397,60 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
 /* 表格：允许横向滚动而不是撑破页面（手机上的标准做法） */
 .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { table-layout: auto; }
-/* 表格里不换行的小单元格（数字列）保持紧凑，但整体可滚动 */
+/*
+ * ⚠️ 表格必须按内容取宽，否则 .table-wrap 的横向滚动**永远不会触发**。
+ *
+ * 根因（线上实测，P1）：全局的 `table { width: 100% }` 让表格永远塞满容器、
+ * 永不溢出，于是 `overflow-x: auto` 形同虚设 —— 表格不是「滚动」，而是
+ * **被压缩**。代价在手机上很直观：五列明细表（冷却中 / 模型限流）的表头被
+ * 挤成竖排单字（「类/型」「原/因」），供应商名 `codearts` 断成 `codea/rts`。
+ * 实测对照：原样式下 表格宽 309px == 容器 309px（不滚动）；
+ *          `width: max-content` 下 表格宽 397px > 容器 340px（真正可滚动）。
+ * `min-width: 100%` 保证窄表（如「配置」两列）仍占满容器，不会缩成一小块。
+ */
+.table-wrap > table { width: max-content; min-width: 100%; }
+
+/*
+ * ⚠️ 必须允许网格项收缩，否则上面那条规则反而会把**整个页面**顶宽。
+ *
+ * `main` 是 `display: grid`，而网格项默认 `min-width: auto` —— 也就是
+ * 「不小于内容的最小宽度」。表格一旦按 max-content 取宽，这个最小值就跟着
+ * 变大，网格轨道被撑开、页面横向溢出。
+ *
+ * 实测（390px 视口，用量视图）：加 `min-width: 0` 前
+ *   docScrollW 422 > 视口 375（溢出 47px），.table-wrap 自己被撑到 376px、
+ *   横向滚动依旧不触发；加上之后 section 回到 351px、wrap 317px、
+ *   表格 335px → **真正在容器内滚动**，页面溢出归零。
+ *
+ * 这与 `.count { min-width: 0 }` 是同一类陷阱（flex/grid 项默认不收缩）。
+ * 用 `main > *` 覆盖所有网格项（含 WAF 横幅），将来新增区块也不会再踩。
+ */
+main > * { min-width: 0; }
 
 @media (max-width: 720px) {
   /* ── 整体留白收紧，把宽度让给内容 ── */
   main { padding: 12px; gap: 12px; }
 
   /* ── 顶栏：标题与按钮在小屏上容易挤成两行 ── */
-  header { flex-wrap: wrap; gap: 8px; }
+  /* 纵向 padding 收到 8px，给 40px 的图标按钮留出空间（否则顶栏会过高） */
+  header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
 
   /* ── 计数卡片：手机上 2 列，比「一列太长、三列太窄」都好读 ── */
   .counts { gap: 8px; }
   .count {
-    flex: 1 1 calc(50% - 4px);
+    /* ⚠️ `flex-grow: 0`（不是 1）：计数块个数是奇数时（供应商页 5 个），
+     * grow 会让最后一块**被拉伸成整行宽**，看起来像被选中的高亮项。
+     * 固定成半宽后每块尺寸一致，奇数个只是末尾留一个空位。 */
+    flex: 0 1 calc(50% - 4px);
     min-width: 0;          /* ⚠️ 关键：不清掉 min-width 时 flex 项不会收缩 */
     padding: 7px 10px;
   }
   .count b { font-size: 16px; }
 
-  /* ── 柱状图：标签与数值改窄，把空间留给进度条 ── */
-  .bar-label { width: 52px; font-size: 10px; }
+  /* ── 柱状图：标签与数值改窄，把空间留给进度条 ──
+   * ⚠️ 58px 是量出来的：`10-03 20:00` 在 10px 字号下的自然宽度是 **55px**，
+   * 原先的 52px / 44px 都会让它折成两行，柱状图每行高度从 16px 变成 31px。 */
+  .bar-label { width: 58px; font-size: 10px; }
   .bar-val { width: 46px; font-size: 10px; }
 
   /* ── 模型开关行：名字可换行，不再固定 150px ── */
@@ -400,9 +473,22 @@ table { table-layout: auto; }
   .nav-item { white-space: nowrap; flex: 0 0 auto; }
 }
 
-/* 极窄屏（老机型 / 分屏）再收一档 */
+/* ── 二维码：小屏上略缩，避免把弹窗撑到需要滚动 ── */
 @media (max-width: 420px) {
-  .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
-  .bar-label { width: 44px; }
   .qr-box svg { width: 148px; height: 148px; }
+}
+
+/*
+ * 极窄屏（≤360：老机型 / 分屏）再收一档。
+ *
+ * ⚠️ 「计数块收成一列」原先挂在 **420px** 上，注释写的是「极窄屏（老机型/分屏）」，
+ * 但 420 实际覆盖了 375/390/393/402/412 —— 也就是**几乎所有在用手机**。
+ * 线上实测每行几个：375→1、390→1、412→1，只有 430 及以上才是 2 列。
+ * 后果是 5 个计数块纵排占掉 344px，首个供应商卡片被推到 **578px**
+ *（844 高的屏上已过半；667 高的机型直接落到首屏之外），而卡片才是本页主要内容。
+ * 故把单列规则降到 360 —— 常见手机走 720 断点的两列布局。
+ */
+@media (max-width: 360px) {
+  .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
+  .bar-label { width: 52px; }  /* 此时折成两行可以接受 */
 }
