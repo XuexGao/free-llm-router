@@ -553,7 +553,7 @@ TaskRunner DO
 |---|---|---|---|
 | `buddy`（国内版，**默认**） | ✓ | ✓ | ✓ |
 | `workbuddy`（国际版） | ✓ | ✓ | ✕ |
-| `cline` | ✕ | ✓ | ✕ |
+| `cline` | ✓ | ✓ | ✕ |
 | `minimax` | ✕ | ✓ | ✓ |
 | `codearts` | ✕ | ✓ | ✓ |
 | `lobsterai` | ✕ | ✓ | ✓ |
@@ -570,7 +570,8 @@ TaskRunner DO
 - **zcode**：签到需 headful Chromium 过阿里云 captcha（推理不受影响）；
 - **raccoon**：无签到端点（每日额度由服务端自动发放）；
 - **workbuddy（国际版）**：上游**本就没有**每日签到接口（积分在 CodeBuddy 侧领）；
-- **cline / minimax / loomy / raccoon**：协议支持（或函数已实现）但本服务未接线发起流程。
+- **minimax / loomy**：协议支持（或函数已实现）但本服务未接线发起流程。
+  ⚠️ `cline` 已接线（WorkOS 设备码，**用户码**式）；`raccoon` 亦已接线（微信扫码）。
 
 ### 🔴 第 8 步实测发现的 5 个真实缺陷
 
@@ -627,7 +628,8 @@ TaskRunner DO
 | **会话粘性** | 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） | ❌ 未实现 |
 | **图片入站** | Free 计划 10ms CPU 下 base64 图片解码可能超限 | ❌ 未实现 |
 | **连登兑换 / 抽奖 / 旅行** | `travel.ts` 已实现但**未接入计划表**（当前 `growth` 计划只覆盖 11 个任务动作） | ❌ 未接入 |
-| **cline/minimax/loomy/raccoon 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
+| **minimax/loomy 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
+| **cline 设备码登录** | ✅ 已接线（`/admin/providers/login/{start,poll}`，WorkOS 三步 + 用户码式 UI）。⚠️ 会话内的 `intervalMs`/`nextPollAt`/`deadline` **必须持久化在登录会话载荷里** —— Workers 无跨请求内存，放模块变量会让 `slow_down` 的累积退避**静默失效** | 已实现，见 `src/providers/cline.ts` 的「设备码登录」小节 |
 
 ### 项目结构（最终）
 

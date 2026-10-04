@@ -33,6 +33,30 @@ import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstrea
  * 又不会让一个废弃会话长期占着存储。
  */
 const RACCOON_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+/**
+ * cline 设备码登录的节流下限（毫秒）。
+ *
+ * ⚠️ 与 `src/providers/cline.ts` 的 `CLINE_DEVICE_MIN_INTERVAL_MS` 同值。
+ * 这里单独写一份是为了避免顶层静态 import 整个 cline 模块（它是**懒加载**的：
+ * 该模块带着余额 / 目录 / 续期等一大坨代码，只有真要登录时才需要）。
+ * 若两处取值分叉，`intervalMs` 缺失时的兜底会与上游要求不一致。
+ */
+const CLINE_DEVICE_MIN_INTERVAL_MS = 1_000
+
+/**
+ * cline 登录会话在设备码到期后**多留的宽限**（毫秒）。
+ *
+ * ⚠️ **不能省**：`readLoginSession` 在 `expires_at <= now` 时会直接删掉会话
+ * （`src/store/db.ts:128-134`），于是轮询只会拿到通用的「会话不存在或已过期」
+ * —— 那条响应**没有 `status`**，面板会当成「继续等」而不是终态，
+ * 用户要空等到面板自己的 100 次超时（约 5 分钟）才知道失败。
+ *
+ * 留出这个窗口后，`/admin/providers/login/poll` 的 cline 分支才有机会走到
+ * `now > deadline` 那条判断并回 `status: 'failed'`，让面板**立刻**停下来。
+ * ⚠️ 两处 `saveLoginSession`（发起时、每轮 pending 写回时）**必须用同一个值**
+ * —— 否则第一轮写回就把宽限抹掉了，等于没加。
+ */
+const CLINE_LOGIN_SESSION_GRACE_MS = 60_000
 import type { AccountState } from './pool/state.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
@@ -339,12 +363,17 @@ async function writeDisabledModels(
 async function findLoginSession(
   env: Env,
   state: string,
-): Promise<{ realm: string; payload: Record<string, unknown> } | undefined> {
+): Promise<
+  { realm: string; payload: Record<string, unknown>; pool: DurableObjectStub<AccountPoolDO> } | undefined
+> {
   if (state === '') return undefined
   for (const realm of ['cn', 'global']) {
     const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const session = (await probe.getLoginSession(state, Date.now())) as Record<string, unknown> | undefined
-    if (session !== undefined) return { realm, payload: session }
+    // ⚠️ 连同**命中分片的 stub** 一起返回：调用方要就地更新会话
+    // （cline 的设备码节流状态每轮都要写回），自己按 realm 重建 stub
+    // 容易写错分片，而写错分片的表现是「节流失效」这种静默故障。
+    if (session !== undefined) return { realm, payload: session, pool: probe }
   }
   return undefined
 }
@@ -901,6 +930,81 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         expiresInMs: RACCOON_LOGIN_STATE_TTL_MS,
       })
     }
+    // ── cline：WorkOS 设备码（**用户码**式，不是扫码也不是回跳） ──
+    //
+    // ⚠️ 与其余家的关键不同：授权页要用户**手输一个 user code**，
+    // 故返回体里带 `userCode`（面板必须显眼地展示它，而不是只给一个链接）。
+    //
+    // 三步协议（`src/providers/cline.ts` 的「设备码登录」小节，
+    // 原始依据 `deepseek-harness-codearts/src/cline-oauth.ts:18-38`）：
+    // ① 拿设备码 → ② 轮询 WorkOS token → ③ 注册成 Cline 自己的 token。
+    // **第 ③ 步不能省**：WorkOS 的 token 只是「证明你是谁」。
+    //
+    // ⚠️ 会话里的 `intervalMs` / `nextPollAt` / `deadline` 是**必须持久化**的：
+    // 面板每 3 秒发一个**独立** HTTP 请求来轮询，而 Workers 没有跨请求内存
+    // —— 把间隔放在模块变量里会随 isolate 回收丢失，于是 `slow_down` 的
+    // 累积退避**静默失效**（表现为被 WorkOS 持续限流）。
+    //
+    // cline 属 `cn` 分片（凭据不带 `extras.realm`，与 buddy 同域）。
+    if (providerId === 'cline') {
+      const { requestClineDeviceAuthorization } = await import('./providers/cline.js')
+      try {
+        const started = await requestClineDeviceAuthorization({ signal: AbortSignal.timeout(30_000) })
+        const state = crypto.randomUUID()
+        const now = Date.now()
+        // 设备码自身有效期（上游 `expires_in`，缺省 5 分钟）就是会话期限 ——
+        // 会话比设备码活得久没有意义（轮询只会得到 expired_token）。
+        const deadline = now + started.expiresInMs
+        // ⚠️ 会话 TTL 比 `deadline` **多留 {@link CLINE_LOGIN_SESSION_GRACE_MS}**：
+        // 理由见该常量的注释（不留的话设备码一过期，轮询只会拿到
+        // 没有 `status` 的「会话不存在」，面板会一直空等）。
+        const sessionTtl = deadline + CLINE_LOGIN_SESSION_GRACE_MS
+        await pool.saveLoginSession(
+          state,
+          {
+            provider: 'cline',
+            kind: 'cline',
+            realm: loginRealm,
+            deviceCode: started.deviceCode,
+            userCode: started.userCode,
+            verificationUri: started.verificationUri,
+            ...started.verificationUriComplete === undefined
+              ? {}
+              : { verificationUriComplete: started.verificationUriComplete },
+            intervalMs: started.intervalMs,
+            // 首次轮询也要等满一个 interval（设备码规范要求）
+            nextPollAt: now + started.intervalMs,
+            deadline,
+            createdAt: now,
+          },
+          sessionTtl,
+        )
+        return json({
+          ok: true,
+          provider: 'cline',
+          state,
+          userCode: started.userCode,
+          verificationUri: started.verificationUri,
+          // ⚠️ 没有就不编造：面板会回落到 `verificationUri`（用户多输一次 code）
+          ...started.verificationUriComplete === undefined
+            ? {}
+            : { verificationUriComplete: started.verificationUriComplete },
+          // `requestClineDeviceAuthorization` 已保证该值 > 0（非法值回落到默认）
+          expiresInMs: started.expiresInMs,
+          realm: loginRealm,
+        })
+      } catch (error) {
+        return json(
+          {
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+              type: 'login_start_failed',
+            },
+          },
+          502,
+        )
+      }
+    }
     // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
     //
     // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
@@ -1012,6 +1116,99 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
           return json({ done: false, status: 'canceled', message: '用户已取消授权，请重新发起' })
         }
         return json({ done: false, status: polled.status, message: '等待扫码…' })
+      }
+      // ── cline：WorkOS 设备码（单次轮询 + 会话内持久化节流） ──
+      //
+      // ⚠️ **必须无状态友好**：面板每 3 秒发一个**独立** HTTP 请求，Workers
+      // 没有跨请求内存 —— 设备码的 `interval` / `slow_down` 退避状态只能存在
+      // 会话载荷里（start 时写入，这里每轮更新）。放在模块变量里会在 isolate
+      // 回收后丢失，退避**静默失效**。
+      //
+      // ⚠️ 三段状态机（判据逐条对齐 `src/cline-oauth.ts:266-291`）：
+      // - `authorization_pending` → 继续等（**不是错误**）；
+      // - `slow_down` → 间隔 **+1 秒累积**后继续；
+      // - 终态错误 → `{done:false, status:'failed'}`，面板据此停止轮询。
+      //
+      // ⚠️ 未到下次轮询时刻时**直接返回 pending**，不打上游：
+      // 面板 3 秒一次而设备码间隔可能已退避到 8 秒，不做节流会持续被限流。
+      if (saved.payload['kind'] === 'cline') {
+        const {
+          pollClineDeviceTokenOnce,
+          registerClineTokens,
+          clineCredentialFromRegisterResponse,
+        } = await import('./providers/cline.js')
+
+        const deviceCode = sessionString(saved.payload, 'deviceCode')
+        if (deviceCode === '') {
+          return json({ done: false, status: 'failed', message: '登录会话缺少 device_code，请重新发起登录' })
+        }
+        const deadline = sessionNumber(saved.payload, 'deadline') ?? now
+        if (now > deadline) {
+          // 设备码本身已过期：再轮询只会得到 `expired_token`，如实收尾。
+          // ⚠️ 这条分支**依赖发起时给会话多留了宽限**（CLINE_LOGIN_SESSION_GRACE_MS）
+          // —— 会话 TTL 若恰好等于 deadline，`readLoginSession` 会先一步删掉会话，
+          // 我们只能回一条**没有 `status`** 的「会话不存在」，面板会当成继续等。
+          await saved.pool.removeLoginSession(state)
+          return json({ done: false, status: 'failed', message: '设备码已过期，请重新发起登录' })
+        }
+
+        const intervalMs = sessionNumber(saved.payload, 'intervalMs') ?? CLINE_DEVICE_MIN_INTERVAL_MS
+        const nextPollAt = sessionNumber(saved.payload, 'nextPollAt') ?? now
+        if (now < nextPollAt) {
+          // 还没到下一次轮询时刻（面板的 3 秒节奏快于设备码要求）
+          return json({ done: false, status: 'authorization_pending', message: '等待授权中…' })
+        }
+
+        const outcome = await pollClineDeviceTokenOnce(
+          { deviceCode, intervalMs },
+          { signal: AbortSignal.timeout(20_000) },
+        )
+
+        if (outcome.kind === 'pending') {
+          // ⚠️ 每轮都把新间隔写回会话：`slow_down` 的累积退避必须跨请求保留。
+          // ⚠️ TTL 也必须带上同一个宽限值（见 CLINE_LOGIN_SESSION_GRACE_MS）——
+          // 用 `deadline` 当 TTL 会把宽限窗口在第一轮就抹掉。
+          await saved.pool.saveLoginSession(
+            state,
+            {
+              ...saved.payload,
+              intervalMs: outcome.intervalMs,
+              nextPollAt: Date.now() + outcome.intervalMs,
+              lastStatus: outcome.status,
+            },
+            deadline + CLINE_LOGIN_SESSION_GRACE_MS,
+          )
+          return json({
+            done: false,
+            // ⚠️ 原样回传上游状态（`authorization_pending` / `slow_down`），
+            // 不糊成一句「等待中」—— 面板与排查都需要看到真实原因
+            status: outcome.status,
+            message: outcome.status === 'slow_down' ? '服务端要求降速，继续等待授权…' : '等待授权中…',
+          })
+        }
+
+        if (outcome.kind === 'failed') {
+          await saved.pool.removeLoginSession(state)
+          return json({ done: false, status: 'failed', message: outcome.message })
+        }
+
+        // 第二步成功 → 第三步：注册成 Cline 自己的 token
+        try {
+          const registered = await registerClineTokens(outcome, { signal: AbortSignal.timeout(30_000) })
+          const credential = clineCredentialFromRegisterResponse(registered, saved.realm)
+          const result = await persistProviderCredential(env, credential, now)
+          // ⚠️ 只有**落盘成功**后才清会话（与 buddy 分支同口径）：
+          // 失败时保留，让用户能继续轮询重试。
+          await saved.pool.removeLoginSession(state)
+          return json(result)
+        } catch (error) {
+          await saved.pool.removeLoginSession(state)
+          return json({
+            done: false,
+            status: 'failed',
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
       }
       // ── codearts：浏览器回跳 + ticket 换取凭据 ──
       // `{done:false, status}` 是**约定形状**：面板据此区分「等浏览器」

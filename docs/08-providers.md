@@ -18,7 +18,7 @@
 | id | login | chat | checkin | 说明 |
 |---|---|---|---|---|
 | `workbuddy` | ✓ | ✓ | ✓ | 腾讯 CodeBuddy（默认供应商，反斜杠兼容既有用户） |
-| `cline` | ✕ | ✓ | ✕ | WorkOS 设备码协议可移植，但本服务未接线发起流程 |
+| `cline` | ✓ | ✓ | ✕ | WorkOS **设备码**（用户码式）：`/admin/providers/login/{start,poll}` 三步闭环 |
 | `minimax` | ✕ | ✓ | ✓ | 上游是 **Anthropic Messages** 协议 |
 | `codearts` | ✕ | ✓ | ✓ | 华为云码道；登录需 `127.0.0.1` 回调 |
 | `lobsterai` | ✕ | ✓ | ✓ | 有道龙虾；登录需 `127.0.0.1` 回调 |
@@ -240,7 +240,8 @@ opencode(api_key) → opencode ✓
 | **zcode 签到** | `billing/claim` **始终**索要阿里云 captcha，需 **headful** Chromium（`--headless=new` 实测过不了风控） | 推理不受影响 |
 | **raccoon 短信登录** | 需阿里云滑块 `captcha_param` | 仅扫码可用 |
 | **opencode 每账号代理** | 参考实现用 undici + 自实现 SOCKS5；Workers 的 `fetch` 不接受 `dispatcher` | **真实功能损失**：多个匿名槽共享同一出口 IP，免费额度**不再能通过多开扩容** |
-| **cline / minimax / loomy / raccoon 登录未接线** | 协议可移植（或函数已实现），但本服务未实现发起流程 | 已**如实声明** `login: false` |
+| **minimax / loomy 登录未接线** | 协议可移植（或函数已实现），但本服务未实现发起流程 | 已**如实声明** `login: false` |
+| **cline 设备码登录** | ✅ 已接线（WorkOS 三步：设备码 → 轮询 → `/api/v1/auth/register`）。⚠️ 轮询状态（间隔/下次轮询时刻/期限）**持久化在登录会话载荷**里 —— 面板每 3 秒发独立请求，Workers 无跨请求内存 | 已实现 |
 | **流内换号**（trae / lobsterai） | 需先消费整个 SSE 才能决定重发，而本项目逐帧透传（10ms CPU 铁律） | 流内错误转成错误帧；换号由 HTTP 状态驱动 |
 
 ---

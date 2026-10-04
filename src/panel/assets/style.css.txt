@@ -314,3 +314,18 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   background: #fff; border-radius: 8px; line-height: 0;
 }
 .qr-box svg { width: 200px; height: 200px; display: block; }
+
+/*
+ * 设备码登录的**用户码**（cline：授权页要求用户手输这个码）。
+ *
+ * ⚠️ 必须做得**显眼且可整段选中**：用户要把它抄进浏览器里的另一个页面。
+ * 字号偏大、等宽字体、加字距，避免把 0/O、1/I 看错。
+ * 与 .qr-box 同理恒用白底深字 —— 深色主题下低对比会让用户抄错码，
+ * 而抄错码的表现是「授权页一直报代码无效」，用户完全看不出是我们的锅。
+ */
+.user-code {
+  display: inline-block; margin: 10px 0; padding: 10px 16px;
+  background: #fff; color: #10131a; border-radius: 8px;
+  font-family: ui-monospace, monospace; font-size: 26px; font-weight: 700;
+  letter-spacing: 4px; user-select: all;
+}

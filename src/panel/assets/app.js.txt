@@ -442,7 +442,7 @@ function loginWaitHint(providerId) {
 }
 
 /**
- * 渲染登录提示：**扫码**家显示二维码，其余家显示授权链接。
+ * 渲染登录提示：**扫码**家显示二维码，**用户码**家显示用户码 + 链接，其余显示授权链接。
  *
  * ## ⚠️ 为什么必须抽成共享函数（实测踩到）
  *
@@ -460,6 +460,47 @@ function loginWaitHint(providerId) {
 function renderLoginPrompt(el, body, providerId) {
   const qrSvg = body.qrSvg
   const authUrl = body.authUrl
+  const userCode = body.userCode
+
+  // ── 设备码（**用户码**式：cline）──
+  //
+  // ⚠️ cline 的授权页要求用户**手输一个 user code**，故这里必须把 code
+  // 显眼地展示出来。它既不是扫码（raccoon 的 `qrSvg`）也不是纯链接
+  //（buddy / qoder 的 `authUrl`）—— 只给链接会让用户卡在「请输入代码」那一步。
+  //
+  // 链接优先用 `verificationUriComplete`（URL 里已带 code，用户少输一次），
+  // 没有才回落到 `verificationUri`。
+  if (typeof userCode === 'string' && userCode !== '') {
+    const tip = document.createElement('div')
+    tip.textContent = '请在浏览器打开下面的链接，并输入以下代码完成授权：'
+    el.appendChild(tip)
+
+    const codeBox = document.createElement('div')
+    codeBox.className = 'user-code'
+    codeBox.textContent = userCode
+    el.appendChild(codeBox)
+
+    const url = typeof body.verificationUriComplete === 'string' && body.verificationUriComplete !== ''
+      ? body.verificationUriComplete
+      : (typeof body.verificationUri === 'string' ? body.verificationUri : '')
+    if (url !== '') {
+      const a = document.createElement('a')
+      a.href = url; a.target = '_blank'; a.rel = 'noreferrer noopener'
+      a.textContent = '打开授权页面'
+      el.appendChild(a)
+      const hint = document.createElement('div')
+      hint.className = 'hint'
+      hint.textContent = '代码已填进链接时可直接确认，否则请手工输入上面的代码。'
+      el.appendChild(hint)
+    }
+
+    // 轮询时只更新这段状态文字 —— 用户码必须留在页面上，不能被文字覆盖掉
+    const status = document.createElement('div')
+    status.textContent = '等待授权中…' + loginWaitHint(providerId)
+    el.appendChild(status)
+    el._loginStatus = status
+    return
+  }
 
   // ── 扫码登录（raccoon）：二维码由服务端渲染好，这里只负责显示 ──
   //
@@ -816,14 +857,18 @@ const CAPS = [
 ]
 
 /**
- * 登录方式**不是设备码**的供应商：卡片标签与弹窗标题要写实际方式。
+ * 登录方式**不是标准设备码轮询**的供应商：卡片标签与弹窗标题要写实际方式。
  *
  * ⚠️ 为什么必须有它：codearts 是**浏览器回跳**式登录（把浏览器的授权结果打回
  * 本服务的 `/login/codearts/callback/<state>`），与设备码轮询完全不是一回事。
  * 标签写成「设备码登录」会误导用户去找一个并不存在的设备码。
- * 其余家（buddy / workbuddy / qoder / zcode）确实都是设备码轮询。
+ *
+ * ⚠️ cline 也是设备码，但它是**用户码**式：用户要先把一个短码抄进授权页，
+ * 与 buddy/qoder 那种「点开链接就完事」的体验不同，故标签写明「用户码登录」，
+ * 让用户在点之前就知道要准备抄一串代码。
+ * 其余家（buddy / workbuddy / qoder / zcode）确实都是标准设备码轮询。
  */
-const LOGIN_KIND_LABEL = { codearts: '浏览器登录', raccoon: '微信扫码' }
+const LOGIN_KIND_LABEL = { codearts: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录' }
 
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []

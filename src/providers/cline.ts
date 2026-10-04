@@ -17,7 +17,7 @@
  * - 目录合并与免费判定：`src/cline-models.ts:20-35`、`:192-235`；
  * - 余额与签到事实：`src/cline-credits.ts:5-56`、`src/cline-quota.ts`。
  *
- * ## 登录（本轮**不实现**，但状态机已定，供后续 `loginStart`/`loginPoll` 照抄）
+ * ## 登录（**已实现**：WorkOS 设备码，用户码式）
  *
  * Cline 走 **WorkOS 设备码轮询**（无本地回调监听 ⇒ 可在 Workers 跑，
  * 故 `capabilities.login = true`）。三步（`src/cline-oauth.ts:18-38`）：
@@ -44,10 +44,17 @@
  *    用固定间隔会在服务端要求降速后持续被限流。
  * 3. 终态只有 `access_denied` / `expired_token` / `invalid_grant`
  *    （`cline-oauth.ts:279-286`），其余非 2xx 也是终态失败。
- * 4. 轮询间隔**下限 1 秒**（服务端可能下发 0 或负数），网络失败容忍
- *    **5 次连续失败**（`cline-oauth.ts:236-302`）。
+ * 4. 轮询间隔**下限 1 秒**（服务端可能下发 0 或负数）。
+ *    ⚠️ 参考实现另有「容忍 5 次连续网络失败」（`cline-oauth.ts:292-304`），
+ *    本项目**刻意不照搬**：那是**单进程循环**里的计数器，而本服务的轮询是
+ *    每 3 秒一个独立 HTTP 请求、Workers 无跨请求内存。网络失败时如实回
+ *    `authorization_pending`（面板会继续轮询）比维护一个会丢的计数器更可靠。
  * 5. 注册响应的 `accessToken` **自带 `workos:` 前缀**，仍要幂等补齐
  *    （`cline-oauth.ts:408-412`）。
+ *
+ * ⚠️ **本模块的登录函数一律接受可注入 `fetcher`**（见「设备码登录」小节）：
+ * cline 的 `refreshToken` 是**一次性轮换**的，任何对真实端点的验证调用都可能
+ * 把用户凭据作废（本项目已因此丢过两次账号）。
  *
  * ## 本轮刻意不做的事（避免「假装支持」）
  *
@@ -101,6 +108,63 @@ const BALANCE_TIMEOUT_MS = 30_000
 const REFRESH_PATH = '/api/v1/auth/refresh'
 /** 单次续期请求超时（对齐参考 `CLINE_HTTP_TIMEOUT_MS = 30_000`，`src/cline-oauth.ts:77`）。 */
 const REFRESH_TIMEOUT_MS = 30_000
+
+// ───────────────────── 设备码登录（WorkOS）常量 ─────────────────────
+//
+// 三步协议的完整说明见本文件头注释；以下常量逐条对应
+// `deepseek-harness-codearts/src/cline-product.ts:265-297`。
+
+/**
+ * WorkOS 基址（`src/cline-product.ts:267` 的 `CLINE.workOsBase`）。
+ *
+ * ⚠️ **与 {@link API_BASE} 不是同一个域**：设备码授权与 token 轮询挂
+ * `api.workos.com`，注册（换 Cline 自己的 token）才挂 `api.cline.bot`。
+ */
+const WORKOS_BASE = 'https://api.workos.com'
+
+/**
+ * WorkOS client id（`src/cline-product.ts:268` 的 `CLINE.workOsClientId`）。
+ *
+ * ⚠️ 这是**公开**常量（官方桌面端内置），不是密钥；设备码流程靠
+ * `device_code` 而非 client secret 保证安全。
+ */
+const WORKOS_CLIENT_ID = 'client_01K3A541FN8TA3EPPHTD2325AR'
+
+/** 设备码授权路径（挂 `WORKOS_BASE`，`src/cline-product.ts:293`）。 */
+const DEVICE_AUTHORIZATION_PATH = '/user_management/authorize/device'
+/** 设备码 token 轮询路径（挂 `WORKOS_BASE`，`src/cline-product.ts:295`）。 */
+const DEVICE_AUTHENTICATE_PATH = '/user_management/authenticate'
+/** 注册路径（挂 `API_BASE`，`src/cline-product.ts:297`）。 */
+const REGISTER_PATH = '/api/v1/auth/register'
+
+/**
+ * 设备码轮询的 `grant_type`。
+ *
+ * ⚠️ 取值来自实测原文（`src/cline-oauth.ts:28`），**不是** `device_code`。
+ * 写错服务端不会报「缺字段」，而是回一个泛化的认证失败，极难定位。
+ */
+const DEVICE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code'
+
+/** 设备码默认有效期（`src/cline-oauth.ts:80`：`DEFAULT_DEVICE_AUTH_EXPIRES_IN_SECONDS = 300`）。 */
+export const CLINE_DEVICE_AUTH_EXPIRES_MS = 300_000
+/** 设备码默认轮询间隔（`src/cline-oauth.ts:83`：`DEFAULT_DEVICE_AUTH_INTERVAL_SECONDS = 5`）。 */
+export const CLINE_DEVICE_AUTH_INTERVAL_MS = 5_000
+/**
+ * 轮询间隔**下限**（`src/cline-oauth.ts:236`）。
+ *
+ * ⚠️ 服务端可能下发 `0` 或负数（实测），无节制轮询会被限流。
+ */
+export const CLINE_DEVICE_MIN_INTERVAL_MS = 1_000
+/**
+ * `slow_down` 的累积退避步长（`src/cline-oauth.ts:273-277`）。
+ *
+ * ⚠️ 必须**累积**（源码 `intervalSeconds += 1`）而非重置回原值 ——
+ * 用固定间隔会在服务端要求降速后持续被限流。
+ */
+export const CLINE_DEVICE_SLOW_DOWN_STEP_MS = 1_000
+
+/** 登录相关单次请求超时（对齐 `src/cline-oauth.ts:77`）。 */
+const OAUTH_TIMEOUT_MS = 30_000
 
 /**
  * 访问令牌前缀。**必须原样保留**。
@@ -465,14 +529,23 @@ export function parseCredential(input: unknown): ProviderCredential {
     ?? readNested(record, ['userInfo'], ['name', 'displayName', 'firstName'])
     ?? readNested(record, ['account'], ['nickname', 'name'])
 
-  const expiresRaw =
-    readNumber(record, ['expiresAt', 'expires_at', 'expire_time', 'expireTime', 'expiry'])
-    ?? readNumber(asRecord(record.auth) ?? {}, ['expiresAt', 'expires_at', 'expire_time'])
-    ?? readNumber(asRecord(record.data) ?? {}, ['expiresAt', 'expires_at', 'expire_time'])
   // 时间字段也可能是 ISO 字符串，`readNumber` 拿不到时再走通用解析。
-  const expiresAt = expiresRaw !== undefined
-    ? parseClineTimestamp(expiresRaw)
-    : parseClineTimestamp(record.expiresAt ?? record.expires_at ?? record.expire_time)
+  //
+  // ⚠️ **必须逐层看，不能只读顶层**（实测踩到的真实缺陷）：官方
+  // `/api/v1/auth/register` 与 `/api/v1/auth/refresh` 的响应把 `expiresAt`
+  // 放在 **`data` 信封**里，而这里原先只在 `readNumber` 失败时回落到
+  // `record.expiresAt`（顶层）—— 于是**所有经登录/续期拿到的凭据
+  // `expiresAt` 恒为 0**（=「过期时间未知」）。
+  // 后果不是「少显示一个字段」：`needsRefresh(0, now)` 恒为 true
+  // （`src/upstream/auth.ts:348-351` 的口径是「未知就宁可多续一次」），
+  // 即**每次请求前都白续一次期**，而 cline 的 refresh token 是**一次性轮换**
+  // 的 —— 白续期会真的消耗掉轮换次数，把账号推向不可续期。
+  const expiresAt = parseClineTimestamp(
+    record.expiresAt ?? record.expires_at ?? record.expire_time
+    ?? asRecord(record.data)?.expiresAt ?? asRecord(record.data)?.expires_at
+    ?? asRecord(record.data)?.expire_time
+    ?? asRecord(record.auth)?.expiresAt ?? asRecord(record.auth)?.expires_at,
+  )
 
   return buildCredential(
     clineBearerValue(accessTokenRaw),
@@ -1202,6 +1275,301 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
   }
 }
 
+// ─────────────────── 设备码登录（WorkOS 三步） ───────────────────
+//
+// ## 为什么这条流程值得做（用户诉求）
+//
+// 本地 DSH 客户端与本服务此前**共用同一份 Cline 凭据文件**。cline 的
+// `refreshToken` 是**一次性轮换**的（与 raccoon 同型）：两边各自续期会把对方
+// 顶掉，账号「用一天就废」。让本服务自己走一遍设备码登录、拿到**独立的**
+// 凭据，两边就不再打架。
+//
+// ## 为什么能在 Workers 跑
+//
+// 设备码轮询**不需要本地监听端口**（`src/cline-oauth.ts:5-16`）——
+// 用户在自己浏览器里输 user code，我们只轮询 WorkOS。
+//
+// ## ⚠️ 操作纪律（两次真实事故）
+//
+// 本文件导出的 `refresh()` 打的是**真实** `/api/v1/auth/refresh`，
+// 对真实凭据调用一次就可能把用户本机那份凭据作废。
+// 故本节的三个函数一律接受**可注入的 `fetcher`**，单测全部走 mock
+// （见 `tests/cline-login.test.ts`）。**任何验证都不得打真实端点。**
+
+/** 设备码授权响应（已归一化；三字段齐备才有效，`src/cline-oauth.ts:194-203`）。 */
+export interface ClineDeviceAuthorization {
+  deviceCode: string
+  userCode: string
+  verificationUri: string
+  /** 带 `user_code` 的完整 URL（有则优先用它，用户少一步输入）。 */
+  verificationUriComplete?: string
+  expiresInMs: number
+  /** 轮询间隔（**已按 {@link CLINE_DEVICE_MIN_INTERVAL_MS} 兜底**）。 */
+  intervalMs: number
+}
+
+/** 注入项：所有网络访问都走它（缺省全局 `fetch`）。 */
+export interface ClineLoginOptions {
+  fetcher?: typeof fetch
+  signal?: AbortSignal
+}
+
+/**
+ * 第一步：请求设备码授权。
+ *
+ * ```
+ * POST {WORKOS_BASE}/user_management/authorize/device
+ *   Content-Type: application/x-www-form-urlencoded
+ *   body: client_id=<WORKOS_CLIENT_ID>
+ * → { device_code, user_code, verification_uri, verification_uri_complete?,
+ *     expires_in, interval }
+ * ```
+ *
+ * ⚠️ **三个字段缺一不可**（`device_code` / `user_code` / `verification_uri`）：
+ * 参考实现（`src/cline-oauth.ts:197-199`）同样三字段齐备才通过 ——
+ * 缺 `user_code` 时用户无从输入，缺 `device_code` 时轮询无从发起，
+ * 都是**必然失败**的会话，不如在这里就如实报错。
+ *
+ * ⚠️ `expires_in` / `interval` 单位是**秒**（OAuth 设备码规范），
+ * 非法值回落到默认（`src/cline-oauth.ts:165-168` 的 `toMs`）。
+ */
+export async function requestClineDeviceAuthorization(
+  options: ClineLoginOptions = {},
+): Promise<ClineDeviceAuthorization> {
+  const fetcher = options.fetcher ?? fetch
+  const res = await fetcher(`${WORKOS_BASE}${DEVICE_AUTHORIZATION_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: WORKOS_CLIENT_ID }).toString(),
+    signal: options.signal ?? AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+  })
+
+  const payload = await res.json().catch(() => ({})) as Record<string, unknown>
+  if (!res.ok) {
+    const detail = readString(payload, ['error_description', 'error'])
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      message: `Cline 设备码授权失败（HTTP ${res.status}）${detail === undefined ? '' : `：${detail}`}`,
+    })
+  }
+
+  const deviceCode = readString(payload, ['device_code']) ?? ''
+  const userCode = readString(payload, ['user_code']) ?? ''
+  const verificationUri = readString(payload, ['verification_uri']) ?? ''
+  if (deviceCode === '' || userCode === '' || verificationUri === '') {
+    throw new ProviderError({
+      provider: ID,
+      message:
+        'Cline 设备码授权响应缺少必要字段（device_code / user_code / verification_uri）。'
+        + '上游协议可能已变更，请重新发起登录或改用「粘贴凭据导入」。',
+    })
+  }
+
+  const verificationUriComplete = readString(payload, ['verification_uri_complete'])
+  return {
+    deviceCode,
+    userCode,
+    verificationUri,
+    ...verificationUriComplete === undefined ? {} : { verificationUriComplete },
+    expiresInMs: secondsToMs(payload.expires_in, CLINE_DEVICE_AUTH_EXPIRES_MS),
+    // ⚠️ 起手就把间隔压到下限之上（服务端可能下发 0/负数）。
+    intervalMs: Math.max(
+      CLINE_DEVICE_MIN_INTERVAL_MS,
+      secondsToMs(payload.interval, CLINE_DEVICE_AUTH_INTERVAL_MS),
+    ),
+  }
+}
+
+/**
+ * 把「秒」归一为毫秒；非法值（缺字段 / 0 / 负数 / 非数）回落到默认。
+ *
+ * ⚠️ **不能写 `value * 1000`**：服务端下发 `0` 或负数时，
+ * `Math.max(下限, …)` 之外的路径都会得到「无间隔轮询」。
+ */
+function secondsToMs(value: unknown, fallbackMs: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallbackMs
+  return Math.floor(value) * 1000
+}
+
+/** 一次轮询的终态（供调用方决定是「继续等」还是「就此失败」）。 */
+export type ClineDevicePollOutcome =
+  | { kind: 'pending'; status: 'authorization_pending' | 'slow_down'; intervalMs: number }
+  | { kind: 'success'; accessToken: string; refreshToken: string }
+  | { kind: 'failed'; status: string; message: string }
+
+/**
+ * 第二步（**单次**）：轮询一次 WorkOS token。
+ *
+ * ```
+ * POST {WORKOS_BASE}/user_management/authenticate
+ *   body: grant_type=urn:ietf:params:oauth:grant-type:device_code
+ *         &device_code=<device_code>&client_id=<WORKOS_CLIENT_ID>
+ * → 200 { access_token, refresh_token, token_type }
+ * → 错误体 { error: "authorization_pending" | "slow_down" | … }
+ * ```
+ *
+ * ## ⚠️ 为什么是「单次」而不是「循环到成功」
+ *
+ * 参考实现 `pollClineWorkOsTokens`（`src/cline-oauth.ts:230-307`）是一个
+ * `while` 循环 —— 那在**单进程**里成立，但本服务的面板是**每 3 秒发一个独立
+ * HTTP 请求**轮询的，Workers 又**没有跨请求内存**：循环里的 `intervalMs`
+ * 与 `failures` 一旦放在模块变量里就会随 isolate 回收丢失。
+ * 故这里拆成「一次调用 = 一次轮询」，把间隔与期限**持久化在会话载荷**里
+ * （见 `src/index.ts` 的 cline 分支）。状态机语义与参考实现逐条对齐：
+ *
+ * - `authorization_pending` → 继续（**不是错误**）；
+ * - `slow_down` → 间隔 **+1 秒后累积**（`intervalMs` 一并回传）；
+ * - `access_denied` / `expired_token` / `invalid_grant` → 终态失败；
+ * - 其它非 2xx → 终态失败；
+ * - 2xx 但缺 token → 终态失败（**不是** pending：重试一万次也不会有 token，
+ *   继续轮询只会把用户永远挂在「等待授权中」）。
+ */
+export async function pollClineDeviceTokenOnce(
+  authorization: Pick<ClineDeviceAuthorization, 'deviceCode' | 'intervalMs'>,
+  options: ClineLoginOptions = {},
+): Promise<ClineDevicePollOutcome> {
+  const fetcher = options.fetcher ?? fetch
+  const res = await fetcher(`${WORKOS_BASE}${DEVICE_AUTHENTICATE_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: DEVICE_GRANT_TYPE,
+      device_code: authorization.deviceCode,
+      client_id: WORKOS_CLIENT_ID,
+    }).toString(),
+    signal: options.signal ?? AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+  })
+
+  const payload = await res.json().catch(() => ({})) as Record<string, unknown>
+
+  if (res.ok) {
+    const accessToken = readString(payload, ['access_token']) ?? ''
+    const refreshToken = readString(payload, ['refresh_token']) ?? ''
+    if (accessToken === '' || refreshToken === '') {
+      return {
+        kind: 'failed',
+        status: 'invalid_response',
+        message: 'Cline 登录响应缺少 access_token / refresh_token，请重新发起登录',
+      }
+    }
+    return { kind: 'success', accessToken, refreshToken }
+  }
+
+  const errorCode = readString(payload, ['error']) ?? ''
+  const detail = readString(payload, ['error_description'])
+
+  // ⚠️ `authorization_pending` 的判据是**响应体的 `error` 字段**，
+  // 不是 HTTP 状态码（`src/cline-oauth.ts:40-44`）。按状态码判失败会把
+  // 「用户还没点授权」误报成登录失败。
+  if (errorCode === 'authorization_pending') {
+    return { kind: 'pending', status: 'authorization_pending', intervalMs: authorization.intervalMs }
+  }
+  if (errorCode === 'slow_down') {
+    // ⚠️ **累积**退避 1 秒（源码 `intervalSeconds += 1`），不是重置。
+    const next = Math.max(
+      CLINE_DEVICE_MIN_INTERVAL_MS,
+      authorization.intervalMs + CLINE_DEVICE_SLOW_DOWN_STEP_MS,
+    )
+    return { kind: 'pending', status: 'slow_down', intervalMs: next }
+  }
+  if (errorCode === 'access_denied' || errorCode === 'expired_token' || errorCode === 'invalid_grant') {
+    return {
+      kind: 'failed',
+      status: errorCode,
+      message: detail ?? (errorCode === 'access_denied'
+        ? '用户拒绝了本次授权，请重新发起登录'
+        : '设备码已失效或授权被撤销，请重新发起登录'),
+    }
+  }
+  return {
+    kind: 'failed',
+    status: errorCode === '' ? 'http_error' : errorCode,
+    message: `Cline 登录轮询失败（HTTP ${res.status}）${detail === undefined ? '' : `：${detail}`}`,
+  }
+}
+
+/**
+ * 第三步：把 WorkOS token 注册成 **Cline 自己的** token。
+ *
+ * ```
+ * POST {API_BASE}/api/v1/auth/register
+ *   Content-Type: application/json
+ *   body: { accessToken, refreshToken }        ← 驼峰！
+ * → { success: true, data: { accessToken, refreshToken, expiresAt,
+ *                            userInfo: { clineUserId, email, … } } }
+ * ```
+ *
+ * ⚠️ **这一步不能省**（`src/cline-oauth.ts:309-338`）：WorkOS 的 token 只是
+ * 「证明你是谁」，Cline 的推理端点认的是注册后的 token。
+ *
+ * ⚠️ 返回**注册响应原文**（不在这里解析）—— 解析交给
+ * {@link parseCredential} 的同一套口径（`data` 信封 + 驼峰字段 + `userInfo`），
+ * 避免「登录拿到的凭据」与「粘贴导入的凭据」出现两套解析规则。
+ */
+export async function registerClineTokens(
+  tokens: { accessToken: string; refreshToken: string },
+  options: ClineLoginOptions = {},
+): Promise<unknown> {
+  const fetcher = options.fetcher ?? fetch
+  const res = await fetcher(`${API_BASE}${REGISTER_PATH}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...CLIENT_HEADERS,
+    },
+    body: JSON.stringify({ accessToken: tokens.accessToken, refreshToken: tokens.refreshToken }),
+    signal: options.signal ?? AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+  })
+
+  const payload = await res.json().catch(() => ({})) as Record<string, unknown>
+  if (!res.ok) {
+    const detail = readString(payload, ['error', 'message', 'error_description'])
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      message: `Cline token 注册失败（HTTP ${res.status}）${detail === undefined ? '' : `：${detail}`}`,
+    })
+  }
+  return payload
+}
+
+/**
+ * 把**注册响应原文**转成落盘用的 `ProviderCredential`。
+ *
+ * ⚠️ **必须复用 {@link parseCredential}**，不能手搓字段：手搓会漏掉
+ * `extras.accountId` / `extras.realm`，前者会让余额端点直接 400
+ *（它只认 `usr-…`），后者会让账号落错分片（存进去却按 realm 查不到）。
+ *
+ * 注册响应的 `accessToken` **自带 `workos:` 前缀**（`src/cline-oauth.ts:408-412`），
+ * 而 {@link clineBearerValue} 是**幂等补齐**，故两条路径（带/不带前缀）都正确。
+ */
+export function clineCredentialFromRegisterResponse(
+  payload: unknown,
+  realm: string,
+): ProviderCredential {
+  const record = asRecord(payload)
+  if (record === undefined) {
+    throw new ProviderError({
+      provider: ID,
+      message: 'Cline 注册响应不是 JSON 对象，无法落盘凭据，请重新发起登录',
+    })
+  }
+  // ⚠️ `success:false` 即使 HTTP 200 也是失败（`src/cline.ts:121-160` 的
+  // `requireClineTokenResponse` 同款判据）—— 只看状态码会把失败信封当成功。
+  if (record.success === false) {
+    throw new ProviderError({
+      provider: ID,
+      message: `Cline 注册失败：${readString(record, ['error', 'message']) ?? '上游未说明原因'}`,
+    })
+  }
+  const credential = parseCredential(payload)
+  // ⚠️ realm 由**本轮登录请求**决定（与 `toProviderCredential` 同口径）：
+  // cline 属 `cn` 分片，但显式写入比靠兜底更可靠。
+  return { ...credential, extras: { ...credential.extras, realm } }
+}
+
 // ─────────────────────────── 导出 ───────────────────────────
 
 export const clineProvider: Provider = {
@@ -1236,21 +1604,19 @@ export const clineProvider: Provider = {
      * （`src/cline-oauth.ts:5-16`）。具体状态机见文件头注释。
      */
     /**
-     * ⚠️ **本构建为 `false`，尽管协议本身支持设备码登录**。
+     * ⚠️ **本构建为 `true`** —— 三步流程已全部实现并接线到
+     * `/admin/providers/login/{start,poll}`（见 `src/index.ts` 的 cline 分支）。
      *
-     * 诚实纪律（见 types.ts 的「不假装支持」）：`login` 的含义是
-     * 「**本服务能发起这条登录流程**」，而不是「上游协议允许登录」。
-     * cline 的 WorkOS 设备码三步（`src/cline-oauth.ts:18-38`）虽然可在
-     * Workers 跑（无本地监听），但本项目的 `/admin/providers/login/*`
-     * 目前只接线了 qoder 与 zcode —— 声 true 会让面板显示一个点了没反应的按钮。
+     * 为什么值得做（用户诉求）：本地 DSH 客户端与本服务此前**共用同一份凭据
+     * 文件**，而 cline 的 `refreshToken` 是**一次性轮换**的 —— 两边互相续期
+     * 会把对方顶掉，账号「用一天就废」（与 raccoon 同型事故）。
+     * 本服务自己走一遍设备码登录后即拥有**独立**凭据。
      *
-     * 用**导入凭据**即可正常使用（`~/.cline/data/settings/providers.json` 的
-     * `accessToken`）。
+     * ⚠️ 登录方式与其余家**都不同**：它是**用户码**式（授权页要用户手输
+     * `userCode`），既不是扫码（raccoon）也不是浏览器回跳（codearts）。
+     * 面板据此显示用户码而不是只给一个链接（见 `renderLoginPrompt`）。
      */
-    login: false,
-    loginBlockedReason:
-      '本服务暂未接线 Cline 的设备码登录（协议支持，但未实现发起流程）。'
-      + '请从 Cline 桌面端的 `providers.json` 复制 `accessToken` 后粘贴导入。',
+    login: true,
     listModels: true,
     chat: true,
     /** ✅ 有真实余额端点 `/api/v1/users/{userId}/balance`（`src/cline-credits.ts`）。 */
