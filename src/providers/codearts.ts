@@ -1812,15 +1812,42 @@ export const codeartsProvider: Provider = {
   name: 'CodeArts（华为云码道）',
   capabilities: {
     /**
-     * ✅ **可从本服务发起**：走 legacy ticket + `auth_callback_url` 流程，
-     * 回调指向**本服务自己的 URL**（`/login/codearts/callback/<state>`），
-     * 不需要在本机开监听端口（完整说明见文件头）。
+     * ❌ **不可用**：华为的登录链路在服务端就是个**死循环**，远程回调收不到。
      *
-     * ⚠️ **有一处未实测**：华为是否接受非 localhost 的 `auth_callback_url`。
-     * 没有真人登录就验不了；若被拒，会话会停在「等待浏览器完成授权」。
-     * 仍声明 `true`：流程本身已实现，且 URL 构造与 ticket 契约都有实测依据。
+     * ## 实测结论（用户两次真实登录，地址栏取证）
+     *
+     * 用户登录后被送到**华为自己的中间页**（不是我们的回调）：
+     * ```
+     * https://devcloud.cn-north-4.huaweicloud.com/doer/login?ticket_id=…
+     *   &auth_callback_url=<我们的回调>&fingerprint=<base64(该URL自身)>
+     * ```
+     * 其中 `fingerprint` 解码后**只是它自己**，**不含 token** ⇒ 登录尚未完成。
+     *
+     * 而该页返回的是一段跳转脚本，它把浏览器**又送回登录页**：
+     * ```js
+     * if (uri.host === window.location.host) href = targethref   // 只有同 host 才跳
+     * location.replace('https://auth.huaweicloud.com/authui/login?service=' + href)
+     * ```
+     * ⇒ 登录页 → 登录 → `/doer/login` → 又回登录页，**无限循环**。
+     *
+     * 实测排除了「回调地址不合法」这一可能：对
+     * `127.0.0.1` / 我们的 URL / `evil.example.com` / **完全不带该参数**，
+     * 该页返回的响应**逐字节相同** —— 即它**根本不读** `auth_callback_url`。
+     *
+     * ## 为什么参考实现能成
+     * 它的 `auth_callback_url` 是 `http://127.0.0.1:<port>/authentication` ——
+     * 浏览器**直连用户本机端口**，不经过 `authui/login` 这条链的二次跳转。
+     * Worker 收不到本机端口，故这条路**架构上不成立**。
+     *
+     * ⚠️ **不要靠「换个 callback 地址」或「补 fingerprint 分支」来修** ——
+     * 那些都试过了，问题在华为侧的跳转链，不在我们这边。
+     * 除非华为支持设备码或远程回调，否则只能「粘贴凭据导入」。
      */
-    login: true,
+    login: false,
+    loginBlockedReason:
+      '华为的登录跳转链在服务端会死循环（浏览器被反复送回登录页），'
+      + '而它的回调只认本机 127.0.0.1 端口 —— Worker 收不到。这是上游的协议限制，'
+      + '不是本服务的缺失。请从码道 IDE / 桌面端导出凭据后粘贴导入。',
     listModels: true,
     chat: true,
     balance: true,

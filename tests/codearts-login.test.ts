@@ -414,12 +414,37 @@ test('⚠️ 服务端万一同时下发续期材料，必须透传（否则可�
 
 // ─────────────────── ⑦ 能力声明 ───────────────────
 
-test('⚠️ codearts 现在声明 login=true（浏览器回跳流程已实现）', () => {
+test('❌ codearts 必须声明 login=false —— 华为登录链在服务端就是死循环', () => {
+  // ## 被用户两次真实登录推翻的结论（2026-10-04）
+  //
+  // 用户登录后被送到**华为自己的中间页**（不是我们的回调）：
+  //   https://devcloud.cn-north-4.huaweicloud.com/doer/login?ticket_id=…
+  //     &auth_callback_url=<我们的>&fingerprint=<base64(该URL自身)>
+  // 其中 fingerprint 解码后**只是它自己**、**不含 token** ⇒ 登录未完成。
+  //
+  // 该页返回一段跳转脚本，把浏览器**又送回登录页**：
+  //   if (uri.host === window.location.host) href = targethref   // 只有同 host 才跳
+  //   location.replace('https://auth.huaweicloud.com/authui/login?service=' + href)
+  // ⇒ 登录页 → 登录 → /doer/login → 又回登录页，**无限循环**。
+  //
+  // 实测排除「回调地址不合法」：对 127.0.0.1 / 我们的 URL / evil.example.com /
+  // **完全不带该参数**，该页响应**逐字节相同** —— 它**根本不读** auth_callback_url。
+  //
+  // 参考实现能成是因为它用 `http://127.0.0.1:<port>/authentication`，
+  // 浏览器**直连本机端口**，不经过 authui/login 的二次跳转。Worker 收不到。
   const provider = findProvider('codearts')
-  assert.equal(provider?.capabilities.login, true)
-  // 声明能登录就**必须**真的有可用的登录原语（避免「声明了却做不到」）
+  assert.equal(provider?.capabilities.login, false, 'codearts 不能声称支持登录')
+  assert.ok(
+    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
+    '阻塞原因必须点明是「回调只认本机 127.0.0.1」',
+  )
+})
+
+test('codearts 的登录原语保留（协议已逆向，将来若上游支持远程回调可直接接回）', () => {
+  // 原语本身是对的（URL 构造、ticket 契约、fingerprint/secret/token 三种回传
+  // 形态都实现并测过），只是**上游不允许**我们把回调放到远程。
   assert.equal(typeof buildCodeArtsLoginUrl, 'function')
-  assert.equal(typeof fetchCodeArtsTicket, 'function')
+  assert.equal(typeof buildCodeArtsCallbackUrl, 'function')
 })
 
 // ─────────────────── 登录入口 host（用户报障「一直显示登录中」） ───────────────────
