@@ -556,6 +556,8 @@ async function handleProviderChat(input: {
     }
 
     const startedAt = Date.now()
+    // ⚠️ 续期只试一次（见下方 401 分支的说明）。
+    let refreshed = false
     let upstream: Response
     try {
       upstream = await provider.chat(credential, { model, body, signal: request.signal })
@@ -568,6 +570,60 @@ async function handleProviderChat(input: {
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
+
+      // ⚠️ **401/403 先尝试续期，而不是直接判失败**（实测踩到）。
+      //
+      // 上游令牌都有寿命（实测本地凭据过期 5–7 小时），过期后所有请求 401。
+      // 若不续期，账号用一天就废；而用户看到的是「凭据坏了」，
+      // 完全想不到「只是该续期了」。
+      //
+      // 只试**一次**（`refreshed` 标记）：续期后仍 401 说明 refresh token 也废了，
+      // 再试只是无谓地打上游。
+      if ((upstream.status === 401 || upstream.status === 403) && provider.refresh !== undefined && !refreshed) {
+        try {
+          refreshed = true
+          const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+          await pool.putCredential(picked.uid, fresh, Date.now())
+          // ⚠️ 重放请求（用新凭据）。这里直接用 continue 会重新选号，
+          // 但我们要的是**同一个号**换新令牌重试 —— 故显式再发一次。
+          const retry = await provider.chat(fresh, { model, body, signal: request.signal })
+          if (retry.ok && retry.body !== null) {
+            const startedAt2 = Date.now()
+            return {
+              response: streamResponse(retry.body, {
+                onFirstChunk: () => {
+                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+                onError: (message) => {
+                  const t = pool
+                    .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })
+                    .catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+                onFinish: (usage) => {
+                  const t = pool
+                    .recordUsage({
+                      at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
+                      input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
+                      ms: Date.now() - startedAt2,
+                    })
+                    .catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+              }),
+            }
+          }
+        } catch (error) {
+          // 续期失败（refresh token 也废了）→ 落回正常失败路径，
+          // 并把这个号标成需要重新登录（软冷却，避免每请求都试一次续期）。
+          console.error(
+            `[refresh] ${providerId} 续期失败：`,
+            error instanceof Error ? error.message : String(error),
+          )
+        }
+      }
+
       const rotate = provider.shouldRotate?.(upstream.status, text) ?? (upstream.status === 429 || upstream.status === 402)
       await pool
         .applyFailure({

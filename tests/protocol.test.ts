@@ -218,8 +218,11 @@ test('isValidUid：接受 UUID 形态', () => {
 
 test('isValidUid：拒绝空串与超长串', () => {
   assert.equal(isValidUid(''), false)
-  assert.equal(isValidUid('a'.repeat(65)), false)
-  assert.equal(isValidUid('a'.repeat(64)), true)
+  // ⚠️ 上限从 64 放宽到 128：多供应商的存储 key 会带 `provider:` 前缀
+  //（如 `qoder:01a0c249-e8f4-76df-a44a-bda7c5120f3b`），
+  // 加上前缀后很容易超过 64。
+  assert.equal(isValidUid('a'.repeat(129)), false)
+  assert.equal(isValidUid('a'.repeat(128)), true)
 })
 
 // ─────────────────────────── 续期判据 ───────────────────────────

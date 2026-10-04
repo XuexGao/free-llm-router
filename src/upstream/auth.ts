@@ -210,9 +210,29 @@ export async function pollLogin(input: {
  * 构成路径穿越（`workbuddy-../../evil.json`）。这里虽然不落文件系统，
  * 但作为 KV key 同样要守边界。
  */
+/**
+ * uid 是否可作为存储 key。
+ *
+ * ## ⚠️ 为什么允许冒号（实测踩到）
+ *
+ * 原规则只允许 `[A-Za-z0-9_-]`，于是 **CodeArts 的 uid 被拒**
+ * （它的 uid 形如 `ak:HSTAGZBUB301TH1GN1V9`，是
+ * 「AK 前缀 + access_key_id」的形态）。
+ * 用户看到的是「uid 含非法字符，已拒绝」，但那个 uid 是**上游给的**、
+ * 用户无法更改 —— 等于这家供应商永远导不进来。
+ *
+ * 本项目自己的存储 key 规则本来就允许冒号
+ * （多供应商用 `${provider}:${uid}` 做前缀，见 index.ts 的 storageUid），
+ * 故冒号在这里是安全的：它只出现在我们自己控制的 key 里，
+ * 不会被用作 SQL 标识符或路径。
+ *
+ * 仍然拒绝的字符：空白、引号、斜杠、反斜杠、控制字符 ——
+ * 那些会破坏 key 的可用性或日志可读性。
+ */
 export function isValidUid(uid: string): boolean {
-  if (uid === '' || uid.length > 64) return false
-  return /^[A-Za-z0-9_-]+$/.test(uid)
+  if (uid === '' || uid.length > 128) return false
+  // 允许字母数字、下划线、连字符、冒号（CodeArts 的 AK 前缀形态）
+  return /^[A-Za-z0-9_:-]+$/.test(uid)
 }
 
 /**

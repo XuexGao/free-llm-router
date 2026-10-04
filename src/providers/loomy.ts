@@ -22,7 +22,8 @@
  *    这正是本文件在 chat 路径上要额外 peek 一次 JSON 体的原因。
  * 3. **没有 refresh 端点**：`session` 是登录时声明 14 天得来的，过期只能重新登录
  *    （`src/loomy.ts:196-205`）。故 `extras.refreshable` 恒为 `false` ——
- *    这是**诚实标记**，不是遗漏。
+ *    这是**诚实标记**，不是遗漏。⇒ 本适配器**不实现** `refresh()`
+ *    （见文件中「刻意不实现 refresh()」一节）。
  *
  * ## 登录为什么可以在 Workers 上跑
  *
@@ -1044,6 +1045,10 @@ export const loomyProvider: Provider = {
   chat,
   balance,
   checkin,
+  // ⚠️ **刻意不提供 `refresh`**：Loomy 没有任何续期端点，`session` 过期只能
+  // 重新登录。完整依据与行为影响见本文件上方「刻意不实现 refresh()」一节。
+  // 不在这里写一个「探测型 refresh」是**遵守 `Provider.refresh` 的契约**
+  //（它必须返回新凭据）—— 详情见该节末尾对参考实现的对照说明。
   /**
    * 429（限流）与 402（余额耗尽）值得换号 —— 这是 `Provider` 的缺省语义。
    * 另外补上 401/403 与业务码 `100002`：Loomy **没有续期端点**
@@ -1056,6 +1061,30 @@ export const loomyProvider: Provider = {
     return bodyText.includes(LOOMY_AUTH_ERROR_CODE)
   },
 }
+
+// ── 🔴 本供应商**刻意不实现** `refresh()` ──────────────────────────
+//
+// Loomy **没有任何续期端点**：`session` 是登录时向服务端声明
+// `expire: 1209600`（14 天）得来的，响应里既没有 refresh_token、也没有到期
+// 时间戳，到期只能**重新短信/扫码登录**（`src/loomy.ts:196-205` 的
+// `isLoomyRefreshable` 恒返回 `false`；`src/loomy-auth.ts:1-19` 更把这一点
+// 列为「与其余 7 个 provider 的根本差异：不能续期」）。
+//
+// ⇒ 按 `types.ts` 的「不假装支持」纪律，这里**省略** `refresh()`，
+// 而不是编一个「看起来在续期、实际什么都没换」的方法 —— 后者会让网关在 401
+// 后白重放一次请求，并把「请重新登录」这条唯一有用的信息淹没在噪声里。
+//
+// ⚠️ 由此产生的**行为差异**（必须知道）：网关的续期重放分支要求
+// `provider.refresh !== undefined`（`gateway/server.ts:582`），故 Loomy 的
+// 凭据过期后会**直接**走失败/换号路径，而不是先续期再重放。
+// 这正是本家的实际情况：它**没有**可续期的东西，重放一次同样是 401。
+//
+// 📌 参考实现的对照（`deepseek-harness-codearts/src/loomy-auth.ts:315-341`）：
+// 它的 `refresh()` 在 Loomy 上被实现为**有效性探测**（打一次最便宜的只读端点
+// `GET /points/records?pageSize=1`），失效时抛 `RefreshTokenExpiredError`，
+// 用来把「登录过期」翻译成 UI 上的「凭证过期，请重新登录」。
+// 但 `Provider` 接口的 `refresh` 契约是「返回**新凭据**」（`types.ts:178-194`），
+// 一个不返回新凭据的探测并不满足该契约 —— 故这里选择省略，并把差异如实报告。
 
 // ── 登录（供面板调用；Provider 接口本身没有登录方法） ────────────────
 //

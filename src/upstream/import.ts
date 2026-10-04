@@ -224,7 +224,67 @@ export function importAuthDocuments(inputs: Array<{ raw: unknown; source?: strin
  *
  * 方便一次性粘贴：既接受 `[{...},{...}]`，也接受单个 `{...}`。
  */
+/**
+ * 宽容地把字符串解析成对象。
+ *
+ * ## ⚠️ 为什么需要（实测踩到）
+ *
+ * 凭据文件（如 DSH 的 `.credentials.yaml`）里，字符串字段可能含**裸控制字符**：
+ * 实测某条 WORKBUDDY 凭据的 `scope` 值是
+ * `"openid\n    profile offline_access\n    email"` —— YAML 折行把换行写成了
+ * **真实的 0x0A**，而 JSON 规范不允许字符串里出现裸控制字符。
+ * 于是 `JSON.parse` 报 `Invalid control character at ...`，整条凭据导入失败。
+ *
+ * 修法：把**字符串字面量内部**的裸控制字符转义后再解析。
+ * 只处理 0x00–0x1F（JSON 禁止的裸控制字符），不动其它字符。
+ *
+ * ⚠️ 只在**首次解析失败**时兜底，正常路径仍走标准 `JSON.parse` ——
+ * 不因为个别脏数据让所有凭据都走宽容路径（那会掩盖真实的格式错误）。
+ */
+export function parseJsonLenient(text: string): unknown {
+  const trimmed = text.trim()
+  if (trimmed === '') throw new ImportError('凭据字符串为空')
+  try {
+    return JSON.parse(trimmed)
+  } catch (first) {
+    // 把字符串字面量内部的裸控制字符转义（用状态机跟踪是否在字符串内）
+    let out = ''
+    let inString = false
+    let escaped = false
+    for (const ch of trimmed) {
+      if (escaped) { out += ch; escaped = false; continue }
+      if (ch === '\\') { out += ch; escaped = true; continue }
+      if (ch === '"') { inString = !inString; out += ch; continue }
+      const code = ch.charCodeAt(0)
+      if (inString && code < 0x20) {
+        // 转义成 \n / \r / \t，其余用 \uXXXX
+        if (code === 0x0a) out += '\\n'
+        else if (code === 0x0d) out += '\\r'
+        else if (code === 0x09) out += '\\t'
+        else out += '\\u' + code.toString(16).padStart(4, '0')
+        continue
+      }
+      out += ch
+    }
+    try {
+      return JSON.parse(out)
+    } catch {
+      // ⚠️ 宽容解析也失败 → 抛 `ImportError`（而不是原始的 SyntaxError）。
+      // 调用方（导入端点）按 `ImportError` 分类处理，抛别的类型会变成 500。
+      throw new ImportError(
+        `凭据不是合法 JSON：${first instanceof Error ? first.message : String(first)}`,
+      )
+    }
+  }
+}
+
 export function parseAuthPayload(payload: unknown): Array<{ raw: unknown; source?: string }> {
+  // ⚠️ 字符串输入：先宽容解析成对象再继续。
+  // 用户从凭据文件里复制的值常常是「被引号包住的 JSON 字符串」，
+  // 且可能含裸控制字符（见 parseJsonLenient 的说明）。
+  if (typeof payload === 'string') {
+    return [{ raw: parseJsonLenient(payload), source: '(string)' }]
+  }
   if (Array.isArray(payload)) {
     return payload.map((raw, i) => ({ raw, source: `[${i}]` }))
   }

@@ -176,6 +176,24 @@ export interface Provider {
   checkin?(credential: ProviderCredential, signal: AbortSignal): Promise<CheckinResult>
 
   /**
+   * 续期凭据（用 `refreshToken` 换新的 `accessToken`）。
+   *
+   * ## ⚠️ 为什么这是个必须补的缺口（实测踩到）
+   *
+   * 上游令牌都有寿命（实测本地凭据：cline 已过期 7 小时、raccoon 5 小时、
+   * codearts 的 `expires_at` 是 ISO 时间且已过）。**过期后所有请求都 401**，
+   * 而本项目**从来没有调用过续期** —— `upstream/auth.ts` 里的
+   * `refreshCredential` 写好了却没人调，等于账号用一天就废。
+   *
+   * 故这一层是必需的：过期不是「凭据坏了」，而是「该续期了」。
+   * 网关在收到 401 时会用本方法续期并**重放一次**请求。
+   *
+   * 返回**新凭据**（调用方负责落盘）；无法续期时抛 `ProviderError`
+   * 并说明原因（如「缺少 refresh_token，请重新登录」）。
+   */
+  refresh?(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential>
+
+  /**
    * 对象凭据的**判别式**（自动识别时用）。
    *
    * ## ⚠️ 为什么必须有它（实测踩到的严重缺陷）

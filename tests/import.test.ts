@@ -267,3 +267,23 @@ test('camelCase 与 snake_case 混用也能解析', () => {
   // 秒级仍会被放大
   assert.equal(credential.expiresAt, 1_700_000_000_000)
 })
+
+// ─────────────────── uid 校验（CodeArts 导不进来的根因） ───────────────────
+
+test('⚠️ isValidUid 必须接受 CodeArts 的 `ak:xxx` 形态', () => {
+  // 实测：CodeArts 的 uid 是 `ak:HSTAGZBUB301TH1GN1V9`（上游给的，
+  // 用户无法更改）。原规则只允许 [A-Za-z0-9_-]，把它拒了 ——
+  // 表现为「uid 含非法字符，已拒绝」，即这家永远导不进来。
+  assert.equal(isValidUid('ak:HSTAGZBUB301TH1GN1V9'), true)
+  // 本项目自己的多供应商前缀也用冒号
+  assert.equal(isValidUid('qoder:01a0c249-e8f4-76df-a44a-bda7c5120f3b'), true)
+})
+
+test('⚠️ isValidUid 仍必须拒绝会破坏 key 的字符', () => {
+  for (const bad of ['', ' ', 'a b', "a'b", 'a/b', 'a\\b', 'a\nb', 'a\tb']) {
+    assert.equal(isValidUid(bad), false, `应拒绝 ${JSON.stringify(bad)}`)
+  }
+  assert.equal(isValidUid('x'.repeat(200)), false, '超长应拒绝')
+})
+
+import { isValidUid } from '../src/upstream/auth.ts'

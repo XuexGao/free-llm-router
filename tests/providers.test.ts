@@ -400,3 +400,91 @@ test('⚠️ 每个真实对话动作都必须已注册（否则入队了却执�
     assert.ok(registered.has(action), `未注册的动作：${action}`)
   }
 })
+
+// ─────────────────── 凭据判别（本地 10 个真实账号暴露的问题） ───────────────────
+
+test('⚠️ qoder/trae/raccoon/codearts 必须有 matchesShape（否则被 buddy 兜底抢走）', () => {
+  // 实测：拿本地真实凭据跑 parseCredentialAnywhere，
+  // QODER / TRAE / RACCOON 的凭据全被判成 buddy ——
+  // 因为它们没有 matchesShape，自动识别时被跳过，
+  // 而 buddy 是默认供应商、永远参与且形态最宽松。
+  for (const id of ['qoder', 'trae', 'raccoon', 'codearts']) {
+    const p = findProvider(id)
+    assert.notEqual(p, undefined, `${id} 应已注册`)
+    assert.equal(typeof p?.matchesShape, 'function', `${id} 必须声明 matchesShape`)
+  }
+})
+
+test('⚠️ workbuddy（国际版）必须有 matchesShape（buddy 会明确拒绝它的凭据）', () => {
+  // 实测：WORKBUDDY 凭据的 domain 含 workbuddy.ai，
+  // buddy.parseCredential 会**明确拒绝**它（防止拿国内端点打国际账号）；
+  // 而 workbuddy 若没有 matchesShape 就不参与自动识别 →
+  // 最终报「没有任何供应商能解析这份凭据」。
+  const intl = findProvider('workbuddy')
+  assert.equal(typeof intl?.matchesShape, 'function', '国际版必须声明 matchesShape')
+  assert.equal(intl?.matchesShape?.({ domain: 'www.workbuddy.ai' }), true)
+  assert.equal(intl?.matchesShape?.({ domain: 'copilot.tencent.com' }), false)
+})
+
+test('⚠️ 各家 matchesShape 不得互相误判（用真实凭据的字段形态）', () => {
+  const cases: Array<[string, Record<string, unknown>, boolean]> = [
+    ['qoder', { access_token: 'x', security_oauth_token: 'y', machine_id: 'z' }, true],
+    ['qoder', { access_token: 'x', uid: 'u' }, false],
+    ['trae', { access_token: 'x', machine_id: 'm', device_id: 'd' }, true],
+    ['trae', { access_token: 'x', uid: 'u' }, false],
+    ['raccoon', { access_token: 'x', phone: '13800000000' }, true],
+    ['raccoon', { access_token: 'x', user_id: '7455957' }, true],
+    ['raccoon', { access_token: 'x', user_id: '5ad0e353-69c6-4732-b382-5769fc4b171c' }, false],
+    ['codearts', { access_key_id: 'ak', secret_access_key: 'sk' }, true],
+    ['codearts', { access_token: 'x' }, false],
+    ['opencode', { api_key: 'sk-abc' }, true],
+    ['opencode', { access_token: 'x' }, false],
+    ['zcode', { zcode_jwt: 'jwt', device_mid: 'd' }, true],
+    ['zcode', { access_token: 'x' }, false],
+    ['minimax', { minimax_user_id: 'm' }, true],
+    ['minimax', { access_token: 'x' }, false],
+  ]
+  for (const [id, input, expected] of cases) {
+    const p = findProvider(id)
+    assert.notEqual(p, undefined, `${id} 应已注册`)
+    assert.equal(p?.matchesShape?.(input), expected,
+      `${id} 对 ${JSON.stringify(Object.keys(input))} 应判 ${expected}`)
+  }
+})
+
+test('⚠️ JSON 文本形态的凭据必须被识别（不能当成裸令牌拒掉）', () => {
+  // 实测：用户从 .credentials.yaml 复制的值是「被引号包住的 JSON 文本」，
+  // 之前 parseCredentialAnywhere 把它当裸令牌，被 bareStringPattern 拒掉，
+  // 报「没有任何供应商能解析这份凭据」—— 而它其实是完整 JSON。
+  const jsonText = JSON.stringify({ access_token: 'x'.repeat(40), user_id: 'u1' })
+  const r = parseCredentialAnywhere(jsonText)
+  assert.equal(r.provider.id, 'buddy', 'JSON 文本应被正常解析成对象')
+})
+
+test('⚠️ JSON 里含裸控制字符时也要能解析（YAML 折行的真实形态）', () => {
+  // 实测：某凭据的 scope 字段被 YAML 折行写成了含真实换行符的字符串，
+  // JSON.parse 报 "Invalid control character"。宽容解析必须兜住。
+  const withNewline = '{"access_token":"' + 'x'.repeat(40) + '","scope":"openid\n    profile","user_id":"u1"}'
+  const r = parseCredentialAnywhere(withNewline)
+  assert.equal(r.provider.id, 'buddy', '含裸控制字符的 JSON 应能被宽容解析')
+})
+
+// ─────────────────── 续期（过期账号用不了的根因） ───────────────────
+
+test('⚠️ Provider 接口必须支持 refresh（否则过期令牌永不恢复）', () => {
+  // 实测：本地 cline/raccoon/codearts 的凭据都过期了（前两者过期 5–7 小时），
+  // 而本项目**从不调用续期** —— `upstream/auth.ts` 的 refreshCredential
+  // 写好了却没人调，等于账号用一天就废。
+  assert.ok(
+    'refresh' in (findProvider('buddy') as object),
+    'buddy 必须实现 refresh',
+  )
+})
+
+test('⚠️ 声明 refresh 的供应商必须也保持 refreshToken 非空才可能续期', () => {
+  // 续期的前提是凭据里有 refresh_token。若 parseCredential 把它丢了，
+  // refresh() 永远只会抛「缺少 refresh_token」。
+  const withRefresh = PROVIDERS.filter((p) => typeof p.refresh === 'function').map((p) => p.id)
+  assert.ok(withRefresh.length > 0, '至少应有一家实现了 refresh')
+  assert.ok(withRefresh.includes('buddy'), 'buddy 应有 refresh')
+})

@@ -26,6 +26,7 @@ import { opencodeProvider } from './opencode.js'
 import { loomyProvider } from './loomy.js'
 import { raccoonProvider } from './raccoon.js'
 import { zcodeProvider } from './zcode.js'
+import { parseJsonLenient } from '../upstream/import.js'
 
 /**
  * 全部供应商（**顺序有意义**：第 0 项是默认供应商）。
@@ -127,10 +128,33 @@ export function parseCredentialAnywhere(
   // ⚠️ 裸字符串要按形状**预筛**供应商。
   // 否则「任意非空字符串即收下」的那几家会把任何文本吞掉，产出必然 401 的
   // 假账号（实测 `'str'` 被 minimax 收下），而用户看到的是「导入成功」。
-  const bare = typeof input === 'string' ? input.trim() : undefined
+  // ⚠️ 字符串输入有两种可能，必须**先判别**：
+  //   (a) 一段 JSON 文本（用户从凭据文件里复制的值）；
+  //   (b) 一个裸令牌（如 `workos:xxx` / `sk-xxx` / `public`）。
+  //
+  // 之前把两者都当成裸令牌，于是 (a) 会被 `bareStringPattern` 拒掉，
+  // 报「没有任何供应商能解析这份凭据」—— 而它其实是一份完整的 JSON 凭据。
+  // 判别方式：以 `{` 或 `[` 开头就按 JSON 解析（宽容解析，容忍裸控制字符）。
+  let effective: unknown = input
+  let bare: string | undefined
+  if (typeof input === 'string') {
+    const trimmed = input.trim()
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        effective = parseJsonLenient(trimmed)
+      } catch (error) {
+        throw new ProviderError({
+          provider: 'unknown',
+          message: `凭据看起来是 JSON 但解析失败：${error instanceof Error ? error.message : String(error)}`,
+        })
+      }
+    } else {
+      bare = trimmed
+    }
+  }
   const record =
-    input !== null && typeof input === 'object' && !Array.isArray(input)
-      ? (input as Record<string, unknown>)
+    effective !== null && typeof effective === 'object' && !Array.isArray(effective)
+      ? (effective as Record<string, unknown>)
       : undefined
 
   for (const provider of ordered) {
@@ -162,7 +186,7 @@ export function parseCredentialAnywhere(
       }
     }
     try {
-      const credential = provider.parseCredential(input)
+      const credential = provider.parseCredential(effective)
       return { provider, credential }
     } catch (error) {
       errors.push(`${provider.id}: ${error instanceof Error ? error.message : String(error)}`)

@@ -24,6 +24,7 @@ import { planByName } from './taskrunner/plans.js'
 import { resolveUpstream, type Env } from './env.js'
 import { cliChatHeaders } from './upstream/headers.js'
 import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstream/auth.js'
+import type { AccountState } from './pool/state.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleChatCompletions } from './gateway/server.js'
@@ -97,6 +98,57 @@ async function authorized(request: Request, env: Env): Promise<boolean> {
  * 它会被直接取消 —— 表现为「对话成功但用量恒为 0」，且**没有任何错误日志**
  * （线上实测踩到；这正是本项目一直在警告的静默失败形态）。
  */
+/**
+ * 调供应商接口，遇到 401/403 **先续期再重试一次**。
+ *
+ * ## ⚠️ 为什么必须抽出来（实测踩到）
+ *
+ * 上游令牌有寿命，过期后所有请求 401。本项目原先**从不续期** ——
+ * 结果 cline/raccoon/codearts 三个账号的余额查询全报 auth_error，
+ * 而它们的模型目录明明拉得到（证明凭据本身没问题，只是 access token 过期）。
+ *
+ * 续期只试**一次**：续期后仍 401 说明 refresh token 也废了，再试只是白打上游。
+ *
+ * @returns `{ credential, value }`；续期成功时 `credential` 是新凭据（调用方已落盘）。
+ */
+async function withRefreshRetry<T>(
+  env: Env,
+  pool: DurableObjectStub<AccountPoolDO>,
+  providerId: string,
+  credential: ProviderCredential,
+  call: (credential: ProviderCredential) => Promise<T>,
+): Promise<{ credential: ProviderCredential; value: T }> {
+  try {
+    return { credential, value: await call(credential) }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    // ⚠️ 判据要**宽**，因为各家的鉴权错误文案千差万别：
+    // - WorkBuddy: `auth_error` / `upstream 401`
+    // - Raccoon:   `code=200003` + `authorization_verify_error`
+    // - Cline:     `http=401` + `Unauthorized`
+    // - 通用:       `403` / `Forbidden` / `token` / `unauthorized`
+    //
+    // 实测踩到：只匹配 `auth_error|401|403|Unauthorized|token` 时，
+    // Raccoon 的 `code=200003` 不含这些词 → 续期从不触发 →
+    // 账号明明有**有效的** refresh token（手工验证能换到新令牌）却一直 401。
+    //
+    // 宁可偶尔多试一次续期（续期失败会走 catch 落回原错误），
+    // 也不要漏掉真正的鉴权失败。
+    const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|200003|\b401\b|\b403\b/i.test(
+      message,
+    )
+    if (!isAuth) throw error
+
+    const provider = findProvider(providerId)
+    if (provider?.refresh === undefined) throw error
+
+    const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+    await pool.putCredential(credential.uid, fresh, Date.now())
+    console.warn(`[refresh] ${providerId} 续期成功，已回写凭据`)
+    return { credential: fresh, value: await call(fresh) }
+  }
+}
+
 /**
  * 把供应商登录拿到的凭据加密落盘（与 `/admin/import` 同一套 key 规则）。
  *
@@ -507,9 +559,22 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     if (!provider.capabilities.listModels) {
       return json({ provider: providerId, models: [], note: '该供应商不支持列出模型' })
     }
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const accounts = await pool.listAccounts('cn', Date.now())
-    const account = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId)
+    // ⚠️ **必须同时查 cn 与 global 两个 realm**。
+    // 账号按凭据里的 realm 分片存（如 WorkBuddy 国际版的凭据 realm 就是 global），
+    // 只查 cn 会让国际版账号「看起来不存在」—— 实测踩到：
+    // 面板显示「没有该供应商的账号」，而账号其实好好地存在 global 里。
+    let account: AccountState | undefined
+    let pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    for (const realm of ['cn', 'global']) {
+      const candidatePool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const accounts = await candidatePool.listAccounts(realm, Date.now())
+      const hit = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId)
+      if (hit !== undefined) {
+        account = hit
+        pool = candidatePool
+        break
+      }
+    }
     if (account === undefined) {
       return json({ provider: providerId, models: [], note: '没有该供应商的账号，无法拉取模型目录' })
     }
@@ -519,7 +584,10 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     // 国际版恒用官方域名。
     const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
     try {
-      const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+      // ⚠️ 走续期重试：过期令牌不该让用户看到「凭据坏了」
+      const { value: models } = await withRefreshRetry(env, pool, providerId, credential, (c) =>
+        bound.listModels(c, AbortSignal.timeout(20_000)),
+      )
       // 带上「是否被用户停用」标记，供面板渲染开关
       const disabled = await pool.getDisabledModels(providerId)
       const set = new Set(disabled)
@@ -576,7 +644,28 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       const credential = (await pool.getCredential(a.uid)) as LoginCredential | undefined
       if (credential === undefined) continue
       try {
-        const b = await fetchBalance({ uid: a.uid, accessToken: credential.accessToken }, env, now)
+        // ⚠️ **按供应商调它自己的余额接口**，不能一律用 WorkBuddy 的
+        // `fetchBalance` —— 那会让所有非 buddy 账号拿到 401
+        //（实测：cline/trae/qoder 等的余额全报 auth_error，
+        //  而它们的模型目录明明拉得到 485/38/17 个，证明凭据是好的）。
+        const pid = a.provider ?? DEFAULT_PROVIDER
+        const provider = findProvider(pid)
+        if (provider === undefined || !provider.capabilities.balance || provider.balance === undefined) {
+          out.push({
+            uid: a.uid, provider: pid, nickname: a.nickname,
+            skipped: true, reason: '该供应商不支持查余额',
+          })
+          continue
+        }
+        const boundProvider = pid === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        // ⚠️ 先把方法取出来再调：TS 无法透过三元表达式收窄 `boundProvider.balance`
+        // 的可选性（上面已判过 `provider.balance !== undefined`）。
+        const balanceFn = boundProvider.balance
+        if (balanceFn === undefined) continue
+        // ⚠️ 经 `unknown` 中转：存储里放的是 ProviderCredential（各供应商形态不同），
+        // 而 `getCredential` 的返回类型被标注成 LoginCredential（历史原因）。
+        // 边界处断言一次，符合本项目「跨存储边界断言一次」的纪律。
+        const b = await balanceFn(credential as unknown as ProviderCredential, AbortSignal.timeout(30_000))
         out.push({
           uid: a.uid,
           // ⚠️ 必须回传 provider：面板按供应商卡片汇总积分，

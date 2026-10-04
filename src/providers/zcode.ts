@@ -463,6 +463,38 @@ export function parseCredential(input: unknown): ProviderCredential {
 const EXTRA_DEVICE_MID = 'deviceMid'
 const EXTRA_APP_VERSION = 'appVersion'
 
+// ── 🔴 本供应商**刻意不实现** `refresh()` ──────────────────────────
+//
+// ZCode 的凭据是**静态的**：JWT 的 payload 里没有 `exp`（实测只有
+// `{user_id, token_version, sub, iat}`），也**没有任何续期端点**。
+// 参考实现的判据是两条显式常量
+//（`deepseek-harness-codearts/src/zcode.ts:592-595`）：
+//
+// ```ts
+// export function isZcodeExpired(_credential: ZcodeCredential): boolean { return false }
+// export const ZCODE_REFRESHABLE = false
+// ```
+//
+// 而且它的 `refreshAccountCredential` **根本不发网络请求** —— 只是「重新解析
+// 该账号自己的 ref 再写回它自己」（`src/zcode-auth.ts:1544-1600`）。
+// 参考项目在 `src/zcode-adapter.ts:162-168` 把这条契约写得更直白：
+// 「ZCode **不可续期**（凭据是静态的）。这个回调存在只是为了让适配器与其它
+// provider 同形；实现应当**重读凭据**而不是去调 refresh 端点」。
+//
+// ⚠️ `ZcodeLoginResult.bigmodelRefreshToken`（`src/zcode-login.ts:94-96`）
+// 看起来像一个可用的续期材料，但**参考仓库里没有任何地方消费它**
+// （只有解析与赋值两处，零调用方）—— 它是「服务端某天给了就记下来」的字段，
+// 而不是一条已跑通的续期链路。**不要**据此臆造一个续期请求。
+//
+// ⇒ 按 `types.ts` 的「不假装支持」纪律，这里**省略** `refresh()`。
+// 真失效时上游回 401 / 业务码 1002，由 `shouldRotate` 与错误分类处理
+//（换号或提示重新登录），而不是在这一层假装能续期。
+//
+// 📌 **行为影响**（必须知道）：网关的续期重放分支要求
+// `provider.refresh !== undefined`（`gateway/server.ts:582`），故 ZCode 的凭据
+// 失效后会**直接**走失败/换号路径。这对本家是正确的 —— 它没有可续的东西，
+// 重放一次同样是 401。
+
 // ─────────────────────────── 上游请求头 ───────────────────────────
 
 /**
@@ -1029,6 +1061,8 @@ export const zcodeProvider: Provider = {
   chat,
   balance,
   checkin,
+  // ⚠️ **刻意不提供 `refresh`**：ZCode 凭据是静态的、没有续期端点。
+  // 完整依据与行为影响见上方「刻意不实现 refresh()」一节。
   shouldRotate(status, bodyText) {
     // ⚠️ 风控（3012）**不该换号**：换号只会让另一个账号也吃一次冷却惩罚
     //（24h 内第 3 次起 24h、5 次停用）。

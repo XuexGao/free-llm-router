@@ -59,6 +59,20 @@ export const TRAE_CHECKIN_STATUS_PATH = '/trae/api/v2/ug/checkin_credits/status'
 export const TRAE_CHECKIN_CLAIM_PATH = '/trae/api/v2/ug/checkin_credits/claim'
 /** 积分余额（`trae.ts:63`）。 */
 export const TRAE_ENT_USAGE_PATH = '/trae/api/v2/pay/ide_user_ent_usage'
+/**
+ * 续期（ExchangeToken）端点（`trae.ts:55` 的 `TRAE_EXCHANGE_PATH`）。
+ *
+ * ⚠️ 它挂 **OAuth host**（`api.trae.com.cn`），不是 Agent host，也不是
+ * 签到用的 Ug host —— 三个 host 不可互换，挂错会 404 或 401。
+ */
+export const TRAE_EXCHANGE_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken'
+/**
+ * OAuth `client_id`（`trae-product.ts:270` 的 `TRAE.clientId`）。
+ *
+ * ⚠️ 它与 `TRAE_APP_ID` **不是同一个值**，且请求体字段名是大写开头的
+ * `ClientID` —— 照抄参考实现原样，别「规范化」成 `client_id`。
+ */
+export const TRAE_OAUTH_CLIENT_ID = 'en1oxy7wnw8j9n'
 
 /** App ID（`trae-product.ts` 的 `TRAE.appId`）。 */
 export const TRAE_APP_ID = '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8'
@@ -1526,7 +1540,230 @@ async function checkin(credential: ProviderCredential, signal: AbortSignal): Pro
 
 // ── 供应商实例 ──
 
+// ── 续期（ExchangeToken，**会轮换 refresh_token**） ──
+
+/**
+ * 用 `refresh_token` 换一份新凭据。
+ *
+ * ## 协议（`trae-auth.ts:378-428` 的 `refreshCredential`，逐字对齐）
+ *
+ * ```
+ * POST {TRAE_OAUTH_HOST}/cloudide/api/v3/trae/oauth/ExchangeToken
+ * headers: Content-Type: application/json + Accept + User-Agent（**无签名**）
+ * body:    { "ClientID": "en1oxy7wnw8j9n", "RefreshToken": "…",
+ *            "ClientSecret": "-", "UserID": "" }
+ * → { "Result": { "Token": "…", "RefreshToken": "…",
+ *                 "TokenExpireAt": <Unix 秒?>, "TokenExpireDuration": <秒>,
+ *                 "RefreshExpireAt": … } }
+ * ```
+ *
+ * ⚠️ **四个字段名都是大写开头**（`ClientID` / `RefreshToken` /
+ * `ClientSecret` / `UserID`），且 `ClientSecret` 是字面量 `'-'`、`UserID` 是
+ * 空串 —— 这两点是实测值，不是占位符（`trae-auth.ts:379-385`）。
+ *
+ * ⚠️ **`User-Agent` 必须带**：OAuth 端点无签名，只靠 UA 识别客户端
+ * （`trae.ts:408-414` 的 `traeOAuthHeaders`）。
+ *
+ * ## 🔴 `refresh_token` 会**轮换**
+ *
+ * ExchangeToken 每次调用都下发**新的** `RefreshToken`，且服务端侧旧的随之失效。
+ * 故必须**用新值覆盖**（新值为空时才保留旧的）—— 不覆盖会让下一次续期失败。
+ * 这正是参考实现 `applyTraeRefresh` 的写法（`trae.ts:614-640`），也是本项目
+ * 唯二会轮换 refresh token 的两家之一（另一家是 raccoon）。
+ *
+ * ## 终态判定（四条独立依据，任一成立即需重新登录）
+ *
+ * 1. HTTP 401/403（**最权威**：网关拒绝的是凭据本身）；
+ * 2. 响应体命中 session-dead 标记（`login` / `unauthorized` / `token invalid`…，
+ *    `trae-errors.ts:49-56` 的 `SESSION_DEAD_MARKERS`）；
+ * 3. 拿到 2xx、响应体也是 JSON，却**没有** accessToken —— 重试一万次也不会有；
+ * 4. 响应体是 HTML 错误页（网关在凭据失效时的典型表现，`json()` 会抛
+ *    `Unexpected token '<'`，那个报错对用户毫无信息量，故这里取文本再解析）。
+ *
+ * 其余（网络异常、5xx、429）→ `retryable: true`，**绝不**报成「请重新登录」。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  if (refreshToken === '') {
+    throw new ProviderError({
+      provider: 'trae',
+      message: 'TRAE 凭据缺少 refresh_token，无法自动续期，请重新导出凭据（或重新登录 TRAE 桌面端）',
+    })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${TRAE_OAUTH_HOST}${TRAE_EXCHANGE_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        // OAuth 端点**无签名**，只发 UA（`trae.ts:408-414`）。
+        'User-Agent': TRAE_USER_AGENT,
+      },
+      body: JSON.stringify({
+        ClientID: TRAE_OAUTH_CLIENT_ID,
+        RefreshToken: refreshToken,
+        ClientSecret: '-',
+        UserID: '',
+      }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    // 传输层失败：**不能**判为终态 —— 网络抖动不该让用户重新登录。
+    throw new ProviderError({
+      provider: 'trae',
+      retryable: true,
+      message: `TRAE 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  // ⚠️ 取文本再尝试解析（**不要**直接用 `response.json()`）：凭据失效时网关会回
+  // **HTML 错误页**，`json()` 抛出的 `Unexpected token '<'` 看不出真实原因
+  // （`trae-auth.ts:397-408` 的做法与理由）。
+  const text = await res.text().catch(() => '')
+  let parsed: Record<string, unknown> | undefined
+  try {
+    const candidate = JSON.parse(text) as unknown
+    if (typeof candidate === 'object' && candidate !== null && !Array.isArray(candidate)) {
+      parsed = candidate as Record<string, unknown>
+    }
+  } catch {
+    parsed = undefined
+  }
+
+  const result = parsed === undefined ? undefined : asRecordField(parsed, ['Result', 'result'])
+  const accessToken = result === undefined
+    ? ''
+    : (readString(result, 'Token') || readString(result, 'token') || readString(result, 'accessToken'))
+  const lower = text.toLowerCase()
+
+  if (res.status === 401 || res.status === 403) {
+    throw new ProviderError({
+      provider: 'trae',
+      httpStatus: res.status,
+      message: `TRAE 登录态已失效（HTTP ${res.status}），请重新登录`,
+    })
+  }
+
+  if (accessToken === '') {
+    // ⚠️ **只在拿不到令牌时才做「会话死亡」文本判定**：那些标记
+    // （`login` / `session` / `401`）太宽松，在**成功**响应里也可能偶然命中
+    // （例如随机令牌串里恰好含 `401`）。参考实现同样只在失败分支里分类
+    // （`trae-auth.ts:414-424` 的 `classifyTraeError` 调用点）。
+    if (SESSION_DEAD_MARKERS.some((marker) => lower.includes(marker))) {
+      throw new ProviderError({
+        provider: 'trae',
+        httpStatus: res.status,
+        message: `TRAE 登录态已失效（${text.trim().slice(0, 160) || '会话终止'}），请重新登录`,
+      })
+    }
+    // 拿到 2xx + JSON 却没有令牌：同样**不是**瞬时故障（`trae-auth.ts:415-425`）。
+    if (res.ok && parsed !== undefined) {
+      throw new ProviderError({
+        provider: 'trae',
+        message: 'TRAE 续期响应缺少访问令牌，请重新登录',
+      })
+    }
+    throw new ProviderError({
+      provider: 'trae',
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `TRAE 续期失败（HTTP ${res.status}）：${text.trim().slice(0, 200) || '(空响应体)'}`,
+    })
+  }
+
+  const nextRefreshRaw = result === undefined ? '' : readString(result, 'RefreshToken')
+  // ⚠️ 空值/缺失时保留旧值（见上方「会轮换」说明）。
+  const nextRefresh = nextRefreshRaw !== '' ? nextRefreshRaw : credential.refreshToken
+
+  const expiresAt = resolveTraeExpiry(result, accessToken, credential.expiresAt)
+
+  return {
+    // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（machine_id、device_id）
+    // —— 设备身份不在续期响应里，丢了会让后续请求被判为「异常设备」。
+    ...credential,
+    accessToken,
+    refreshToken: nextRefresh,
+    expiresAt,
+  }
+}
+
+/** 取嵌套对象字段（`trae.ts:435-437` 的 `data.Result ?? data.result`）。 */
+function asRecordField(source: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return value as Record<string, unknown>
+    }
+  }
+  return undefined
+}
+
+/**
+ * 从 ExchangeToken 响应算过期时刻（毫秒）。
+ *
+ * 判据顺序与参考 `applyTraeRefresh`（`trae.ts:614-640`）**逐条一致**：
+ * 1. `TokenExpireAt > 1e12` → 已经是毫秒；
+ * 2. `TokenExpireAt > 0` → 秒，×1000（⚠️ Go 端存的是 Unix 秒，见
+ *    `trae.ts:78-84`「转换时需 ×1000」，不乘会让凭据永远显示「已过期」）；
+ * 3. `TokenExpireDuration > 0` → 相对秒数，`now + ×1000`；
+ * 4. 都没有 → 试 JWT 的 `exp`；
+ * 5. 仍算不出 → **保留旧值**（不编造）。
+ */
+function resolveTraeExpiry(
+  result: Record<string, unknown> | undefined,
+  accessToken: string,
+  previous: number,
+): number {
+  if (result !== undefined) {
+    const tokenExpireAt = readNumber(result, 'TokenExpireAt') ?? readNumber(result, 'tokenExpireAt') ?? 0
+    if (tokenExpireAt > 1e12) return Math.round(tokenExpireAt)
+    if (tokenExpireAt > 0) return Math.round(tokenExpireAt * 1000)
+    const duration = readNumber(result, 'TokenExpireDuration') ?? readNumber(result, 'tokenExpireDuration') ?? 0
+    if (duration > 0) return Date.now() + Math.round(duration * 1000)
+  }
+  const fromJwt = decodeJwtExpMs(accessToken)
+  return fromJwt ?? previous
+}
+
+/** 从 JWT 载荷读 `exp`（秒 → 毫秒）；不是 JWT 或没有 exp 时返回 undefined。 */
+function decodeJwtExpMs(token: string): number | undefined {
+  const parts = token.split('.')
+  const payload = parts[1]
+  if (parts.length !== 3 || payload === undefined || payload === '') return undefined
+  try {
+    const padded = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const json = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4))
+    const claims = JSON.parse(json) as unknown
+    if (typeof claims !== 'object' || claims === null) return undefined
+    const exp = (claims as Record<string, unknown>)['exp']
+    if (typeof exp !== 'number' || !Number.isFinite(exp) || exp <= 0) return undefined
+    return Math.round(exp * 1000)
+  } catch {
+    return undefined
+  }
+}
+
+/** 会话死亡标记（对齐 Go 端 `sessionDeadMarkers`，`trae-errors.ts:49-56`）。 */
+const SESSION_DEAD_MARKERS: readonly string[] = [
+  'login', 'token 失效', 'token invalid', 'session', 'unauthorized', '401',
+]
+
+// ── 供应商实例 ──
+
 export const traeProvider: Provider = {
+  /**
+   * 对象判别式：TRAE 凭据的**独有**组合。
+   *
+   * ⚠️ TRAE 与 buddy 都有 `access_token` + `uid` + `expires_at`，
+   * 故必须靠 TRAE 独有的 `machine_id` + `device_id` 组合来判别
+   *（`device_id` 是 32 位 hex，见 trae.ts 的注释）。
+   * 实测：不加判别时本地 TRAE 凭据被判成 buddy。
+   */
+  matchesShape(input) {
+    return typeof input['machine_id'] === 'string' && typeof input['device_id'] === 'string'
+  },
   id: 'trae',
   name: 'TRAE（字节跳动）',
   capabilities: {
@@ -1550,6 +1787,19 @@ export const traeProvider: Provider = {
   chat,
   balance,
   checkin,
+  /**
+   * ✅ **可静默续期**：`POST {TRAE_OAUTH_HOST}/cloudide/api/v3/trae/oauth/ExchangeToken`
+   * （大写字段体的 OAuth 交换，完整说明见 {@link refresh}）。
+   *
+   * ⚠️ **它会轮换 `refresh_token`**：每次续期都下发新值、服务端侧旧值失效。
+   * 故 `refresh` 返回的凭据必须**整体落盘**，且 `refreshToken` 用新值覆盖
+   * —— 只更新 `accessToken` 会让下一次续期失败。
+   *
+   * 为什么必须有它：TRAE 的 access_token 寿命按小时计（实测 `exp` 约 14 天，
+   * 但服务端会提前作废），过期后所有 Agent/签到请求都被拒，
+   * 而凭据里的 `refresh_token` 完好。
+   */
+  refresh,
   /**
    * 换号判据：
    * - 429（软限流）/ 402 / 401 / 403 值得换号；

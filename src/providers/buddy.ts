@@ -36,6 +36,7 @@ import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
+import { refreshCredential } from '../upstream/auth.js'
 import {
   ProviderError,
   type ChatRequest,
@@ -156,7 +157,9 @@ function makeParseCredential(config: VariantConfig) {
       refreshToken: first.refreshToken,
       expiresAt: first.expiresAt,
       nickname: first.nickname,
-      extras: { realm: first.realm, domain: first.domain },
+      // ⚠️ `enterpriseId` 必须存下来：续期请求要带 `X-Enterprise-Id` 头
+      //（见 upstream/auth.ts 的 refreshCredential），丢了会导致企业账号续期失败。
+      extras: { realm: first.realm, domain: first.domain, enterpriseId: first.enterpriseId },
     }
   }
 }
@@ -288,6 +291,35 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     }
   }
 
+  /**
+   * 续期凭据。
+   *
+   * ⚠️ 国内版与国际版的**续期域不同**：
+   * - 国内版 → `www.codebuddy.cn`
+   * - 国际版 → `www.workbuddy.ai`
+   *（见 upstream/auth.ts 的 `origin` 判定，按 `realm` 选）。
+   */
+  async function refresh(credential: ProviderCredential): Promise<ProviderCredential> {
+    const realm = credential.extras['realm'] ?? 'cn'
+    const r = await refreshCredential({
+      chatBase: bases.chat,
+      realm,
+      refreshToken: credential.refreshToken,
+      accessToken: credential.accessToken,
+      uid: credential.uid,
+      enterpriseId: credential.extras['enterpriseId'] ?? '',
+    })
+    return {
+      ...credential,
+      accessToken: r.accessToken,
+      // ⚠️ 上游可能不返回新 refreshToken —— 此时**保留旧的**，
+      // 否则下一次续期会因为 refreshToken 为空而彻底失败。
+      refreshToken: r.refreshToken === '' ? credential.refreshToken : r.refreshToken,
+      expiresAt: r.expiresAt,
+      extras: { ...credential.extras, domain: r.domain },
+    }
+  }
+
   const provider: Provider = {
     id: config.id,
     name: config.name,
@@ -301,6 +333,31 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
         ? {}
         : { checkinBlockedReason: config.checkinBlockedReason }),
     },
+    /**
+     * 对象判别式。
+     *
+     * ⚠️ 国内版（buddy）**不声明** —— 它是默认供应商，自动识别时永远参与，
+     * 且形态最宽松，作为兜底最合适（声明了反而会把它自己排除掉）。
+     *
+     * ⚠️ 国际版（workbuddy）**必须声明** —— 否则对象形态下它不参与自动识别，
+     * 国际版凭据会被 buddy 收下并**在 parseCredential 里被拒**
+     *（buddy 明确拒绝 domain 含 workbuddy.ai 的凭据），
+     * 于是最终报「没有任何供应商能解析这份凭据」——
+     * 实测本地 WORKBUDDY_ACCOUNT 凭据就卡在这里。
+     *
+     * 判据：`domain` 或 `enterprise_id` 指向 workbuddy.ai，
+     * 或显式带 `platform: 'workbuddy-ai'`。
+     */
+    ...(config.id === WORKBUDDY_INTL.id
+      ? {
+          matchesShape(input: Record<string, unknown>) {
+            const domain = input['domain']
+            if (typeof domain === 'string' && domain.includes('workbuddy.ai')) return true
+            const platform = input['platform']
+            return typeof platform === 'string' && platform === 'workbuddy-ai'
+          },
+        }
+      : {}),
     parseCredential: makeParseCredential(config),
     listModels,
     chat,
@@ -308,6 +365,7 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     // ⚠️ 只在声明支持时挂上 —— 国际版没有签到接口，
     // 挂上去会让「一键签到」对它发起必然失败的请求。
     ...(config.checkin ? { checkin } : {}),
+    refresh,
   }
 
   return provider

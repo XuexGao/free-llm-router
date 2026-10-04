@@ -98,6 +98,35 @@ const CLAIMED_STATUSES: readonly string[] = ['CLAIMED', 'CONFIRMED', 'CONSUMED']
 /** 控制面请求超时（毫秒）。与源实现 `codearts-credits.ts:111` 的 30s 同口径。 */
 const REQUEST_TIMEOUT_MS = 30_000
 
+// ── 续期（华为 STS OAuth2 + DPoP） ──
+
+/**
+ * 华为 STS token 端点（`src/oauth.ts:10` 的 `STS_TOKEN_ENDPOINT`）。
+ *
+ * ⚠️ 这是**唯一**的续期入口，与推理/积分那套签名端点完全不同源：
+ * 它认 OAuth2 表单 + DPoP proof，而不是 `SDK-HMAC-SHA256`。
+ */
+export const CODEARTS_STS_TOKEN_ENDPOINT = 'https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens'
+
+/** OAuth client_id（即其 URI scheme，`src/oauth.ts:8` 的 `CLIENT_ID`）。 */
+const CODEARTS_OAUTH_CLIENT_ID = 'codearts-agent'
+
+/** 续期请求超时（`src/oauth.ts:12` 的 `TOKEN_TIMEOUT_MS = 60_000`）。 */
+const TOKEN_TIMEOUT_MS = 60_000
+
+/** 凭据 extras 里承载 PKCE / DPoP 材料的键名（续期必需，见下方 parseCredential）。 */
+const EXTRA_CODE_VERIFIER = 'codeVerifier'
+const EXTRA_DPOP_JWK = 'dpopPrivateKeyJwk'
+
+/** ES256 私钥 JWK（P-256；`d` 是私钥材料）。 */
+interface DpopPrivateJwk extends Record<string, unknown> {
+  kty: string
+  crv: string
+  x: string
+  y: string
+  d: string
+}
+
 /**
  * snap-access 端点的**签名后追加**头（不参与 canonical request）。
  *
@@ -491,6 +520,22 @@ function parseCredential(input: unknown): ProviderCredential {
   const nickname = pickString(root, ['nickname', 'user_name', 'userName', 'name']) || 'CodeArts'
   const expiresAt = pickExpiresAt(root)
 
+  /**
+   * ⚠️ **续期所需的另外两样材料必须一起存下来**（`types.ts:931-934` 的
+   * `CodeArtsCredential`）：`code_verifier`（PKCE，服务端拿它的 S256 对上授权
+   * 时的 code_challenge）与 `dpop_private_key_jwk`（签 DPoP proof，服务端拿它
+   * 与 refresh_token 里的 `cnf.jkt` 比对）。
+   *
+   * 少任一样，`refresh()` 只能抛「材料不全，请重新登录」—— 从而把一份
+   * **本可自愈**的凭据变成必须人工重登的废凭据（参考 `src/service.ts:18-30`
+   * 的 `isCodeArtsRefreshable` 就是这三样缺一不可）。
+   */
+  const extras: Record<string, string> = { ak, sk }
+  const codeVerifier = pickString(root, ['code_verifier', 'codeVerifier'])
+  if (codeVerifier !== '') extras[EXTRA_CODE_VERIFIER] = codeVerifier
+  const dpopJwk = asJwk(root['dpop_private_key_jwk'] ?? root['dpopPrivateKeyJwk'])
+  if (dpopJwk !== undefined) extras[EXTRA_DPOP_JWK] = JSON.stringify(dpopJwk)
+
   return {
     provider: 'codearts',
     uid,
@@ -498,8 +543,29 @@ function parseCredential(input: unknown): ProviderCredential {
     refreshToken: pickString(root, ['refresh_token', 'refreshToken']),
     expiresAt,
     nickname,
-    extras: { ak, sk },
+    extras,
   }
+}
+
+/** 取出一个合法的 ES256 私钥 JWK（形状不符返回 undefined，绝不半信半疑地用）。 */
+function asJwk(value: unknown): DpopPrivateJwk | undefined {
+  if (typeof value === 'string' && value.trim().startsWith('{')) {
+    try {
+      return asJwk(JSON.parse(value) as unknown)
+    } catch {
+      return undefined
+    }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const kty = record['kty']
+  const crv = record['crv']
+  const x = record['x']
+  const y = record['y']
+  const d = record['d']
+  if (kty !== 'EC' || crv !== 'P-256') return undefined
+  if (typeof x !== 'string' || typeof y !== 'string' || typeof d !== 'string') return undefined
+  return { kty, crv, x, y, d }
 }
 
 /**
@@ -993,9 +1059,266 @@ async function checkin(credential: ProviderCredential, signal: AbortSignal): Pro
   }
 }
 
+// ── 续期（OAuth2 refresh_token + DPoP） ──
+
+/** base64url 编码（**去 padding**，DPoP 的 `jti` / JWS 段都用这个形态）。 */
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/** UTF-8 文本 → base64url。 */
+function base64UrlFromText(text: string): string {
+  return base64UrlEncode(new TextEncoder().encode(text))
+}
+
+/**
+ * 用持久化的 DPoP 私钥签一个 `dpop+jwt`（`src/oauth.ts:74-85` 的 `signDpopJws`）。
+ *
+ * 载荷字段与参考**逐字一致**：`htm`（HTTP 方法）、`htu`（完整 URL，**不含 query**）、
+ * `iat`（秒）、`jti`（32 字节 hex）。头部必须带 `jwk` —— 服务端要用公钥验签，
+ * 并把它与 refresh_token 里的 `cnf.jkt` 比对。
+ */
+async function signDpopJws(jwk: DpopPrivateJwk, htm: string, htu: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'jwk',
+    jwk as unknown as JsonWebKey,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign'],
+  )
+  const header = base64UrlFromText(JSON.stringify({
+    alg: 'ES256',
+    typ: 'dpop+jwt',
+    // ⚠️ 只带公钥字段：把 `d` 放进 `jwk` 会**泄漏私钥**给上游（且不符合 RFC 9449）。
+    jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
+  }))
+  const jtiBytes = crypto.getRandomValues(new Uint8Array(32))
+  const payload = base64UrlFromText(JSON.stringify({
+    htm,
+    htu,
+    iat: Math.floor(Date.now() / 1000),
+    jti: toHex(jtiBytes),
+  }))
+  const signingInput = `${header}.${payload}`
+  const signature = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    key,
+    new TextEncoder().encode(signingInput),
+  )
+  // ⚠️ WebCrypto 的 ECDSA 输出就是 JWS 要的 **raw r||s**（各 32 字节），
+  // 与 jose 的产物一致，**不需要**再做 DER 转换。
+  return `${signingInput}.${base64UrlEncode(new Uint8Array(signature))}`
+}
+
+/**
+ * 用 `refresh_token` 换一份新凭据。
+ *
+ * ## 协议（`src/oauth.ts:96-176`，逐字对齐）
+ *
+ * ```
+ * POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens
+ * headers: DPoP: <ES256 dpop+jwt>   Content-Type: application/x-www-form-urlencoded
+ * body:    client_id=codearts-agent&code_verifier=…&grant_type=refresh_token
+ *          &refresh_token=…
+ * → { credentials: { access_key_id, secret_access_key, security_token, expiration },
+ *     refresh_token }
+ * ```
+ *
+ * ⚠️ **`code_verifier` 必须重发**：服务端拿它的 S256 对上授权时的 challenge，
+ * 少了它直接换不到 token。而它**不在** access token 里，只能靠
+ * {@link parseCredential} 一起存进 `extras`（这就是上面要存它的原因）。
+ *
+ * ⚠️ **DPoP proof 的 `htu` 是完整 URL 且不带 query**（参考实现传的就是常量
+ * `STS_TOKEN_ENDPOINT` 本身）。
+ *
+ * ## 终态判定（**只认 refresh_token 自己失效的信号**，`src/oauth.ts:122-141`）
+ *
+ * - `error === 'invalid_grant'` 或 `error_code` 含 `ExpiredRefreshToken` → 终态；
+ * - ⚠️ **`InvalidDPoPHeader` 不算终态**：它说的是「这次 proof 没过校验」
+ *   （时钟偏差、重放判定、网关抖动），与 refresh_token 还能不能用无关。
+ *   把它当终态会把材料完好的账号一步标死，只能人工重登
+ *   （参考项目为此专门记录了一次真实缺陷）。
+ * - 网络异常 → `retryable: true`。
+ *
+ * ## 返回值
+ *
+ * 新 `security_token` 写进 `accessToken`；**AK/SK 被服务端轮换时用新值**，
+ * 未下发时保留旧的（`extras.ak` / `extras.sk` 同时也是 uid 的来源，不能丢）。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  const codeVerifier = (credential.extras[EXTRA_CODE_VERIFIER] ?? '').trim()
+  const jwkRaw = credential.extras[EXTRA_DPOP_JWK] ?? ''
+  const jwk = asJwk(jwkRaw)
+
+  // 三样缺一即不可静默续期（参考 `src/service.ts:18-30` 的 `isCodeArtsRefreshable`）。
+  const missing: string[] = []
+  if (refreshToken === '') missing.push('refresh_token')
+  if (codeVerifier === '') missing.push('code_verifier')
+  if (jwk === undefined) missing.push('dpop_private_key_jwk')
+  // ⚠️ 把 `jwk === undefined` 放进同一个条件里（而不是单独一条 `if`）：
+  // 这样通过之后 TypeScript 能**收窄** `jwk` 的类型，否则下面签名处报
+  // 「可能为 undefined」—— 而那句本该不可达的判空只是为了让类型系统满意。
+  if (jwk === undefined || missing.length > 0) {
+    // ⚠️ 这不是「网络抖动」，重试一万次也不会好 —— 明确让用户重新登录，
+    // 并说清缺什么（否则用户看到「续期失败」不知道该补哪个字段）。
+    throw new ProviderError({
+      provider: 'codearts',
+      message: `CodeArts 凭据缺少自动续期所需的材料（${missing.join('、')}），无法自动续期，`
+        + '请重新登录「码道」并导出完整凭据（新版 IAM OAuth 凭据除三项 AK/SK/security_token 外，'
+        + '还带 `refresh_token`、`code_verifier` 与 `dpop_private_key_jwk`）。',
+    })
+  }
+
+  let dpop: string
+  try {
+    dpop = await signDpopJws(jwk, 'POST', CODEARTS_STS_TOKEN_ENDPOINT)
+  } catch (error) {
+    // 本地密码学失败（JWK 损坏等）→ 终态：换多少次请求都签不出来。
+    throw new ProviderError({
+      provider: 'codearts',
+      message: `CodeArts DPoP 签名失败（dpop_private_key_jwk 可能已损坏），请重新登录：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const form = new URLSearchParams({
+    client_id: CODEARTS_OAUTH_CLIENT_ID,
+    code_verifier: codeVerifier,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  })
+
+  let res: Response
+  try {
+    res = await fetch(CODEARTS_STS_TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        DPoP: dpop,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(TOKEN_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    // 传输层失败：**不能**判为终态 —— 网络抖动不该让用户重新登录。
+    throw new ProviderError({
+      provider: 'codearts',
+      retryable: true,
+      message: `CodeArts 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+  let parsed: Record<string, unknown> = {}
+  try {
+    const candidate = JSON.parse(text) as unknown
+    if (typeof candidate === 'object' && candidate !== null && !Array.isArray(candidate)) {
+      parsed = candidate as Record<string, unknown>
+    }
+  } catch {
+    // 非 JSON（网关 HTML 错误页）：保持空对象，由下方按状态码归类。
+  }
+
+  const credentials = readRecord(parsed, 'credentials')
+  const securityToken = readString(credentials, 'security_token')
+  const errorCode = readString(parsed, 'error_code')
+  const errorName = readString(parsed, 'error')
+
+  /**
+   * ⚠️ **`InvalidDPoPHeader` 必须先于「401/403 = 终态」被拦下，且判为可重试**。
+   *
+   * 参考项目为这条专门记了一次真实缺陷（`src/oauth.ts:124-141`）：把
+   * `InvalidDPoPHeader` 当终态，会把**材料完好**的账号（refresh_token 还有
+   * 十几天寿命、code_verifier 与 DPoP 私钥都在）一步标成「不可续期」，
+   * 重启也不自愈，用户只能重新登录。
+   *
+   * 它说的是「**这次** proof 没通过校验」—— 时钟偏差让 `iat` 落在窗口外、
+   * proof 被判重放、网关抖动，全都是**一次请求层面**的拒绝，
+   * 与「refresh_token 还能不能用」无关（该错误实测以 HTTP 401 下发，
+   * 故不能只看状态码）。
+   *
+   * 两边的代价不对称：判可重试最多再发一次 HTTP 请求；判终态则要人工重登。
+   */
+  if (errorName.includes('InvalidDPoPHeader')) {
+    throw new ProviderError({
+      provider: 'codearts',
+      httpStatus: res.status,
+      retryable: true,
+      // ⚠️ 文案里**刻意不出现**「重新登录」四个字：调用方按该子串判定终态
+      //（同 `raccoon.ts:1245-1247` 记录的判据形态）。写成「无需重新登录」
+      // 会被子串匹配**误判成终态**，正好把这条可重试的错误变成账号报废。
+      message: `CodeArts 续期被拒（${errorName}：本次 DPoP proof 未通过校验，多为时钟偏差或重放判定），`
+        + '将重试；凭据本身仍然有效，无需人工干预',
+    })
+  }
+
+  // 终态判据**只认这两条**（见上方说明，`InvalidDPoPHeader` 已被上面的分支摘出）。
+  if (errorName === 'invalid_grant' || errorCode.includes('ExpiredRefreshToken')) {
+    throw new ProviderError({
+      provider: 'codearts',
+      httpStatus: res.status,
+      message: `CodeArts 登录态已过期（refresh_token 已失效：${errorName || errorCode}），请重新登录`,
+    })
+  }
+
+  if (!res.ok || securityToken === '') {
+    // 非终态的失败（5xx / 429 / 网关错误）属可重试。
+    const detail = text.trim() === '' ? '(空响应体)' : text.slice(0, 200)
+    throw new ProviderError({
+      provider: 'codearts',
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `CodeArts 续期失败（HTTP ${res.status}）：${detail}`,
+    })
+  }
+
+  // AK/SK 被轮换时用新值；未下发时保留旧的（它们是签名必需，丢了整份凭据就废了）。
+  const nextAk = readString(credentials, 'access_key_id')
+  const nextSk = readString(credentials, 'secret_access_key')
+  const nextRefreshRaw = readString(parsed, 'refresh_token')
+  // ⚠️ 服务端可能只回新的 access 三元组（不带新 refresh_token）——
+  // 此时必须保留旧值，否则续期一次就把账号变成不可续期。
+  const nextRefresh = nextRefreshRaw !== '' ? nextRefreshRaw : credential.refreshToken
+
+  // 过期时间来自 `credentials.expiration`（ISO 串）；取不到则保留旧值，不编造。
+  const expiration = readString(credentials, 'expiration')
+  const parsedExpiry = expiration === '' ? Number.NaN : Date.parse(expiration)
+  const expiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : credential.expiresAt
+
+  return {
+    // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（ak、sk 之外的
+    // code_verifier 与 dpop 私钥必须原样留着，否则**下一次**续期会失败）。
+    ...credential,
+    accessToken: securityToken,
+    refreshToken: nextRefresh,
+    expiresAt,
+    extras: {
+      ...credential.extras,
+      ...(nextAk === '' ? {} : { ak: nextAk }),
+      ...(nextSk === '' ? {} : { sk: nextSk }),
+      [EXTRA_CODE_VERIFIER]: codeVerifier,
+      [EXTRA_DPOP_JWK]: JSON.stringify(jwk),
+    },
+  }
+}
+
 // ── 供应商实例 ──
 
 export const codeartsProvider: Provider = {
+  /**
+   * 对象判别式：CodeArts 用 **AK/SK 签名**，字段与其它家完全不重叠。
+   *
+   * 有 `access_key_id` + `secret_access_key` 就一定是它。
+   */
+  matchesShape(input) {
+    return (
+      typeof input['access_key_id'] === 'string'
+      && typeof input['secret_access_key'] === 'string'
+    )
+  },
   id: 'codearts',
   name: 'CodeArts（华为云码道）',
   capabilities: {
@@ -1019,6 +1342,18 @@ export const codeartsProvider: Provider = {
   chat,
   balance,
   checkin,
+  /**
+   * ✅ **可静默续期**：`POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens`
+   * （OAuth2 `grant_type=refresh_token` + DPoP proof，完整说明见 {@link refresh}）。
+   *
+   * 为什么必须有它（实测踩到）：本地 CODEARTS 凭据的 `expires_at` 是 ISO 串且
+   * **已经过期**，于是所有签名请求 401 `APIG.0301`；而凭据里的 `refresh_token`、
+   * `code_verifier`、`dpop_private_key_jwk` 三样齐全、还能用。
+   *
+   * ⚠️ 与别家不同的是**续期材料**：DPoP 私钥与 PKCE verifier 现在存于
+   * `extras`（旧凭据没有这两项 → 只能重新登录，见 {@link parseCredential}）。
+   */
+  refresh,
   /**
    * 换号判据：429（限流）与 402（额度耗尽）值得换号；
    * **401/403 也值得换号** —— CodeArts 经 APIG 网关鉴权，SecurityToken

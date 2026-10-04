@@ -952,6 +952,29 @@ export async function fetchLoginRewardStatus(
 // ── 供应商导出 ──────────────────────────────────────────────────────
 
 export const raccoonProvider: Provider = {
+  /**
+   * 对象判别式：Raccoon 凭据的**独有**字段。
+   *
+   * ⚠️ 它的 `access_token` + `user_id` 与 buddy 重叠，必须靠
+   * `phone`（Raccoon 登录必带手机号）或 `user_id` 的数字形态判别。
+   * 实测：不加判别时本地 RACCOON 凭据被判成 buddy（uid=7455957）。
+   */
+  /**
+   * 续期：`POST {base}/api/web/auth/v1/refresh`（body 带 refresh_token）。
+   *
+   * 实测本地凭据已过期 5 小时 → 所有请求 401；
+   * 接上续期后应能自动恢复，而不需要用户重新扫码。
+   */
+  async refresh(credential, signal) {
+    return await refreshRaccoonCredential(credential, signal)
+  },
+
+  matchesShape(input) {
+    if (typeof input['phone'] === 'string' && input['phone'] !== '') return true
+    // Raccoon 的 user_id 是**纯数字**（buddy 的 user_id 是 UUID 形态）
+    const uid = input['user_id']
+    return typeof uid === 'string' && /^\d+$/.test(uid)
+  },
   id: 'raccoon',
   name: 'Raccoon（商汤）',
   capabilities: {

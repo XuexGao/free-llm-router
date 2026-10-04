@@ -53,9 +53,9 @@
  *
  * - **不解析 SSE**：`chat()` 返回上游原始 `Response`，由网关逐帧透传
  *   （Workers Free 只有 10ms CPU，这一层禁止缓冲，见 `gateway/stream.ts` 头注释）；
- * - **不做 token 续期**：`Provider` 接口没有续期方法，凭据过期由调用方重新导入
- *   （续期协议是 `POST /api/v1/auth/refresh` + 驼峰 `{refreshToken, grantType}`，
- *   见 `src/cline.ts:250-268` —— 将来加时要照抄这两个**非标准**字段名）。
+ * - **续期已实现**：`refresh()` 走 `POST /api/v1/auth/refresh` + 驼峰
+ *   `{refreshToken, grantType}`（见 {@link refresh} 的说明）。这是**必补的缺口**：
+ *   实测本地凭据已过期 7 小时，没有续期则所有请求 401 且永不恢复。
  */
 
 import {
@@ -91,6 +91,16 @@ const RECOMMENDED_MODELS_PATH = '/api/v1/ai/cline/recommended-models'
 const MODELS_TIMEOUT_MS = 20_000
 /** 单次余额请求超时（对齐参考 `CLINE_CREDITS_TIMEOUT_MS = 30_000`）。 */
 const BALANCE_TIMEOUT_MS = 30_000
+
+/**
+ * 续期路径（`src/cline-product.ts:299` 的 `CLINE_REFRESH_PATH`）。
+ *
+ * 与注册路径（`/api/v1/auth/register`）**不是**同一个端点，别混用：
+ * 续期只认 `refreshToken`，注册只认 `accessToken` + `refreshToken`。
+ */
+const REFRESH_PATH = '/api/v1/auth/refresh'
+/** 单次续期请求超时（对齐参考 `CLINE_HTTP_TIMEOUT_MS = 30_000`，`src/cline-oauth.ts:77`）。 */
+const REFRESH_TIMEOUT_MS = 30_000
 
 /**
  * 访问令牌前缀。**必须原样保留**。
@@ -1040,6 +1050,158 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
   }
 }
 
+// ─────────────────────────── 续期 ───────────────────────────
+
+/**
+ * 用 `refreshToken` 换一份新凭据。
+ *
+ * ## 协议（逐条来自参考实现，不是猜的）
+ *
+ * ```
+ * POST {API_BASE}/api/v1/auth/refresh
+ * headers: Content-Type: application/json + Accept + 官方客户端头
+ * body:    { "refreshToken": "…", "grantType": "refresh_token" }   ← 驼峰！
+ * → { "success": true, "data": { "accessToken": "workos:eyJ…",
+ *       "refreshToken": "…", "expiresAt": "2026-09-25T05:23:47.000Z",
+ *       "userInfo": { "clineUserId": "usr-…", … } } }
+ * ```
+ *
+ * ⚠️ **两个字段名都是驼峰**（`refreshToken` / `grantType`），不是 OAuth 标准的
+ * `refresh_token` / `grant_type`：源码 `refreshClineToken` 就是
+ * `JSON.stringify({ refreshToken: current.refresh, grantType: "refresh_token" })`
+ * （`src/cline.ts:263-269` 的 `clineRefreshBody`）。写错字段名服务端**不会**
+ * 报「缺字段」，而是回一个泛化的认证失败，极难定位。
+ *
+ * ## 三条必须守住的语义（参考 `applyClineRefresh`，`src/cline.ts:213-231`）
+ *
+ * 1. **服务端可能只回新的 `accessToken`**（不带新 `refreshToken`）——
+ *    此时必须**保留旧的**，否则续期一次就把账号变成不可续期。
+ * 2. **`uid` / `nickname` / `extras` 一律从旧凭据展开保留** —— 它们不在续期
+ *    响应里（`accountId` 在 `userInfo` 里，但实测可能缺省），丢了会让账号卡片
+ *    失去展示名，并让余额端点（只认 `usr-…`）直接失败。
+ * 3. **续期响应的 `accessToken` 是裸 JWT**（实测），必须走
+ *    {@link clineBearerValue} 补回 `workos:` 前缀 —— 少了前缀请求头就是 401，
+ *    而文案会误导成「客户端版本过旧」。
+ *
+ * ## 终态与瞬时失败的区分
+ *
+ * - 401/403 或错误体里出现 `invalid_grant` / `expired` → **终态**，提示重新登录；
+ * - 网络异常 / 5xx / 429 → `retryable: true`（网络失败**绝不能**报成「请重新登录」）；
+ * - 200 但响应里没有令牌 → 终态（重试一万次也不会有令牌）。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  if (refreshToken === '') {
+    // ⚠️ 文案必须含连续的「重新登录」四个字：调用方按该子串判定终态。
+    throw new ProviderError({
+      provider: ID,
+      message: 'Cline 凭据缺少 refresh_token，无法自动续期，请重新登录（或重新导出凭据）',
+    })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${API_BASE}${REFRESH_PATH}`, {
+      method: 'POST',
+      // ⚠️ **不带 `Authorization`**：续期只认 body 里的 `refreshToken`（参考
+      // `src/cline-auth.ts:395-405` 的请求头就是 Content-Type + Accept +
+      // 官方客户端头）。带一个空 Bearer 只会给上游制造额外的拒绝理由。
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...CLIENT_HEADERS,
+      },
+      body: JSON.stringify({ refreshToken, grantType: 'refresh_token' }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(REFRESH_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    // 传输层失败：**不能**判为终态 —— 网络抖动不该让用户重新登录。
+    throw new ProviderError({
+      provider: ID,
+      retryable: true,
+      message: `Cline 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+
+  // 终态判据优先于一切：401/403 直接说明 refresh_token 不再被接受。
+  const lower = text.toLowerCase()
+  if (res.status === 401 || res.status === 403) {
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      message: `Cline 登录态已失效（HTTP ${res.status}），请重新登录（refresh_token 已被拒绝）`,
+    })
+  }
+  // 错误体里的 `invalid_grant` / `expired` 同样是终态（OAuth 的标准语义）。
+  if (lower.includes('invalid_grant') || lower.includes('invalid grant') || lower.includes('expired')) {
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      message: `Cline 登录态已失效（${detailOf(text)}），请重新登录`,
+    })
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `Cline 续期响应不是 JSON（HTTP ${res.status}）：${text.slice(0, 160)}`,
+    })
+  }
+  const record = asRecord(parsed) ?? {}
+
+  if (!res.ok || record.success === false) {
+    // 非 401/403 的失败（5xx / 429）属可重试。
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `Cline 续期失败（HTTP ${res.status}）：${detailOf(text)}`,
+    })
+  }
+
+  // 载荷可能在 `data` 信封里，也可能直接是顶层（与 parseClineTokenPayload 同口径）。
+  const inner = asRecord(record.data) ?? record
+  const accessTokenRaw = readString(inner, ['accessToken', 'access_token']) ?? ''
+  if (accessTokenRaw === '') {
+    // 拿到 2xx 却没有令牌：视为**无法续期**（需重新登录），而不是可重试的瞬时故障
+    //（参考实现 `src/cline-auth.ts:430-434` 的同款判据）。
+    throw new ProviderError({
+      provider: ID,
+      message: 'Cline 续期响应缺少访问令牌，请重新登录',
+    })
+  }
+
+  const nextRefreshRaw = readString(inner, ['refreshToken', 'refresh_token'])
+  // ⚠️ 新 refreshToken 为空/缺失时**保留旧值** —— 这是最容易踩的坑：
+  // 丢掉它会让「本次续期成功」变成「下次续期永远失败」。
+  const nextRefresh = nextRefreshRaw !== undefined && nextRefreshRaw.length > 0
+    ? nextRefreshRaw
+    : credential.refreshToken
+
+  // 过期时间：优先 `expiresAt`（实测是 ISO 串），其次 `expires_in`（秒），
+  // 都没有则**保留旧值**（0 = 未知），绝不编造。
+  const explicit = parseClineTimestamp(inner.expiresAt ?? inner.expires_at ?? inner.expire_time)
+  const expiresIn = readNumber(inner, ['expiresIn', 'expires_in'])
+  const expiresAt = explicit
+    ?? (expiresIn !== undefined && expiresIn > 0 ? Date.now() + Math.round(expiresIn * 1000) : credential.expiresAt)
+
+  return {
+    // ⚠️ `{...credential}` 展开保留 `uid` / `nickname` / `extras`（accountId、email）
+    // 以及 provider 字段 —— 用重建的方式必然丢字段。
+    ...credential,
+    accessToken: clineBearerValue(accessTokenRaw),
+    refreshToken: nextRefresh,
+    expiresAt,
+  }
+}
+
 // ─────────────────────────── 导出 ───────────────────────────
 
 export const clineProvider: Provider = {
@@ -1121,5 +1283,14 @@ export const clineProvider: Provider = {
   listModels,
   chat,
   balance,
+  /**
+   * ✅ **可静默续期**：`POST {API_BASE}/api/v1/auth/refresh`（驼峰 body，
+   * 见 {@link refresh} 的完整说明）。
+   *
+   * 为什么必须有它（实测踩到）：本地 CLINE 凭据的 `expire_time` 已过期 7 小时，
+   * 于是**每一个**请求都 401；而凭据里的 `refresh_token` 完好。没有续期
+   * 等于「账号用一天就废」，用户只能重新登录。
+   */
+  refresh,
   shouldRotate,
 }

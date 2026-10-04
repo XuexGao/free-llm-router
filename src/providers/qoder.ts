@@ -1198,6 +1198,163 @@ async function checkin(
   }
 }
 
+// ─────────────────────────── 续期 ───────────────────────────
+
+/**
+ * 续期路径（挂 `openApiBase`，`src/qoder.ts:27` 的 `QODER_REFRESH_PATH`）。
+ *
+ * ⚠️ 与登录轮询路径（`/api/v1/deviceToken/poll`）只差最后一段 —— 写错会拿到
+ * 一个语义完全不同的响应（轮询在没有待授权会话时回 404），排查起来毫无头绪。
+ */
+const REFRESH_PATH = '/api/v1/deviceToken/refresh'
+
+/** 单次续期超时（对齐参考 `QODER_REQUEST_TIMEOUT_MS = 30_000`，`src/qoder.ts:14`）。 */
+const REFRESH_TIMEOUT_MS = 30_000
+
+/**
+ * 用 `refresh_token` 换一份新凭据。
+ *
+ * ## 协议（`src/qoder-auth.ts:395-437` 的 `refreshCredential`，逐字对齐）
+ *
+ * ```
+ * POST {openApiBase}/api/v1/deviceToken/refresh
+ * headers: Content-Type: application/json + Accept + User-Agent: qoder/1.0.0
+ * body:    { "refresh_token": "…", "machine_id": "…" }        ← 蛇形！
+ * → { "device_token": "dt-…", "refresh_token": "drt-…",
+ *     "expires_at": <ISO 串或毫秒>, "refresh_token_expires_at": …,
+ *     "user_id": "…", "user_name": "…" }
+ * ```
+ *
+ * ⚠️ **续期响应用 `device_token` 承载访问令牌**，登录响应用 `token`
+ * —— 字段名不同，两个都要认（`src/qoder.ts:211-235` 的注释明确记录）。
+ * 只认 `token` 会把一次成功的续期读成「响应缺少令牌」。
+ *
+ * ⚠️ **`machine_id` 是必填**：它参与加密推理的密钥派生
+ * （`src/qoder.ts:287-293` 的 `qoderRefreshBody` 只发这两个字段，
+ * `machine_token` 来自本插件没有的 UMID 子系统）。故必须从 `extras` 原样取出
+ * 再回写 —— 丢了它，续期成功但**推理会失败**，且下一次续期也没有设备标识了。
+ *
+ * ## 终态判定（与参考一致，`src/qoder-auth.ts:411-436`）
+ *
+ * - 401/403 → 终态，提示重新登录；
+ * - 200 但响应里没有令牌 → 终态（重试一万次也不会有）；
+ * - 网络异常 / 5xx / 429 → `retryable: true`（**绝不能**报成「请重新登录」）。
+ */
+async function refresh(
+  product: QoderProduct,
+  credential: ProviderCredential,
+  signal: AbortSignal,
+): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  if (refreshToken === '') {
+    throw new ProviderError({
+      provider: product.id,
+      message: 'Qoder 凭据缺少 refresh_token，无法自动续期，请重新走一次设备码登录',
+    })
+  }
+  // ⚠️ `machine_id` 必须带（见上方说明）。凭据里没有时**不编造**一个随机值：
+  // 随机值会让加密推理的密钥派生与服务端记录不一致，表现为「续期成功但推理 401」。
+  const machineId = (credential.extras[EXTRA_MACHINE_ID] ?? '').trim()
+  if (machineId === '') {
+    throw new ProviderError({
+      provider: product.id,
+      message: 'Qoder 凭据缺少 machine_id（加密推理与续期都必需），无法自动续期，请重新走一次设备码登录',
+    })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${product.openApiBase}${REFRESH_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        // 与参考一致：`{userAgentPrefix}/1.0.0`（`src/qoder-auth.ts:400`）。
+        'User-Agent': `${product.userAgentPrefix}/1.0.0`,
+      },
+      // ⚠️ **蛇形**字段名（`refresh_token` / `machine_id`），不是驼峰。
+      body: JSON.stringify({ refresh_token: refreshToken, machine_id: machineId }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(REFRESH_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    throw new ProviderError({
+      provider: product.id,
+      retryable: true,
+      message: `Qoder 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+
+  if (res.status === 401 || res.status === 403) {
+    throw new ProviderError({
+      provider: product.id,
+      httpStatus: res.status,
+      message: `Qoder 登录态已失效（HTTP ${res.status}），请重新登录（refresh_token 已被拒绝）`,
+    })
+  }
+
+  let parsed: Record<string, unknown>
+  try {
+    const candidate = JSON.parse(text) as unknown
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+      throw new Error('not an object')
+    }
+    parsed = candidate as Record<string, unknown>
+  } catch {
+    throw new ProviderError({
+      provider: product.id,
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `Qoder 续期响应不是 JSON（HTTP ${res.status}）：${text.trim().slice(0, 160) || '(空响应体)'}`,
+    })
+  }
+
+  if (!res.ok) {
+    throw new ProviderError({
+      provider: product.id,
+      httpStatus: res.status,
+      retryable: res.status >= 500 || res.status === 429,
+      message: `Qoder 续期失败（HTTP ${res.status}）：${text.trim().slice(0, 200)}`,
+    })
+  }
+
+  // ⚠️ 访问令牌在续期响应里叫 `device_token`（登录响应才叫 `token`）。
+  const nextAccessToken = readString(parsed, ['device_token', 'token', 'access_token', 'accessToken'])
+  if (nextAccessToken === undefined) {
+    // 200 却没有令牌 → 终态（参考 `src/qoder-auth.ts:429-434` 的同款判据）。
+    throw new ProviderError({
+      provider: product.id,
+      message: 'Qoder 续期响应缺少访问令牌（device_token），请重新登录',
+    })
+  }
+
+  // ⚠️ 新 refresh_token 缺失时**保留旧值** —— Qoder 实测会轮换它，
+  // 但「某次没下发」不该把可续期凭据变成不可续期。
+  const nextRefresh = readString(parsed, ['refresh_token', 'refreshToken']) ?? credential.refreshToken
+  // 过期时间来自响应（可能是 ISO 串，也可能是秒/毫秒数字）；`readExpiresAt`
+  // 三种形态都认。取不到时**保留旧值**（0 = 未知），不编造。
+  const parsedExpiry = readExpiresAt(parsed)
+  const expiresAt = parsedExpiry > 0 ? parsedExpiry : credential.expiresAt
+
+  // uid 不在续期响应里（参考 `applyQoderRefresh` 明确要保留它，加密推理依赖）。
+  const nextUid = readString(parsed, ['user_id', 'userId']) ?? credential.uid
+  const nextNickname = readString(parsed, ['user_name', 'userName']) ?? credential.nickname
+
+  return {
+    // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（machineId、machineToken、
+    // machineType）—— 机器头是**用户提供的配置**，Workers 里无法重新探测，
+    // 丢了积分/推理能力都会退化。
+    ...credential,
+    uid: nextUid,
+    nickname: nextNickname,
+    accessToken: nextAccessToken,
+    refreshToken: nextRefresh,
+    expiresAt,
+    extras: { ...credential.extras, [EXTRA_MACHINE_ID]: machineId },
+  }
+}
+
 // ─────────────────────────── Provider 导出 ───────────────────────────
 
 /** 用一份产品配置造出 `Provider`。 */
@@ -1227,12 +1384,37 @@ export function buildQoderProvider(product: QoderProduct): Provider {
        */
       checkin: true,
     },
+    /**
+     * 对象判别式：Qoder 凭据的**独有**字段。
+     *
+     * ⚠️ 不认 `access_token` / `uid` 这些通用字段 ——
+     * 它们和 buddy 等家重叠，拿来判别会让 Qoder 凭据被 buddy 兜底抢走
+     * （实测：本地 QODER 凭据被判成 buddy）。
+     * Qoder 独有：`security_oauth_token` / `machine_id`（成对出现）。
+     */
+    matchesShape(input) {
+      return (
+        typeof input['security_oauth_token'] === 'string'
+        || (typeof input['machine_id'] === 'string' && typeof input['security_oauth_token'] === 'string')
+      )
+    },
     parseCredential,
     async listModels(_credential, _signal) {
       // ⚠️ **恒用静态表，不发网络请求**：远端 `GET /algo/api/v2/model/list`
       // 需 WASM 签名，而目录是只读能力 —— 付密码学代价换一张几乎不变的清单
       // 不值得（`AGENTS.md` 的 Qoder 章节第 3 条，参考实现同样做法）。
       return toProviderModels(product.fallbackModels)
+    },
+    /**
+     * ✅ **可静默续期**：`POST {openApiBase}/api/v1/deviceToken/refresh`
+     * （蛇形 body + 必填 `machine_id`，完整说明见 {@link refresh}）。
+     *
+     * ⚠️ 它**只挂 `openApiBase`**（国际版 `openapi.qoder.sh` / 中国版
+     * `openapi.qoder.com.cn`）—— 续期与推理不是一个 host，别混用。
+     * 本方法是产品参数化的，故 `qoder` 与 `qodercn` 两个变体自动都有一份。
+     */
+    async refresh(credential, signal) {
+      return await refresh(product, credential, signal)
     },
     async chat(credential, request) {
       return await chat(product, credential, request)
