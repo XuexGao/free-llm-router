@@ -65,6 +65,7 @@ import {
 } from './types.js'
 import { base64ToBytes, bytesToBase64, encryptAes128Cfb } from './aes-cfb.js'
 import { md5Hex } from './md5.js'
+import { renderQrSvg } from './raccoon-qr.js'
 
 // ── 协议常量 ────────────────────────────────────────────────────────
 
@@ -985,12 +986,17 @@ export const raccoonProvider: Provider = {
      * （`src/raccoon.ts:14-17`、`src/raccoon-oauth.ts:112-118`），
      * 完全绕开那条收不到的 `office-raccoon://auth/callback` 自定义协议。
      * ⚠️ 参考项目里那个 `createServer` 只是承载**登录选择页**的展示壳
-     * （`src/raccoon-login-page.ts:35-48`）；Workers 里这一页应由本服务面板渲染。
+     * （`src/raccoon-login-page.ts:35-48`）；本服务里这一页由面板渲染：
+     * `/admin/providers/login/start` 返回 `qrSvg`，面板内联显示，用户用微信扫。
+     *
+     * ⚠️ 这条声明此前是 `false`（「扫码登录已实现但未接线」）。现已接线到
+     * `/admin/providers/login/{start,poll}`（见 `src/index.ts` 的 raccoon 分支）
+     * —— 目的是让**本服务拥有自己的凭据**：本地 DSH 客户端与本服务此前共用
+     * 同一份凭据文件，而 raccoon 的 `refresh_token` 是**一次性轮换**的，
+     * 两边互相续期会把对方顶掉（用户报障「账号用一天就废」）。
      */
-    login: false,
+    login: true,
 
-    loginBlockedReason:
-      '本服务暂未接线该家的登录流程（扫码登录已实现但未接线到 /admin/providers/login/*）。请导出凭据后粘贴导入。',
     listModels: true,
     chat: true,
     balance: true,
@@ -1055,6 +1061,29 @@ export interface RaccoonQrPollResult {
   expiredAt?: string
 }
 
+/** 一次「发起扫码登录」的结果：面板拿它渲染二维码。 */
+export interface RaccoonQrLoginStart {
+  /** 服务端认这个 code；轮询时原样回传（**本地自造，非服务端下发**）。 */
+  code: string
+  /** 二维码**承载的内容** —— 微信扫码后打开的公开登录页。 */
+  qrUrl: string
+  /** 内联 SVG 字符串（面板把它插进 DOM 即可，无需前端 QR 逻辑）。 */
+  qrSvg: string
+}
+
+/**
+ * 发起一次扫码登录：生成 code、拼出二维码内容、并就地渲染成 SVG。
+ *
+ * ⚠️ **不碰网络、不碰凭据** —— 纯本地计算，故可离线单测，
+ * 也不会因误调接口消耗用户凭据。真正的登录状态由
+ * {@link pollRaccoonQrLogin} 轮询得到。
+ */
+export function beginRaccoonQrLogin(): RaccoonQrLoginStart {
+  const code = generateQrCode()
+  const qrUrl = buildQrLoginUrl(code)
+  return { code, qrUrl, qrSvg: renderQrSvg(qrUrl) }
+}
+
 /**
  * 生成一个扫码用的 `qrcode_code`（32 位小写 hex = 16 字节随机）。
  *
@@ -1088,11 +1117,22 @@ export function buildQrLoginUrl(code: string): string {
  * 轮询是 2 秒一次的循环，偶发失败不应中断整个登录流程；而把未知状态
  * 误判成 `success` 会让流程拿到空 token 后卡死，误判成 `canceled` 则会让
  * 用户正在扫码的二维码被无故刷新（`src/raccoon-oauth.ts:132-139`）。
+ *
+ * ⚠️ `fetcher` 显式注入（缺省全局 `fetch`）：本函数的**唯一**用途是网络轮询，
+ * 单测必须能在**不打真实上游**的前提下锁死「哪种响应算哪种状态」——
+ * 这个仓库的其它 provider 也是这个口径（注入 `signal` + 在测试里替换
+ * `globalThis.fetch`，见 `tests/verify.test.ts:81-95`）。
+ * ⚠️ **绝不能用真实凭据调 `/refresh` 验证任何东西** —— raccoon 的
+ * `refresh_token` 是**一次性轮换**的，调一次就作废（本仓库已因此丢过两次账号）。
  */
-export async function pollRaccoonQrLogin(code: string, signal: AbortSignal): Promise<RaccoonQrPollResult> {
+export async function pollRaccoonQrLogin(
+  code: string,
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<RaccoonQrPollResult> {
   let envelope: RaccoonEnvelope
   try {
-    const response = await fetch(`${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}/login_with_qrcode_code`, {
+    const response = await fetcher(`${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}/login_with_qrcode_code`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ qrcode_code: code }),
@@ -1150,10 +1190,11 @@ export async function pollRaccoonQrLogin(code: string, signal: AbortSignal): Pro
 export async function enrichRaccoonCredential(
   credential: ProviderCredential,
   signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
 ): Promise<ProviderCredential> {
   let response: Response
   try {
-    response = await fetch(`${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}/user_info`, {
+    response = await fetcher(`${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}/user_info`, {
       method: 'GET',
       headers: raccoonHeaders(credential),
       signal: AbortSignal.any([signal, AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)]),

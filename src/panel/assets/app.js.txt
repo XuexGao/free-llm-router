@@ -427,6 +427,20 @@ async function doImport() {
 
 let loginTimer = null
 
+/**
+ * 登录等待文案的**流程相关**后缀。
+ *
+ * ⚠️ 不同家的完成方式是**相反**的，不能共用一句文案：
+ * - 设备码（buddy / workbuddy / qoder / zcode）：用户在别处确认，本页等着即可；
+ * - codearts：浏览器回跳式 —— 华为会把浏览器打到**本服务**的提示页，而凭据要由
+ *   **本面板的轮询**写入，所以用户必须回到本页（提示页上也没有写凭据的入口）。
+ */
+function loginWaitHint(providerId) {
+  return providerId === 'codearts'
+    ? '\n\n（完成华为登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
+    : ''
+}
+
 async function doLogin() {
   if (loginTimer) clearInterval(loginTimer)
   // 空 = 自动识别，此时用默认供应商（buddy）走既有端点
@@ -441,16 +455,65 @@ async function doLogin() {
   if (!res.ok) { show('login-result', res.body); return }
   const authUrl = res.body.authUrl
   const state = res.body.state
+  const qrSvg = res.body.qrSvg
 
-  // 用 DOM API 构造（不把上游返回的 URL 拼进 innerHTML —— 那有注入风险）
   const el = $('login-result')
   clear(el)
-  el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…'
-  const a = document.createElement('a')
-  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
-  a.textContent = '打开授权页面'
-  el.appendChild(document.createElement('br'))
-  el.appendChild(a)
+
+  // ── 扫码登录（raccoon）：二维码由服务端渲染好，这里只负责显示 ──
+  //
+  // ⚠️ 这条路径**不需要用户打开任何链接**：掏出微信扫一下即可。
+  // 与「打开浏览器 → 登录 → 等回跳」的家相比省掉一整步。
+  if (typeof qrSvg === 'string' && qrSvg !== '') {
+    const tip = document.createElement('div')
+    tip.textContent = '请用微信扫描下方二维码完成授权：'
+    el.appendChild(tip)
+
+    const box = document.createElement('div')
+    box.className = 'qr-box'
+    // ⚠️ 用 `DOMParser` 解析 SVG，**不用 innerHTML**。
+    //
+    // 理由有两条：
+    // ① 安全：`DOMParser` 解析出的文档**从不执行脚本**，即便上游返回的 SVG
+    //    被污染也只会得到一个死节点；而 `innerHTML` 会走 HTML 解析器。
+    // ② 本仓库有一条既有不变量测试**禁止任何 `innerHTML` 赋值**
+    //    （`tests/panel.test.ts` 的 XSS 用例）—— 不为了这一处破例。
+    //
+    // `image/svg+xml` 是正确的内容类型；解析失败时静默降级为不显示二维码
+    //（下面还有「打不开二维码时点此」的链接兜底）。
+    try {
+      const doc = new DOMParser().parseFromString(qrSvg, 'image/svg+xml')
+      const svg = doc.documentElement
+      if (svg && svg.nodeName.toLowerCase() === 'svg') {
+        box.appendChild(document.importNode(svg, true))
+      }
+    } catch {
+      // 解析失败：不显示二维码，靠下面的链接兜底
+    }
+    el.appendChild(box)
+
+    const status = document.createElement('div')
+    status.textContent = '等待扫码…'
+    el.appendChild(status)
+    el._loginStatus = status
+
+    // 二维码内容也给出可复制链接，方便手机不在身边时改用别的设备扫
+    if (typeof res.body.qrUrl === 'string') {
+      const a = document.createElement('a')
+      a.href = res.body.qrUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+      a.textContent = '（打不开二维码时点此）'
+      el.appendChild(document.createElement('br'))
+      el.appendChild(a)
+    }
+  } else {
+    // 用 DOM API 构造（不把上游返回的 URL 拼进 innerHTML —— 那有注入风险）
+    el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
+    const a = document.createElement('a')
+    a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+    a.textContent = '打开授权页面'
+    el.appendChild(document.createElement('br'))
+    el.appendChild(a)
+  }
 
   let tries = 0
   loginTimer = setInterval(async () => {
@@ -462,11 +525,20 @@ async function doLogin() {
       clearInterval(loginTimer)
       el.textContent = '授权成功，凭据已加密保存：' + (r.body.nickname || r.body.uid)
       loadAccounts(); loadPool()
+    } else if (r.ok && r.body && r.body.status === 'failed') {
+      // 终态失败：再轮询一万次也是同一结果，如实显示并停下（避免空等到超时）
+      clearInterval(loginTimer)
+      el.textContent = (r.body.message || '登录失败') + '\n可改用「粘贴凭据导入」，或稍后重试。'
     } else if (r.status === 404) {
       clearInterval(loginTimer)
       el.textContent += '\n该登录会话已过期，请重新发起。'
+    } else if (r.ok && r.body && r.body.status === 'canceled') {
+      clearInterval(loginTimer)
+      el.textContent = (r.body.message || '已取消授权') + '\n请重新发起。'
     } else if (r.ok && r.body && r.body.message) {
-      el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
+      // 扫码流程只更新状态文字（二维码必须留在页面上，不能被文字覆盖掉）
+      if (el._loginStatus) el._loginStatus.textContent = r.body.message
+      else el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
     }
   }, 3000)
 }
@@ -721,6 +793,16 @@ const CAPS = [
   ['checkin', '每日签到'],
 ]
 
+/**
+ * 登录方式**不是设备码**的供应商：卡片标签与弹窗标题要写实际方式。
+ *
+ * ⚠️ 为什么必须有它：codearts 是**浏览器回跳**式登录（把浏览器的授权结果打回
+ * 本服务的 `/login/codearts/callback/<state>`），与设备码轮询完全不是一回事。
+ * 标签写成「设备码登录」会误导用户去找一个并不存在的设备码。
+ * 其余家（buddy / workbuddy / qoder / zcode）确实都是设备码轮询。
+ */
+const LOGIN_KIND_LABEL = { codearts: '浏览器登录', raccoon: '微信扫码' }
+
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
 
@@ -815,7 +897,8 @@ async function loadProviders() {
       const tag = document.createElement('span')
       const on = prov.capabilities[key] === true
       tag.className = 'cap ' + (on ? 'on' : 'off')
-      tag.textContent = (on ? '✓ ' : '✕ ') + label
+      const shown = key === 'login' ? (LOGIN_KIND_LABEL[prov.id] || label) : label
+      tag.textContent = (on ? '✓ ' : '✕ ') + shown
       caps.appendChild(tag)
     }
     card.appendChild(caps)
@@ -1013,7 +1096,8 @@ function renderModalAdd() {
     return
   }
 
-  const h2 = document.createElement('h3'); h2.textContent = '设备码登录'
+  const h2 = document.createElement('h3')
+  h2.textContent = LOGIN_KIND_LABEL[modalProviderId] || '设备码登录'
   box.appendChild(h2)
   const btn = document.createElement('button'); btn.textContent = '发起登录'
   const out = document.createElement('pre'); out.className = 'out'
@@ -1034,7 +1118,7 @@ async function startModalLogin(providerId, out) {
   const authUrl = res.body.authUrl
   const state = res.body.state
   clear(out)
-  out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…'
+  out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
   const a = document.createElement('a')
   a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
   a.textContent = '打开授权页面'
@@ -1050,6 +1134,10 @@ async function startModalLogin(providerId, out) {
       clearInterval(modalLoginTimer)
       out.textContent = '授权成功：' + (r.body.nickname || r.body.uid)
       loadModalAccounts(); loadAccounts(); loadPool()
+    } else if (r.ok && r.body && r.body.status === 'failed') {
+      // 终态失败：停下并如实显示（继续轮询只会得到同一答案）
+      clearInterval(modalLoginTimer)
+      out.textContent = (r.body.message || '登录失败') + '\n可改用「粘贴凭据导入」，或稍后重试。'
     } else if (r.ok && r.body && r.body.message) {
       out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
     }

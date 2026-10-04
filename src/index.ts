@@ -24,6 +24,15 @@ import { planByName } from './taskrunner/plans.js'
 import { resolveUpstream, type Env } from './env.js'
 import { cliChatHeaders } from './upstream/headers.js'
 import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstream/auth.js'
+
+/**
+ * raccoon 扫码登录会话的存活时长。
+ *
+ * ⚠️ 与其它家不同：raccoon 的二维码**没有服务端下发的有效期**，
+ * 是我们自己定的窗口。10 分钟足够「掏出手机 → 扫码 → 在微信里确认」，
+ * 又不会让一个废弃会话长期占着存储。
+ */
+const RACCOON_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
 import type { AccountState } from './pool/state.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
@@ -41,7 +50,17 @@ import {
   providerIds,
   PROVIDERS,
 } from './providers/index.js'
-import { splitModelName, type ProviderCredential } from './providers/types.js'
+import { splitModelName, ProviderError, type ProviderCredential } from './providers/types.js'
+import {
+  buildCodeArtsCallbackUrl,
+  buildCodeArtsLoginUrl,
+  codeArtsTicketCredentialToProvider,
+  CODEARTS_LOGIN_CALLBACK_PATH,
+  CODEARTS_LOGIN_STATE_TTL_MS,
+  fetchCodeArtsTicket,
+  generateCodeArtsLoginState,
+  pollCodeArtsTicket,
+} from './providers/codearts.js'
 import { panelAsset, securityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
@@ -307,6 +326,292 @@ async function writeDisabledModels(
   return current.size
 }
 
+/**
+ * 找出登录会话**实际存在哪个分片**（cn / global）。
+ *
+ * ⚠️ 必须两个都查：账号按凭据的 `realm` 分片存放，而登录会话与账号同分片 ——
+ * WorkBuddy 国际版的会话在 `global`，其余家在 `cn`。只查 `cn` 会让国际版登录
+ * 永远回「会话不存在或已过期」（会话就在隔壁分片里）。
+ *
+ * ⚠️ 这是**免鉴权路径（浏览器回调）与鉴权路径共用**的查找：两边必须
+ * 用同一套规则，否则会出现「回调说会话在 global、轮询只找 cn」这类撕裂。
+ */
+async function findLoginSession(
+  env: Env,
+  state: string,
+): Promise<{ realm: string; payload: Record<string, unknown> } | undefined> {
+  if (state === '') return undefined
+  for (const realm of ['cn', 'global']) {
+    const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const session = (await probe.getLoginSession(state, Date.now())) as Record<string, unknown> | undefined
+    if (session !== undefined) return { realm, payload: session }
+  }
+  return undefined
+}
+
+/** 从会话载荷里安全读字符串（缺失/类型不符返回空串）。 */
+function sessionString(payload: Record<string, unknown>, key: string): string {
+  const value = payload[key]
+  return typeof value === 'string' ? value : ''
+}
+
+/** 从会话载荷里安全读数值（缺失/类型不符返回 `undefined`）。 */
+function sessionNumber(payload: Record<string, unknown>, key: string): number | undefined {
+  const value = payload[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 渲染 CodeArts 浏览器回调的结果页。
+ *
+ * ## 为什么是**纯静态 HTML**
+ *
+ * 页面必须**不带任何脚本**：面板的 CSP 是 `default-src 'none'; script-src 'self'`，
+ * 而这里复用同一套安全头（`securityHeaders()`）。要放脚本就得放开
+ * `unsafe-inline`，那等于放弃 XSS 防护（`src/panel/index.ts` 的原注释）。
+ * 用户只需要「看一眼说明 + 点回面板」，静态 HTML 完全够用。
+ *
+ * ⚠️ 所有插值都经 `escapeHtml`：`detail` 可能包含**上游原文**
+ * （如 ticket 端点返回的错误文案），不转义就是反射型 XSS。
+ */
+function codeArtsCallbackPage(input: {
+  status: number
+  ok: boolean
+  title: string
+  detail: string
+}): Response {
+  const color = input.ok ? '#1a7f37' : '#b42318'
+  const body = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(input.title)}</title>
+</head>
+<body style="margin:0;padding:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,'Segoe UI',sans-serif">
+<main style="max-width:640px;margin:12vh auto;padding:28px 32px;background:#161b22;border:1px solid #30363d;border-radius:12px">
+<h1 style="margin:0 0 12px;font-size:20px;color:${color}">${escapeHtml(input.title)}</h1>
+<p style="margin:0 0 18px;line-height:1.7;font-size:14px;color:#c9d1d9">${escapeHtml(input.detail)}</p>
+<p style="margin:0 0 8px;line-height:1.7;font-size:14px;color:#8b949e">
+凭据由<b>面板</b>负责写入（本页不写任何凭据）。请回到面板查看结果，无需关闭本页。
+</p>
+<p style="margin:18px 0 0"><a href="/panel/" style="color:#58a6ff;font-size:14px">返回管理面板</a></p>
+</main>
+</body>
+</html>`
+  return new Response(body, {
+    status: input.status,
+    headers: { ...securityHeaders(), 'content-type': 'text/html; charset=utf-8' },
+  })
+}
+
+/** HTML 转义（回调页会插入上游原文，必须转义）。 */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+/**
+ * 浏览器落点：`GET /login/codearts/callback/<state>?secret=…`（**免鉴权**）。
+ *
+ * ## 为什么不鉴权（以及凭什么安全）
+ *
+ * 浏览器是被华为**重定向**过来的，它带不了 `Authorization` 头。
+ * 故这里**不能**用管理密钥，改用 `state` 本身作为能力凭证：
+ * - `state` 是 32 字节 CSPRNG（{@link generateCodeArtsLoginState}），不可猜；
+ * - 它绑定到一个**已经存在**的 `codearts` 登录会话（`kind === 'codearts'`），
+ *   所以回调**永远无法**给任意其它供应商写凭据 —— 供应商只能来自会话载荷，
+ *   **绝不**从 URL 参数取；
+ * - 会话 10 分钟过期（{@link CODEARTS_LOGIN_STATE_TTL_MS}），且用完即删。
+ *
+ * ## 为什么 `state` 在**路径**里
+ *
+ * 见 `src/providers/codearts.ts` 的 {@link CODEARTS_LOGIN_CALLBACK_PATH} 注释：
+ * 参考实现的回调 URL 不带 query（`login.ts:26`），故无法推断华为是「合并 query」
+ * 还是「字符串拼 `?secret=`」；state 放路径里对两种行为都成立。
+ * 同时这里对 query 形态（`?state=`）与最坏情况的「`state=x?secret=y`」都做了
+ * 兼容解析，见下方剥离逻辑。
+ *
+ * ## 为什么真正的轮询不在这里阻塞
+ *
+ * 浏览器在等这一份响应，不能堵着它两分钟。故：
+ * - 立刻回一个静态提示页；
+ * - `ctx.waitUntil` 里**尽力**轮询 8 次（约 8 秒），成功就把凭据材料写回会话；
+ * - 真正的权威是 `GET /admin/providers/login/poll`（面板每 3 秒调一次），
+ *   它既读回这里的结果、也能自己再打一次 ticket 端点。
+ * 这样即使 `waitUntil` 被 Worker 提前回收（它只是尽力而为），登录也不会失败。
+ */
+async function handleCodeArtsCallback(
+  env: Env,
+  ctx: ExecutionContext,
+  url: URL,
+  path: string,
+): Promise<Response> {
+  // ── state：路径优先，其次 query ──
+  let state = path.startsWith(`${CODEARTS_LOGIN_CALLBACK_PATH}/`)
+    ? decodeURIComponent(path.slice(CODEARTS_LOGIN_CALLBACK_PATH.length + 1))
+    : ''
+  const params = url.searchParams
+  if (state === '') state = params.get('state') ?? ''
+  let secret = params.get('secret') ?? ''
+
+  // ⚠️ 最坏情况的剥离：若华为把 `?secret=` 直接拼在了已有 query 后面，
+  // 我们会解析出 `state = "<state>?secret=<secret>"`。把 secret 剥出来，
+  // 否则 state 找不到会话、而 secret 又缺失 —— 表现为「回调页报参数缺失」。
+  const questionMark = state.indexOf('?')
+  if (questionMark >= 0) {
+    const inner = new URLSearchParams(state.slice(questionMark + 1))
+    if (secret === '') secret = inner.get('secret') ?? ''
+    state = state.slice(0, questionMark)
+  }
+
+  // 用户在华为页面上取消授权：不是错误，但要如实说明（参考实现只回 400）。
+  const upstreamError = params.get('error') ?? params.get('error_code')
+  if (upstreamError !== null && upstreamError !== '') {
+    const description = params.get('error_description') ?? params.get('error_msg') ?? ''
+    return codeArtsCallbackPage({
+      status: 400,
+      ok: false,
+      title: '授权未完成',
+      detail: `华为侧返回了错误：${upstreamError}${description === '' ? '' : `（${description}）`}。请在面板重新发起登录。`,
+    })
+  }
+
+  if (state === '' || secret === '') {
+    return codeArtsCallbackPage({
+      status: 400,
+      ok: false,
+      title: '回调参数不完整',
+      detail: '这次跳转没有带上 state 或 secret。请在面板重新发起登录；'
+        + '若反复出现，请改用「粘贴凭据导入」。',
+    })
+  }
+
+  const saved = await findLoginSession(env, state)
+  // ⚠️ **必须**校验 kind：会话是「谁」只能由服务端记的载荷说了算。
+  // 不校验就等于允许用任意 state 把凭据写进任意供应商的流程里。
+  if (saved === undefined || saved.payload['kind'] !== 'codearts') {
+    return codeArtsCallbackPage({
+      status: 410,
+      ok: false,
+      title: '登录会话不存在或已过期',
+      detail: '会话有效期 10 分钟（浏览器耗时过久会过期）。请回到面板重新点「发起登录」。',
+    })
+  }
+
+  const ticketId = sessionString(saved.payload, 'ticketId')
+  if (ticketId === '') {
+    return codeArtsCallbackPage({
+      status: 410,
+      ok: false,
+      title: '登录会话已损坏',
+      detail: '会话里没有 ticket_id，无法换取凭据。请在面板重新发起登录。',
+    })
+  }
+
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+  // ⚠️ 回写时必须用**会话原本的过期时刻**（载荷里自带的 `expiresAt`）。
+  // 若写成 `Date.now() + TTL`，每次回跳都会把窗口续满 —— 一个被泄漏的 state
+  // 就能被无限续期，能力凭证的窗口形同虚设。
+  // （`getLoginSession` 不回传 expires_at，故创建会话时把它一并存进载荷。）
+  const expiresAt = sessionNumber(saved.payload, 'expiresAt') ?? (Date.now() + CODEARTS_LOGIN_STATE_TTL_MS)
+  const withSecret: Record<string, unknown> = { ...saved.payload, secret, secretAt: Date.now() }
+  await pool.saveLoginSession(state, withSecret, expiresAt)
+
+  // 后台尽力轮询：成功即把**凭据材料**写回会话，供 `/admin/providers/login/poll` 落盘。
+  // ⚠️ 这里不调用 `persistProviderCredential`：落盘只有一条路（poll 端点），
+  // 避免「回调写一次、轮询又写一次」两处各自演进。
+  ctx.waitUntil(
+    (async (): Promise<void> => {
+      try {
+        const material = await pollCodeArtsTicket(ticketId, secret, { maxAttempts: 8, gapMs: 1_000 })
+        await pool.saveLoginSession(state, { ...withSecret, credential: material }, expiresAt)
+      } catch (error) {
+        // 超时是**预期的**（8 次拿不到就交给面板继续），不写任何标记；
+        // 只有服务端明确拒绝（非瞬时）才记下原因，让面板如实显示而不是空等。
+        const terminal = error instanceof ProviderError && !error.retryable
+        if (!terminal) return
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`[codearts-login] ticket 换取凭据被拒：${message}`)
+        await pool.saveLoginSession(state, { ...withSecret, failed: message }, expiresAt)
+      }
+    })(),
+  )
+
+  return codeArtsCallbackPage({
+    status: 200,
+    ok: true,
+    title: '授权完成，请回到面板',
+    detail: '浏览器这一程已经走完，本服务正在用华为回传的 secret 换取凭据。'
+      + '请切回管理面板（本页可以关闭），凭据会自动加密保存到账号池。',
+  })
+}
+
+/**
+ * 完成一次 CodeArts 浏览器登录：把 ticket 换到的材料落盘成正式凭据。
+ *
+ * 两个来源，优先级明确：
+ * 1. 会话里已有 `credential`（回调的后台轮询写进来的）⇒ 直接用；
+ * 2. 否则自己再**打一次** ticket 端点（回调的 `waitUntil` 只有 30 秒预算，
+ *    且可能被提前回收 ⇒ 面板轮询必须能独立完成这件事）。
+ *
+ * ⚠️ 单次尝试（不是循环）：面板每 3 秒轮询一次，**在这里空等会叠加**成并发
+ * 轮询同一个 ticket。按一次的粒度做，整体节奏交给面板。
+ */
+async function pollCodeArtsLogin(
+  env: Env,
+  saved: { realm: string; payload: Record<string, unknown> },
+  state: string,
+  now: number,
+): Promise<Response> {
+  const payload = saved.payload
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+
+  // 终态失败：反复轮询不会有别的结果，如实复述原因（而不是让面板空等到超时）。
+  const failed = sessionString(payload, 'failed')
+  if (failed !== '') {
+    return json({ done: false, status: 'failed', message: `CodeArts 登录失败：${failed}` })
+  }
+
+  let material: unknown = payload['credential']
+  if (material === undefined) {
+    const secret = sessionString(payload, 'secret')
+    if (secret === '') {
+      return json({
+        done: false,
+        status: 'awaiting_browser',
+        message: '等待浏览器完成授权…（登录后浏览器会跳到本服务的提示页，回到本面板即可）',
+      })
+    }
+    const ticketId = sessionString(payload, 'ticketId')
+    let outcome
+    try {
+      outcome = await fetchCodeArtsTicket(ticketId, secret)
+    } catch (error) {
+      // 明确被拒：记进会话，后续轮询复述同一原因（不静默、也不无限重试）。
+      const message = error instanceof Error ? error.message : String(error)
+      await pool.saveLoginSession(state, { ...payload, failed: message }, sessionNumber(payload, 'expiresAt') ?? now + CODEARTS_LOGIN_STATE_TTL_MS)
+      return json({ done: false, status: 'failed', message: `CodeArts 登录失败：${message}` })
+    }
+    if (outcome.status === 'pending') {
+      return json({ done: false, status: 'pending', message: '已收到授权回调，正在换取凭据…' })
+    }
+    material = outcome.credential
+  }
+
+  // ⚠️ 走 provider 自己的解析（同一套 uid / expiresAt / extras 规则），
+  // 保证「登录进来」与「粘贴导入」落成**同一条**账号记录。
+  const credential = codeArtsTicketCredentialToProvider(material as never)
+  const result = await persistProviderCredential(env, credential, now)
+  // 落盘成功后才清会话：失败时保留，用户可继续轮询重试。
+  await pool.removeLoginSession(state)
+  return json(result)
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
@@ -332,6 +637,18 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // 老的 /panel 前缀（无尾斜杠）重定向到带斜杠，避免相对路径解析错误
   if (path === '/panel') {
     return new Response(null, { status: 302, headers: { location: '/panel/' } })
+  }
+
+  // ── CodeArts 浏览器登录回调（**免鉴权**，见 handleCodeArtsCallback 的说明） ──
+  //
+  // ⚠️ 必须放在下面的鉴权检查**之前**：浏览器是被华为重定向过来的，
+  // 带不了 `Authorization` 头。安全性由 `state`（32 字节 CSPRNG + 10 分钟 TTL
+  // + 绑定 codearts 会话）保证，不靠密钥。
+  if (path === CODEARTS_LOGIN_CALLBACK_PATH || path.startsWith(`${CODEARTS_LOGIN_CALLBACK_PATH}/`)) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET', ...securityHeaders() } })
+    }
+    return await handleCodeArtsCallback(env, ctx, url, path)
   }
 
   // ── 其余一律鉴权 ──
@@ -485,6 +802,91 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       await pool.saveLoginSession(state, { provider: 'zcode', kind: 'zcode', flow }, Date.now() + 15 * 60 * 1000)
       return json({ ok: true, provider: 'zcode', state, authUrl: flow.authorizeUrl })
     }
+    // ── codearts（华为云码道）：浏览器回跳式 ticket 流程 ──
+    //
+    // ⚠️ 与其它家**不同**的地方（也是本分支存在的理由）：回调不是本机端口，
+    // 而是**本服务自己的 URL**（`auth_callback_url` 是通用参数，
+    // 参考实现 `login.ts:26` 填的是 `http://127.0.0.1:<port>/authentication`）。
+    // ⚠️ **未实测**：华为是否接受非 localhost 的 callback。见 codearts.ts 文件头。
+    //
+    // `state` 用 32 字节 CSPRNG（不是 randomUUID）：它是这条免鉴权路径上
+    // **唯一**的能力凭证 —— 谁拿到 state，谁就能把浏览器的回跳绑到该会话。
+    // 它同时用于「回调 URL 的路径段」与「登录会话主键」，两者必须是**同一个值**。
+    if (providerId === 'codearts') {
+      const ticketId = crypto.randomUUID()
+      const state = generateCodeArtsLoginState()
+      // 回调地址取**本次请求的 origin** —— 自定义域与 workers.dev 都自动正确。
+      const callbackUrl = buildCodeArtsCallbackUrl(url.origin, state)
+      const { loginUrl } = buildCodeArtsLoginUrl(callbackUrl, ticketId)
+      const expiresAt = Date.now() + CODEARTS_LOGIN_STATE_TTL_MS
+      // ⚠️ `expiresAt` 也存进载荷：回调回写 secret 时要沿用它（否则每次回跳
+      // 都会把窗口续满，`getLoginSession` 不回传 expires_at，见 store/db.ts:128）。
+      await pool.saveLoginSession(
+        state,
+        {
+          provider: 'codearts',
+          kind: 'codearts',
+          realm: loginRealm,
+          ticketId,
+          callbackUrl,
+          createdAt: Date.now(),
+          expiresAt,
+        },
+        expiresAt,
+      )
+      return json({
+        ok: true,
+        provider: 'codearts',
+        state,
+        authUrl: loginUrl,
+        callbackUrl,
+        realm: loginRealm,
+        expiresInMs: CODEARTS_LOGIN_STATE_TTL_MS,
+      })
+    }
+    // ── raccoon（商汤小浣熊）：微信扫码，二维码由**本服务**渲染 ──
+    //
+    // ⚠️ 与其余家最关键的不同：**没有「服务端下发二维码」这一步**。
+    // `qrcode_code` 是**客户端自造**的 32 位 hex（参考实现
+    // `src/raccoon-oauth.ts:112-118`），二维码内容是我们自己拼的公开登录页
+    //（`buildQrLoginUrl`），服务端只在轮询时认这个 code。
+    //
+    // 故这条流程**不需要用户点开任何外部链接**：面板直接内联 SVG，
+    // 用户用微信扫即可 —— 比「打开浏览器 → 登录 → 回跳」的家更省事。
+    //
+    // 为什么值得做（用户诉求）：本地 DSH 客户端与本服务此前**共用同一份凭据文件**，
+    // 而 raccoon 的 `refresh_token` 是**一次性轮换**的 —— 两边互相续期会把对方顶掉，
+    // 账号「用一天就废」。本服务自己扫码后即拥有独立凭据，两边不再打架。
+    //
+    // ⚠️ 会话存 `cn` 分片：raccoon 的凭据不带 `extras.realm`，
+    // 与 buddy 同属国内分片（见 `realmForProvider`）。
+    if (providerId === 'raccoon') {
+      const { beginRaccoonQrLogin } = await import('./providers/raccoon.js')
+      const started = beginRaccoonQrLogin()
+      const state = crypto.randomUUID()
+      await pool.saveLoginSession(
+        state,
+        {
+          provider: 'raccoon',
+          kind: 'raccoon',
+          realm: loginRealm,
+          // ⚠️ 存 `qrcode_code`：轮询时必须原样回传，丢了就再也查不到这个会话
+          qrCode: started.code,
+          createdAt: Date.now(),
+        },
+        Date.now() + RACCOON_LOGIN_STATE_TTL_MS,
+      )
+      return json({
+        ok: true,
+        provider: 'raccoon',
+        state,
+        // 面板把 `qrSvg` 直接插进 DOM（无需前端 QR 库）；`qrUrl` 供「复制链接」兜底。
+        qrSvg: started.qrSvg,
+        qrUrl: started.qrUrl,
+        realm: loginRealm,
+        expiresInMs: RACCOON_LOGIN_STATE_TTL_MS,
+      })
+    }
     // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
     //
     // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
@@ -539,17 +941,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // ── 轮询供应商登录结果 ──
   if (path === '/admin/providers/login/poll' && request.method === 'GET') {
     const state = url.searchParams.get('state') ?? ''
-    // ⚠️ 会话按 realm 分片存放。国际版（workbuddy）的会话在 `global` 分片，
-    // 其余家在 `cn` 分片。**不能只查 cn** —— 那样国际版登录会永远回
-    // 「会话不存在或已过期」（会话就在隔壁分片里）。
-    const saved = await (async (): Promise<{ realm: string; payload: Record<string, unknown> } | undefined> => {
-      for (const realm of ['cn', 'global']) {
-        const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-        const session = (await probe.getLoginSession(state, Date.now())) as Record<string, unknown> | undefined
-        if (session !== undefined) return { realm, payload: session }
-      }
-      return undefined
-    })()
+    // ⚠️ 会话按 realm 分片存放（国际版的在 `global`，其余家在 `cn`）。
+    // 查找规则见 findLoginSession（**浏览器的回调路径用的是同一个函数**）。
+    const saved = await findLoginSession(env, state)
     if (saved === undefined) return json({ done: false, message: '会话不存在或已过期' })
 
     const now = Date.now()
@@ -587,6 +981,30 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         const credential = await pollZcodeLogin(saved.payload['flow'] as never, AbortSignal.timeout(20_000))
         if (credential === undefined) return json({ done: false, message: '等待授权中…' })
         return json(await persistProviderCredential(env, credential, now))
+      }
+      // ── raccoon：微信扫码（二维码由本服务渲染，用户扫完即完成） ──
+      if (saved.payload['kind'] === 'raccoon') {
+        const { pollRaccoonQrLogin } = await import('./providers/raccoon.js')
+        const qrCode = saved.payload['qrCode']
+        if (typeof qrCode !== 'string' || qrCode === '') {
+          return json({ done: false, status: 'failed', message: '登录会话缺少 qrcode_code，请重新发起' })
+        }
+        const polled = await pollRaccoonQrLogin(qrCode, AbortSignal.timeout(20_000))
+        // `success` 才带凭据；其余状态如实回传，面板据此显示「等待扫码 / 已扫码待确认 / 已取消」
+        if (polled.status === 'success' && polled.credential !== undefined) {
+          return json(await persistProviderCredential(env, polled.credential, now))
+        }
+        if (polled.status === 'canceled') {
+          return json({ done: false, status: 'canceled', message: '用户已取消授权，请重新发起' })
+        }
+        return json({ done: false, status: polled.status, message: '等待扫码…' })
+      }
+      // ── codearts：浏览器回跳 + ticket 换取凭据 ──
+      // `{done:false, status}` 是**约定形状**：面板据此区分「等浏览器」
+      //（awaiting_browser）/「已收到回调正在换」（pending）/「终态失败」（failed），
+      // 而不是把三种状态都糊成一句「等待中」。
+      if (saved.payload['kind'] === 'codearts') {
+        return await pollCodeArtsLogin(env, saved, state, now)
       }
     } catch (error) {
       return json({ done: false, message: error instanceof Error ? error.message : String(error) })

@@ -301,3 +301,16 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
 .login-msg.ok { color: var(--ok); }
 .login-msg.err { color: var(--err); }
 .login-foot { font-size: 11px; line-height: 1.6; }
+
+/*
+ * 扫码登录的二维码容器。
+ *
+ * ⚠️ 必须给白底：二维码在深色主题下若跟着面板底色，对比度不足会**扫不出来**
+ *（微信的识别依赖深模块与浅背景的稳定反差）。故这里恒用白底 + 内边距，
+ * 不随主题变化 —— 功能性优先于配色一致性。
+ */
+.qr-box {
+  display: inline-block; margin: 10px 0; padding: 10px;
+  background: #fff; border-radius: 8px; line-height: 0;
+}
+.qr-box svg { width: 200px; height: 200px; display: block; }

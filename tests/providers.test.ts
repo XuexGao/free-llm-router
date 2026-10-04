@@ -504,3 +504,35 @@ test('⚠️ 国际版必须声明 requiresSystemFirst（否则 400 + 11128 伪�
   assert.ok(/requiresSystemFirst: true/.test(src), '国际版应打开它')
   assert.ok(src.includes("role: 'system'"), '应在缺失时自动补 system 首条')
 })
+
+// ─────────────────── 扫码登录（raccoon） ───────────────────
+
+test('⚠️ beginRaccoonQrLogin 必须是纯本地计算（不碰网络、不碰凭据）', async () => {
+  // ⚠️ 这条约束是**安全**要求，不是风格要求：
+  // raccoon 的 refresh_token 是**一次性轮换**的，任何误触网络的调用都可能
+  // 把用户的凭据消耗掉（我已经犯过两次）。
+  // 故「发起登录」必须只做本地计算：生成 code → 拼 URL → 渲染 SVG。
+  const { beginRaccoonQrLogin } = await import('../src/providers/raccoon.ts')
+
+  const realFetch = globalThis.fetch
+  let called = 0
+  globalThis.fetch = (() => { called += 1; throw new Error('不应发网络请求') }) as typeof fetch
+  try {
+    const started = beginRaccoonQrLogin()
+    assert.equal(called, 0, '发起登录不得发任何网络请求')
+    assert.match(started.code, /^[0-9a-f]{32}$/, 'qrcode_code 应是 32 位小写 hex')
+    assert.ok(started.qrUrl.startsWith('https://'), '二维码内容应是 https URL')
+    assert.ok(started.qrSvg.includes('<svg'), '应渲染出 SVG')
+    assert.ok(started.qrUrl.includes(started.code), 'URL 必须带上 code（服务端靠它认会话）')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('⚠️ 二维码容量：超长内容应抛错而不是产出扫不出来的坏码', async () => {
+  const { renderQrSvg } = await import('../src/providers/raccoon-qr.ts')
+  // 版本 1–10 纠错 M 的上限约 213 字节，远超登录 URL（约 145 字节）。
+  // 超出时必须抛错 —— 静默产出坏码会让用户对着一个永远扫不出的图发呆。
+  // 实际文案：「二维码内容过长（500 字节，上限 213 字节），请缩短内容」
+  assert.throws(() => renderQrSvg('x'.repeat(500)), /过长|上限|213/)
+})

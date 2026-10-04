@@ -12,14 +12,38 @@
  *    （`llm-adapter.ts:1147-1160`）。
  * 4. 有**每日签到**（`/v1/ops/delivery` → `/v1/ops/claim` → `/v1/ops/confirm`）。
  *
- * ## 🔴 登录为什么不可用（实测结论，不是偷懒）
+ * ## 登录：浏览器回跳式 ticket 流程（可在 Worker 内完成，**有一处未实测**）
  *
- * CodeArts 的浏览器登录必须由本地进程起一个 `127.0.0.1:<随机端口>` 的 HTTP
- * 监听来接收回调（源实现 `login.ts:170` 与 `login.ts:287` 两处 `createServer`，
- * 并用 `server.listen(0, '127.0.0.1')` 拿端口）。**Workers 没有监听 socket**，
- * 且**没有轮询替代**：回调是唯一能拿到 `secret` 的通道（`secret` 不通过任何
- * 查询端点下发），故无法用「轮询换设备码」绕开。
- * ⇒ `capabilities.login = false`，只支持从桌面端/IDE 导出凭据后粘贴导入。
+ * 参考实现里有两套登录流程（`login.ts`），**只有第一套可用于 Worker**：
+ *
+ * 1. ✅ **legacy ticket + `auth_callback_url`**（`login.ts:11-30` 构造 URL、
+ *    `login.ts:77-113` 轮询换凭据、`login.ts:201-213` 接住回跳的 `secret`）
+ *    —— 本次采用它。关键点是 `auth_callback_url` 是**通用参数**：参考实现填
+ *    `http://127.0.0.1:<port>/authentication`（`login.ts:26`），而本服务填
+ *    **自己的 Worker URL**（`/login/codearts/callback/<state>`，见
+ *    {@link buildCodeArtsCallbackUrl}），由 Worker 自己接住浏览器回跳。
+ * 2. ❌ **portal / PKCE OAuth**（`login.ts:244-271`）：portal 只认 `port` 参数并
+ *    **自己**拼 `http://127.0.0.1:<port>` 回调 —— `login.ts:268` 的原注释
+ *    「真实插件 URL 不含 auth_callback_url——portal 仅凭 port 参数构造回调」。
+ *    Worker 收不到打到用户 localhost 的请求，**此路不通，不要尝试**。
+ *
+ * ⚠️ **唯一未实测的一环**：**华为是否接受非 localhost 的 `auth_callback_url`**。
+ * 没有真人登录就无法验证。已实测的只是「URL 能按契约构造出来」「ticket 端点的
+ * 请求/响应契约来自参考实现的实测代码」；**未实测华为会不会拒绝或改写该
+ * callback**。若被拒，现象是浏览器侧报错、本服务的会话永远停在
+ * 「等待浏览器完成授权」—— 那时请回到「粘贴凭据导入」。
+ *
+ * ⚠️ **产出的凭据通常不可续期（已知代价，不是缺陷）**：ticket 响应只有
+ * AK/SK/security_token 三元组 —— 参考 `types.ts:5-22` 的
+ * `CodeArtsCredentialResponse` **没有** refresh_token / code_verifier / DPoP 私钥。
+ * 故浏览器登录进来的账号**不能静默续期**（`refresh()` 会如实报「材料不全，
+ * 请重新登录」），到期后需重新发起一次浏览器登录。
+ * 反过来这正是我们要的效果：本服务**绝不消费**用户那份单次使用的
+ * refresh_token，因此不会再出现「服务端一续期就把本地客户端踢掉 / 被本地
+ * 客户端踢掉」的互毁。
+ *
+ * 另：非 localhost 不可用的旧结论仍然适用于**另外几家**（lobsterai / trae），
+ * 它们的回调参数由上游**自己**拼成本机地址，没有通用的 callback 参数可用。
  *
  * ## 模型目录为什么是「实时拉取 + 静态兜底」而不是纯静态表
  *
@@ -476,8 +500,12 @@ async function signedGet(
  *
  * ⚠️ **三元组缺任何一个都抛错**。绝不把 token 兜底成 `''` ——
  * 那会产出「永远 401」的凭据，是最难排查的失败形态（`types.ts:148-151`）。
+ *
+ * 导出它只为一件事：浏览器登录流程必须把拿到的凭据材料**回灌到这里**
+ * （见 {@link codeArtsTicketCredentialToProvider}），从而保证「登录进来的凭据」
+ * 与「粘贴导入的凭据」是**同一套解析规则**、落盘形状完全一致。
  */
-function parseCredential(input: unknown): ProviderCredential {
+export function parseCredential(input: unknown): ProviderCredential {
   const root = unwrapCredentialRoot(input)
 
   // ── security_token（必填） ──
@@ -622,6 +650,432 @@ function pickExpiresAt(source: Record<string, unknown>): number {
   }
   const parsed = Date.parse(raw)
   return Number.isNaN(parsed) ? 0 : parsed
+}
+
+// ── 浏览器回跳登录（legacy ticket + auth_callback_url） ──
+
+/**
+ * 华为 CodeArts 的跳转入口（`login.ts:11`）。
+ *
+ * ⚠️ 它与 {@link HUAWEI_AUTH_BASE} 是**两级跳**：本 URL 只负责带上
+ * `auth_callback_url` / `plugin-name` / `ticket_id` 等参数，真正的登录页是后者
+ * （见 {@link buildCodeArtsLoginUrl}）。直接打开本 URL 不会出现登录表单。
+ */
+export const CODEARTS_LOGIN_BASE = 'https://devcloud.cn-north-4.huaweicloud.com/doer/redirect'
+
+/** 华为统一认证登录页（`login.ts:12`），用户实际看到的页面。 */
+export const HUAWEI_AUTH_BASE = 'https://auth.huaweicloud.com/authui/login.html'
+
+/**
+ * ticket 换凭据端点（`login.ts:13`）。
+ *
+ * ⚠️ 它与推理端点同 host 但**不同前缀**：推理在 `/api/v2`，本端点在
+ * `/snap-manager/v1/login/ticket`，且**不带华为签名**（此时还没有 AK/SK）。
+ */
+export const CODEARTS_TICKET_ENDPOINT =
+  'https://snap-access.cn-north-4.myhuaweicloud.com/snap-manager/v1/login/ticket'
+
+/**
+ * 本服务接收浏览器回跳的路径前缀。
+ *
+ * ⚠️ **`state` 放在路径里而不是 query 里**（见 {@link buildCodeArtsCallbackUrl}）：
+ * 参考实现的回调 URL 本身**不带 query**（`login.ts:26` 的
+ * `http://127.0.0.1:<port>/authentication`），因此**无法推断**华为回跳时是
+ * 「按 URL API 合并 query」还是「字符串拼 `?secret=`」。若 state 在 query 里而
+ * 华为用后者，回调会变成 `?state=x?secret=y` —— `secret` 直接解析不出来。
+ * 放在路径里对两种行为都成立。
+ */
+export const CODEARTS_LOGIN_CALLBACK_PATH = '/login/codearts/callback'
+
+/**
+ * 登录会话（= `state`）的有效期：**10 分钟**。
+ *
+ * 取值依据：参考实现给浏览器那一程的预算是 **180 秒**
+ *（`login.ts:337` 的 `OAUTH_CALLBACK_TIMEOUT_MS`），ticket 轮询默认最多
+ * **120 次 × 1 秒 ≈ 2 分钟**（`login.ts:83-88`）。两者相加约 5 分钟，
+ * 再留一倍余量 ⇒ 10 分钟。**刻意不设更长**：`state` 是「能领取一份凭据」的
+ * 能力凭证，窗口越短越安全。
+ */
+export const CODEARTS_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+
+/** ticket 端点要求的插件名（legacy 流程；`login.ts:15`）。 */
+export const CODEARTS_LOGIN_PLUGIN_NAME = 'snap_jetbrains'
+/**
+ * ticket 端点要求的插件版本（`login.ts:16`）。
+ *
+ * ⚠️ 它**不是本项目的版本**，而是参考实现逆向得到的真实插件版本号，
+ * 改动它会换不到凭据（与 portal 流程的 `5.2.0` 是两套，不要混用）。
+ */
+export const CODEARTS_LOGIN_PLUGIN_VERSION = '26.3.3'
+
+/**
+ * ticket 端点下发的一份凭据材料（字段名对齐华为 IAM 的两种形态）。
+ *
+ * ⚠️ `refresh_token` / `code_verifier` / `dpop_private_key_jwk` 是**可选透传**：
+ * 参考实现记录的响应里**没有**它们（`types.ts:5-22`），故一般不出现；
+ * 但万一某个版本的 ticket 端点下发了它们，透传下来就能让账号**可静默续期**
+ * （见 {@link codeArtsTicketCredentialToProvider}），不必为此改代码。
+ */
+export interface CodeArtsTicketMaterial {
+  access_key_id: string
+  secret_access_key: string
+  security_token: string
+  /** ISO 8601 或秒/毫秒时间戳字符串；空串 = 服务端未给出（不当成已过期）。 */
+  expires_at: string
+  domain_id: string
+  user_id: string
+  user_name: string
+  refresh_token?: string
+  code_verifier?: string
+  dpop_private_key_jwk?: string
+}
+
+/** 判定「是不是一个普通对象」（数组与 null 都不算）。 */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+/**
+ * 按候选键名取第一个非空字符串（兼容服务端把标识符下发成数字）。
+ *
+ * 与 {@link pickString} 的差异：这个是给**不可信的上游响应**用的，故对数字
+ * 也宽容（华为的 `user_id` 实测有数字形态）。
+ */
+function pickLooseString(source: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = readString(source, key)
+    if (value !== '') return value
+  }
+  return ''
+}
+
+/**
+ * 生成登录会话 id（= 回调 URL 里的 `state`）。
+ *
+ * ⚠️ **这就是本流程唯一的权限凭证**：谁拿到 state，谁就能把浏览器的回跳
+ * 绑到某个会话上。故用 **32 字节 CSPRNG**（256 位）而不是
+ * `crypto.randomUUID()`（122 位）—— 前者没有可猜的结构。
+ */
+export function generateCodeArtsLoginState(): string {
+  return toHex(crypto.getRandomValues(new Uint8Array(32)))
+}
+
+/**
+ * 生成本服务接收浏览器回跳的 URL。
+ *
+ * ⚠️ **不带 query**：理由见 {@link CODEARTS_LOGIN_CALLBACK_PATH}。
+ * `origin` 取**收到本次请求的那个 origin**（`url.origin`），故自定义域与
+ * `workers.dev` 域都能自动正确，无需配置。
+ */
+export function buildCodeArtsCallbackUrl(origin: string, state: string): string {
+  return `${origin.replace(/\/+$/, '')}${CODEARTS_LOGIN_CALLBACK_PATH}/${encodeURIComponent(state)}`
+}
+
+/**
+ * 按 `login.ts:25-30` 构造两级登录 URL。
+ *
+ * 与参考实现的**唯一差异**是回调地址由调用方给出（我们填自己的 Worker URL），
+ * 其余参数名、顺序、编码方式逐字对齐 —— 参数顺序不影响语义，但保持原样便于
+ * 与参考实现逐行对拍。
+ */
+export function buildCodeArtsLoginUrl(
+  callbackUrl: string,
+  ticketId: string,
+): { redirectUrl: string; loginUrl: string } {
+  const redirectUrl = `${CODEARTS_LOGIN_BASE}?IdeaType=jetbrains&auth_callback_url=${encodeURIComponent(callbackUrl)}`
+    + `&plugin-name=${CODEARTS_LOGIN_PLUGIN_NAME}&plugin-version=${CODEARTS_LOGIN_PLUGIN_VERSION}`
+    + `&ticket_id=${encodeURIComponent(ticketId)}`
+  const loginUrl = `${HUAWEI_AUTH_BASE}?service=${encodeURIComponent(redirectUrl)}`
+  return { redirectUrl, loginUrl }
+}
+
+/**
+ * 把一次 ticket 响应归一化为凭据材料；**尚未就绪时返回 `null`**
+ * （对应 `login.ts:33-62` 的 `parseCredentialResponse`）。
+ *
+ * 认两种响应形态（与参考实现一致，另加一层 `data` 解包）：
+ * 1. `{ credential: { access, secret, securitytoken, expires_at } }`；
+ * 2. `{ result: { accessKeyId, secretAccessKey, securityToken, expiration } }`。
+ *
+ * ⚠️ **与参考实现有一处刻意的差异**：参考实现在形态 1 里只要 `access` 与
+ * `securitytoken` 非空就返回凭据（`secret` 允许是空串，`login.ts:37-47`），
+ * 那会产出**永远 401** 的凭据（没有 SK 就无法完成 `SDK-HMAC-SHA256` 签名）。
+ * 这里要求 AK / SK / security_token **三项全非空**才认为「就绪」，否则当作
+ * 「还没到齐」继续轮询 —— 与 `parseCredential` 的严格口径一致
+ * （`types.ts:148-151`：绝不把关键字段兜底成空串）。
+ */
+export function parseCodeArtsTicketResponse(data: unknown): CodeArtsTicketMaterial | null {
+  const root = asRecord(data)
+  if (root === undefined) return null
+  // 一层 `data` 解包：ticket 端点在某些网关版本下会把载荷包在 data 里。
+  const inner = asRecord(root['data'])
+
+  const identity = (keys: readonly string[]): string =>
+    pickLooseString(root, keys) || (inner === undefined ? '' : pickLooseString(inner, keys))
+
+  const credential = asRecord(root['credential'])
+    ?? (inner === undefined ? undefined : asRecord(inner['credential']))
+  if (credential !== undefined) {
+    const ak = pickLooseString(credential, ['access', 'access_key_id', 'accessKeyId'])
+    const sk = pickLooseString(credential, ['secret', 'secret_access_key', 'secretAccessKey'])
+    const st = pickLooseString(credential, ['securitytoken', 'securityToken', 'security_token'])
+    if (ak !== '' && sk !== '' && st !== '') {
+      return {
+        access_key_id: ak,
+        secret_access_key: sk,
+        security_token: st,
+        expires_at: pickLooseString(credential, ['expires_at', 'expiresAt', 'expiration']),
+        domain_id: identity(['domain_id', 'domainId']),
+        user_id: identity(['user_id', 'userId']),
+        user_name: identity(['user_name', 'userName']),
+        ...optionalRefreshMaterial(credential, root, inner),
+      }
+    }
+  }
+
+  const result = asRecord(root['result'])
+    ?? (inner === undefined ? undefined : asRecord(inner['result']))
+  if (result !== undefined) {
+    const ak = pickLooseString(result, ['accessKeyId', 'access_key_id'])
+    const sk = pickLooseString(result, ['secretAccessKey', 'secret_access_key'])
+    const st = pickLooseString(result, ['securityToken', 'security_token', 'securitytoken'])
+    if (ak !== '' && sk !== '' && st !== '') {
+      return {
+        access_key_id: ak,
+        secret_access_key: sk,
+        security_token: st,
+        expires_at: pickLooseString(result, ['expiration', 'expiresAt', 'expires_at']),
+        domain_id: identity(['domain_id', 'domainId']),
+        user_id: identity(['user_id', 'userId']),
+        user_name: identity(['user_name', 'userName']),
+        ...optionalRefreshMaterial(result, root, inner),
+      }
+    }
+  }
+  return null
+}
+
+/** 透传可选的续期材料（三个容器里任一处出现即取；见 {@link CodeArtsTicketMaterial}）。 */
+function optionalRefreshMaterial(
+  ...sources: Array<Record<string, unknown> | undefined>
+): Pick<CodeArtsTicketMaterial, 'refresh_token' | 'code_verifier' | 'dpop_private_key_jwk'> {
+  const find = (keys: readonly string[]): string | undefined => {
+    for (const source of sources) {
+      if (source === undefined) continue
+      const value = pickLooseString(source, keys)
+      if (value !== '') return value
+    }
+    return undefined
+  }
+  const refresh = find(['refresh_token', 'refreshToken'])
+  const verifier = find(['code_verifier', 'codeVerifier'])
+  const jwk = find(['dpop_private_key_jwk', 'dpopPrivateKeyJwk'])
+  return {
+    ...(refresh === undefined ? {} : { refresh_token: refresh }),
+    ...(verifier === undefined ? {} : { code_verifier: verifier }),
+    ...(jwk === undefined ? {} : { dpop_private_key_jwk: jwk }),
+  }
+}
+
+/** ticket 响应里的显式错误（`readCodeArtsTicketError` 的返回值）。 */
+export interface CodeArtsTicketError {
+  /** 服务端给的错误码（`error_code` / `code` / `statusCode`），可能为空串。 */
+  code: string
+  /** 可读原因（优先 `error_msg` / `message`）。 */
+  message: string
+  /**
+   * 是否属于**瞬时**失败（服务端 5xx / 429）。
+   *
+   * 瞬时的继续轮询；非瞬时的立刻失败 —— 见 {@link fetchCodeArtsTicket}。
+   */
+  transient: boolean
+}
+
+/**
+ * 从 ticket 响应里读出**显式业务错误**；没有错误返回 `undefined`。
+ *
+ * ⚠️ 这是**刻意比参考实现严格**的一处（参考实现把所有失败一律 `continue`，
+ * `login.ts:99-108`）：
+ * 在 Worker 里轮询预算受会话 TTL 限制，一个已经死掉的 ticket（如 secret 无效）
+ * 若也照 120 次轮询，只会白打上游 120 个请求、并把失败拖到超时才暴露。
+ * 本项目的纪律是「失败必须显式」（AGENTS.md §7.2），故：
+ * - **有明确错误体**（`error_code` / `error` / 非 0 `code` / `success:false`）
+ *   且不是 5xx/429 ⇒ **立刻抛错**并带上服务端原文；
+ * - 其余（网络失败、非 JSON、HTTP 4xx 但无错误体、载荷里还没有凭据）
+ *   ⇒ 一律当成「尚未就绪」继续轮询。
+ *
+ * ⚠️ 「HTTP 4xx 但无错误体」**不能**判死：ticket 尚未创建时端点很可能就回
+ * 404（与 Qoder 设备码轮询同一形态，见 `providers/qoder.ts:1523-1526`）。
+ */
+export function readCodeArtsTicketError(data: unknown): CodeArtsTicketError | undefined {
+  const root = asRecord(data)
+  if (root === undefined) return undefined
+  const inner = asRecord(root['data'])
+  for (const source of [root, inner]) {
+    if (source === undefined) continue
+    const code = pickLooseString(source, ['error_code', 'code', 'statusCode', 'status_code'])
+    const error = pickLooseString(source, ['error'])
+    const message = pickLooseString(source, ['error_msg', 'message', 'msg', 'error_description'])
+    const successFalse = source['success'] === false
+    // `code` 为 0 / 200 表示「成功信封」（很多网关习惯），**不是**错误。
+    const codeIsFailure = code !== '' && code !== '0' && code !== '200'
+    if (!codeIsFailure && error === '' && !successFalse) continue
+    const numeric = Number(code)
+    const transient = Number.isFinite(numeric) && (numeric >= 500 || numeric === 429)
+    return {
+      code: code !== '' ? code : successFalse ? 'success=false' : '',
+      message: message !== '' ? message : error !== '' ? error : '服务端未给出原因',
+      transient,
+    }
+  }
+  return undefined
+}
+
+/** 轮询一次的结果。 */
+export type CodeArtsTicketAttempt =
+  | { status: 'ready'; credential: CodeArtsTicketMaterial }
+  | { status: 'pending' }
+
+/** `fetchCodeArtsTicket` / `pollCodeArtsTicket` 的可注入项（单测据此全用 mock）。 */
+export interface CodeArtsTicketOptions {
+  /** 注入 fetch（单测用；默认全局 `fetch`）。 */
+  fetcher?: typeof fetch
+  /** 调用方取消信号（会与内部超时合并）。 */
+  signal?: AbortSignal
+  /** 单次请求超时（默认 15 秒）。 */
+  timeoutMs?: number
+  pluginName?: string
+  pluginVersion?: string
+}
+
+/** 轮询选项（在 {@link CodeArtsTicketOptions} 之上加循环参数）。 */
+export interface CodeArtsTicketPollOptions extends CodeArtsTicketOptions {
+  /** 最多尝试次数（参考实现默认 120，`login.ts:83`）。 */
+  maxAttempts?: number
+  /** 两次尝试之间的间隔毫秒（参考实现默认 1000，`login.ts:88`）。 */
+  gapMs?: number
+  /** 注入 sleep（单测用，避免真等待）。 */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * **轮询一次** ticket 端点。
+ *
+ * 协议（逐字对齐 `login.ts:86-108`）：`GET {endpoint}?ticket_id=…&secret=…`，
+ * 头为 `Content-Type: application/json;charset=UTF-8` + `plugin-name` +
+ * `plugin-version`。
+ *
+ * @returns `ready` = 拿到凭据；`pending` = 尚未就绪 / 瞬时失败，调用方应继续。
+ * @throws ProviderError 服务端给出**明确且非瞬时**的错误（见
+ *   {@link readCodeArtsTicketError}）。
+ */
+export async function fetchCodeArtsTicket(
+  ticketId: string,
+  secret: string,
+  options: CodeArtsTicketOptions = {},
+): Promise<CodeArtsTicketAttempt> {
+  const fetcher = options.fetcher ?? fetch
+  const pluginName = options.pluginName ?? CODEARTS_LOGIN_PLUGIN_NAME
+  const pluginVersion = options.pluginVersion ?? CODEARTS_LOGIN_PLUGIN_VERSION
+  const timeoutMs = options.timeoutMs ?? 15_000
+  const url = `${CODEARTS_TICKET_ENDPOINT}?ticket_id=${encodeURIComponent(ticketId)}&secret=${encodeURIComponent(secret)}`
+  const timeout = AbortSignal.timeout(timeoutMs)
+  const signal = options.signal === undefined ? timeout : AbortSignal.any([options.signal, timeout])
+
+  let response: Response
+  try {
+    response = await fetcher(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'plugin-name': pluginName,
+        'plugin-version': pluginVersion,
+      },
+      signal,
+    })
+  } catch {
+    // 网络失败 / 超时：按瞬态处理，继续轮询（`login.ts:99-101` 的 `continue`）。
+    return { status: 'pending' }
+  }
+
+  const text = await response.text().catch(() => '')
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    // 非 JSON（网关 HTML 错误页等）：同样按瞬态处理（`login.ts:106-108`）。
+    return { status: 'pending' }
+  }
+
+  const material = parseCodeArtsTicketResponse(body)
+  if (material !== null) return { status: 'ready', credential: material }
+
+  const failure = readCodeArtsTicketError(body)
+  if (failure !== undefined && !failure.transient) {
+    throw new ProviderError({
+      provider: 'codearts',
+      httpStatus: response.status,
+      message: `CodeArts 登录换取凭据被拒（HTTP ${response.status}，${failure.code === '' ? 'error' : failure.code}）：`
+        + `${failure.message}。服务端原文片段：${text.trim().slice(0, 200) === '' ? '(空响应体)' : text.trim().slice(0, 200)}`,
+    })
+  }
+  return { status: 'pending' }
+}
+
+/**
+ * 轮询 ticket 端点直到拿到凭据（默认最多 120 次 × 1 秒，与参考实现同口径）。
+ *
+ * ⚠️ Worker 侧的调用方**不要**直接用默认值：10ms CPU 预算下不能在请求里空等
+ * 两分钟。回调里用 8 次、面板轮询里用 1 次（见 `src/index.ts`）。
+ */
+export async function pollCodeArtsTicket(
+  ticketId: string,
+  secret: string,
+  options: CodeArtsTicketPollOptions = {},
+): Promise<CodeArtsTicketMaterial> {
+  const maxAttempts = options.maxAttempts ?? 120
+  const gapMs = options.gapMs ?? 1_000
+  const sleep = options.sleep ?? ((ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms) }))
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0 && gapMs > 0) await sleep(gapMs)
+    const outcome = await fetchCodeArtsTicket(ticketId, secret, options)
+    if (outcome.status === 'ready') return outcome.credential
+  }
+  throw new ProviderError({
+    provider: 'codearts',
+    retryable: true,
+    message: `CodeArts 登录超时（已轮询 ${maxAttempts} 次仍未拿到凭据），请回到面板重新发起登录`,
+  })
+}
+
+/**
+ * 把 ticket 材料转成**本项目的凭据形状**。
+ *
+ * ⚠️ 这里**必须**回灌 {@link parseCredential}，而不是手搓字段：
+ * 手搓会漏掉 `uid` 的兜底规则（`user_id` → `domain_id` → `ak:<AK>`）与
+ * `expires_at` 的秒/毫秒/ISO 归一化，于是同一份 creds 会因为「登录进来」
+ * 与「粘贴进来」而落成**两条账号记录**（或永远被判「已过期」而反复续期）。
+ * 走同一条解析路径还顺带保证：缺 AK/SK/security_token 时**抛错**而不是产出
+ * 一份永远 401 的凭据。
+ */
+export function codeArtsTicketCredentialToProvider(material: CodeArtsTicketMaterial): ProviderCredential {
+  return parseCredential({
+    provider: 'codearts',
+    access_key_id: material.access_key_id,
+    secret_access_key: material.secret_access_key,
+    security_token: material.security_token,
+    expires_at: material.expires_at,
+    domain_id: material.domain_id,
+    user_id: material.user_id,
+    user_name: material.user_name,
+    ...(material.refresh_token === undefined ? {} : { refresh_token: material.refresh_token }),
+    ...(material.code_verifier === undefined ? {} : { code_verifier: material.code_verifier }),
+    ...(material.dpop_private_key_jwk === undefined
+      ? {}
+      : { dpop_private_key_jwk: material.dpop_private_key_jwk }),
+  })
 }
 
 // ── 模型目录 ──
@@ -1322,16 +1776,16 @@ export const codeartsProvider: Provider = {
   id: 'codearts',
   name: 'CodeArts（华为云码道）',
   capabilities: {
-    // 🔴 见文件头「登录为什么不可用」：回调依赖 127.0.0.1 本地监听
-    // （`login.ts:170` / `login.ts:287`），Workers 无监听 socket，
-    // 且没有轮询替代（`secret` 只在浏览器回调里到达）。
-    login: false,
-    loginBlockedReason:
-      'CodeArts 登录需要在本机 127.0.0.1 上开一个回调端口接收浏览器的授权跳转，'
-      + 'Cloudflare Workers 无法监听本地端口，且没有轮询式替代方案。'
-      + '请在码道 IDE / 桌面端登录后导出凭据（含 access_key_id、secret_access_key、'
-      + 'security_token 三项，security_token 也写作 credential.securitytoken），'
-      + '把这段 JSON 粘贴到本项目的「导入凭据」里。',
+    /**
+     * ✅ **可从本服务发起**：走 legacy ticket + `auth_callback_url` 流程，
+     * 回调指向**本服务自己的 URL**（`/login/codearts/callback/<state>`），
+     * 不需要在本机开监听端口（完整说明见文件头）。
+     *
+     * ⚠️ **有一处未实测**：华为是否接受非 localhost 的 `auth_callback_url`。
+     * 没有真人登录就验不了；若被拒，会话会停在「等待浏览器完成授权」。
+     * 仍声明 `true`：流程本身已实现，且 URL 构造与 ticket 契约都有实测依据。
+     */
+    login: true,
     listModels: true,
     chat: true,
     balance: true,
