@@ -20,7 +20,7 @@
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
-- **406 条单测通过**（`npm test`）。
+- **417 条单测通过**（`npm test`）。
 
 **第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
 原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
@@ -527,7 +527,7 @@ TaskRunner DO
 
 ## 九、实施进度与实测发现
 
-**第 1–8 步全部完成，项目可交付。** `npm test` → **406/406 通过**；`npm run typecheck` → 通过。
+**第 1–8 步全部完成，项目可交付。** `npm test` → **417/417 通过**；`npm run typecheck` → 通过。
 
 > 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
 > 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
@@ -1284,7 +1284,57 @@ from the dashboard. Please try again later.
 —— 那个报错**与 DO 重名毫无关系**，只是「worker 名对不上」的副产物。
 排查时别往 DO 配置上找。
 
-### 9.15 项目结构（最终）
+### 9.15 面板 UI 修复（2026-10-05 线上实测后）
+
+> ⚠️ **本节修正 §9.8 的一处结论**：§9.8 记录了面板「已上线、功能可用」，
+> 但那只验证了**资源可达与安全头**，**没有在浏览器里走一遍登录流程**。
+> 实际上从提交 `cd7fd08` 起，面板在登录后就是**一片空白**（见下 P0），
+> 一直没有任何测试覆盖到「登录成功后会发生什么」。
+>
+> **教训**：静态检查（HTTP 200 / content-type / 安全头 / 单测里的字符串断言）
+> 全绿，**不等于页面能用**。凡是「用户要在浏览器里点」的流程，必须真的点一遍。
+
+| 级别 | 缺陷 | 根因 |
+|---|---|---|
+| **P0** | **登录成功后整个面板空白**（桌面与手机都是） | `bootstrap()` 里 `$('setup-hint').hidden = true` 引用的元素已在 cd7fd08 从 index.html 删掉 → 赋值抛 `TypeError`，且恰好在 `setAuth()` / `switchView()` **之前** → 启动流程整个中断，**不报任何错** |
+| P1 | 顶栏主题按钮图标不显示（空框），按钮缩成 **20×10px** | `THEME_ICON` 的 SVG 串缺 `xmlns`；`image/svg+xml` 是 **XML** 解析，**不像 HTML 解析那样隐式补 SVG 命名空间** → 根元素是 `namespaceURI: null` 的普通 Element → 渲染成 0×0 |
+| P1 | 表格的横向滚动**从未生效**，手机上列被压扁 | 全局 `table { width: 100% }` 让表格永不溢出，`.table-wrap` 的 `overflow-x` 空转 —— 表格不是滚动而是**被压缩**：五列明细表表头被挤成竖排单字（「类/型」），`codearts` 断成 `codea/rts` |
+| P2 | 手机上 5 个计数块纵排占 344px，首个供应商卡片被推到 578px | 单列规则挂在 `max-width: 420px`，而 420 覆盖 375/390/393/402/412（实测每行几个：375/390/412→1，仅 430+ 为 2），注释写的却是「极窄屏（老机型/分屏）」 |
+| P2 | 积分包页显示 **「可用 undefined」** | 后端对「不支持查余额」回 `{skipped:true, reason}`（既无 `error` 也无 `total`），前端只判 `a.error` → 落到 else 分支把 `undefined` 拼进字符串 |
+| P2 | 错误文案被切掉尾巴（`Unauthorized: Please make sure you're`） | `a.error.slice(0, 60)` 硬截断，无省略号、无 `title` |
+| P3 | 空的 `.out` 画出 22px 空边框；柱状图时间标签折行；登录卡片顶到屏幕边缘 | 见 `style.css.txt` 对应注释 |
+
+**🔑 两条新增的不变式测试**（这两条是本轮最有价值的产出，其余都是具体修复）：
+
+1. **`$(id)` 引用的每个 id 都必须存在于面板 HTML**
+   （`tests/panel.test.ts`）。P0 与「`loadAccounts` 里的 `$('accounts')`」
+   是**同一类悬空引用** —— 删了元素没删引用，`$()` 返回 `null`，
+   后续操作抛错。这类缺陷**不会自己暴露**（不报错只是不生效），
+   只能靠静态不变式拦住。
+   > 顺带发现：`loadAccounts` 里的 `$('accounts')` 已被同视图的
+   > `loadTaskUids()` 掩盖成**静默失效** —— 任务中心看着正常，但该函数
+   > 后续逻辑一行都没执行，而导入 / 登录 / 删除后共 7 个调用点全在空转。
+
+2. **`.table-wrap > table { width: max-content; min-width: 100% }` 必须配
+   `main > * { min-width: 0 }`**。只改前者会**反而引入全页横向溢出**：
+   `main` 是 `display: grid`，网格项默认 `min-width: auto`（不小于内容最小宽度），
+   表格按 max-content 取宽后网格轨道被撑开 —— 实测 390px 视口下
+   `docScrollW` 422 > 375。这与既有的 `.count { min-width: 0 }`
+   是同一类陷阱（flex/grid 项默认不收缩）。
+
+**验证方式**：单测 406 → **417**；`typecheck` 与 `deploy --dry-run` 通过；
+因沙箱内 `wrangler dev` 起不来（workerd tcmalloc `MmapAligned` OOM），
+改用「本地静态服务 + 假 API」在真实浏览器 / 手机视口
+（320/360/375/390/412/430）逐视图验证，再部署后线上复测。
+
+**⚠️ 部署踩到的环境坑**：`wrangler deploy` 报
+`auth token has expired and could not be refreshed because the Cloudflare
+auth server could not be reached`。**不是登录失效**（凭据未变），而是
+本机 IPv6 不通、而 Node 默认优先 IPv6 去连 `dash.cloudflare.com`
+（`UND_ERR_CONNECT_TIMEOUT`；同一时刻 `curl` 走 IPv4 是通的）。
+**修法**：`NODE_OPTIONS=--dns-result-order=ipv4first npx wrangler deploy`。
+
+### 9.16 项目结构（最终）
 
 ```
 src/
