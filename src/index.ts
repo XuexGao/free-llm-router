@@ -224,6 +224,89 @@ async function persistProviderCredential(
   return { done: true, provider: providerId, uid: storageUid, nickname: credential.nickname, realm }
 }
 
+/**
+ * 找出某供应商的账号**实际在哪个分片**。
+ *
+ * ## ⚠️ 为什么必须有它（实测踩到：「国际版的模型管理不了」）
+ *
+ * 账号按凭据的 `extras.realm` 分片存放（WorkBuddy 国际版在 `global`），
+ * 而模型的「启用/停用」列表是**按供应商存在分片里**的
+ *（`disabledModels`，见 `AccountPoolDO`）。
+ *
+ * 所有管理类端点原先一律 `body.realm ?? 'cn'` —— 于是对国际版：
+ * 读的是 cn 分片（那里没有它的停用记录，看起来「一个都没关」），
+ * 写也写进 cn 分片（**真正的账号在 global，读的时候根本看不到**）。
+ * 用户的表现就是「开关点了没反应 / 管理不了」。
+ *
+ * 规则：先用调用方指定的分片；若该分片里**这个供应商一个账号都没有**，
+ * 就回退到另一个。只在「一个都没有」时回退，避免把
+ *「有账号但都在冷却」误判成「该换分片」。
+ */
+async function realmForProvider(
+  env: Env,
+  providerId: string,
+  requested: string | undefined,
+): Promise<string> {
+  const candidates = requested === undefined || requested === '' ? ['cn', 'global'] : [requested]
+  for (const realm of candidates) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const has = (await pool.listAccounts(realm, Date.now())).some(
+      (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+    )
+    if (has) return realm
+  }
+  // 都没账号：用调用方指定的（或默认 cn），让后续逻辑如实报「没有账号」
+  return requested === undefined || requested === '' ? 'cn' : requested
+}
+
+/**
+ * 写「停用模型」列表 —— 写到**该供应商账号所在的规范分片**，
+ * 并把同一批 id 从**另一个分片**清掉（自愈）。
+ *
+ * ## ⚠️ 为什么必须清另一个分片（实测踩到）
+ *
+ * 修复前所有管理端点都写 `realm='cn'`，于是 WorkBuddy 国际版的停用记录
+ * 被写进了 **cn** 分片（而它的账号在 global）。后来读的时候是**两个分片合并**，
+ * 于是「在 global 里启用」之后，cn 分片里那条陈旧记录仍然把模型标成已停用 ——
+ * 表现为「开关点了返回 ok，但状态没变」，用户说「管理不了」。
+ *
+ * 所以写入时必须**双写清理**：规范分片设成新值，另一个分片把同批 id 删掉。
+ * 这样无论历史脏数据在哪，下一次写操作都会把它纠正过来（自愈，无需手工迁移）。
+ */
+async function writeDisabledModels(
+  env: Env,
+  providerId: string,
+  realm: string,
+  mutate: (current: Set<string>) => void,
+): Promise<number> {
+  const canonical = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const current = new Set(await canonical.getDisabledModels(providerId))
+  mutate(current)
+  await canonical.setDisabledModels(providerId, [...current])
+
+  // ⚠️ 另一个分片**镜像**成同一份列表（不是「按 current 过滤」）。
+  //
+  // 我第一版写成 `otherList.filter((id) => !current.has(id))` —— 那是错的：
+  // 它保留的是「canonical 里**仍然**停用的 id」，于是当 canonical 本来就是空
+  //（WorkBuddy 国际版的停用记录**全在 cn** 分片、global 里一条没有）时，
+  // `current` 为空 ⇒ 一个都不删 ⇒ cn 那 29 条陈旧记录原封不动，
+  // 合并读取后模型仍显示为停用（用户看到的还是「开关没反应」）。
+  //
+  // 正确做法是**镜像**：停用状态在逻辑上属于「供应商」而非「分片」，
+  // 故两个分片最终应持有同一份列表。这样无论历史脏数据落在哪，
+  // 任何一次写操作都会把它纠正过来（自愈），也不需要手工迁移。
+  const otherRealm = realm === 'cn' ? 'global' : 'cn'
+  const other = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(otherRealm))
+  const finalList = [...current]
+  const otherList = await other.getDisabledModels(providerId)
+  const same =
+    otherList.length === finalList.length && otherList.every((id) => current.has(id))
+  if (!same) {
+    await other.setDisabledModels(providerId, finalList)
+  }
+  return current.size
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
@@ -645,17 +728,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const body = (await request.json().catch(() => ({}))) as {
       realm?: string; provider?: string; model?: string; enabled?: boolean
     }
-    const realm = body.realm ?? 'cn'
     const providerId = body.provider ?? ''
     const model = body.model ?? ''
+    // ⚠️ 用「该供应商账号实际所在的分片」，否则国际版的开关会写错分片
+    const realm = await realmForProvider(env, providerId, body.realm)
     if (providerId === '' || model === '') {
       return jsonError(400, 'provider 与 model 必填', 'invalid_request')
     }
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const current = new Set(await pool.getDisabledModels(providerId))
-    if (body.enabled === false) current.add(model)
-    else current.delete(model)
-    await pool.setDisabledModels(providerId, [...current])
+    await writeDisabledModels(env, providerId, realm, (current) => {
+      if (body.enabled === false) current.add(model)
+      else current.delete(model)
+    })
     return json({ ok: true, provider: providerId, model, enabled: body.enabled !== false })
   }
 
@@ -667,18 +750,18 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const body = (await request.json().catch(() => ({}))) as {
       realm?: string; provider?: string; models?: unknown; enabled?: boolean
     }
-    const realm = body.realm ?? 'cn'
     const providerId = body.provider ?? ''
     if (providerId === '') return jsonError(400, 'provider 必填', 'invalid_request')
+    // ⚠️ 同上：国际版在 global 分片
+    const realm = await realmForProvider(env, providerId, body.realm)
     if (!Array.isArray(body.models)) return jsonError(400, 'models 必须是数组', 'invalid_request')
 
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const current = new Set(await pool.getDisabledModels(providerId))
     const ids = body.models.filter((m): m is string => typeof m === 'string' && m !== '')
-    if (body.enabled === false) for (const id of ids) current.add(id)
-    else for (const id of ids) current.delete(id)
-    await pool.setDisabledModels(providerId, [...current])
-    return json({ ok: true, provider: providerId, changed: ids.length, disabledCount: current.size })
+    const size = await writeDisabledModels(env, providerId, realm, (current) => {
+      if (body.enabled === false) for (const id of ids) current.add(id)
+      else for (const id of ids) current.delete(id)
+    })
+    return json({ ok: true, provider: providerId, changed: ids.length, disabledCount: size })
   }
 
   // ── 清除模型级冷却（「解冻」） ──
@@ -737,12 +820,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         bound.listModels(c, AbortSignal.timeout(20_000)),
       )
       // 带上「是否被用户停用」标记，供面板渲染开关
-      const disabled = await pool.getDisabledModels(providerId)
-      const set = new Set(disabled)
+      // ⚠️ 合并**两个分片**的停用列表：停用记录是按供应商存在各自分片里的，
+      // 只看当前分片会让「在另一个分片关掉的模型」重新显示为启用。
+      const set = new Set<string>()
+      for (const p of ['cn', 'global']) {
+        const other = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(p))
+        for (const id of await other.getDisabledModels(providerId)) set.add(id)
+      }
       return json({
         provider: providerId,
         models: models.map((m) => ({ ...m, disabled: set.has(m.id) })),
-        disabledCount: disabled.length,
+        disabledCount: set.size,
       })
     } catch (error) {
       return jsonError(502, error instanceof Error ? error.message : String(error), 'list_models_failed')
@@ -1127,24 +1215,44 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 
   // ── OpenAI 兼容：模型列表 ──
   if (path === '/v1/models' && request.method === 'GET') {
-    const realm = url.searchParams.get('realm') ?? 'cn'
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const accounts = await pool.listAccounts(realm, Date.now())
+    // ⚠️ **必须遍历两个 realm**（实测踩到：WorkBuddy 国际版在目录里完全消失）。
+    //
+    // 账号按凭据的 `extras.realm` 分片存放（国际版在 `global`），
+    // 而这里原先只看 `?realm=`（缺省 `cn`）—— 于是国际版**永远不会出现**，
+    // 表现为「账号登录好了、别处也能用，但 /v1/models 里没有它」，
+    // 客户端根本选不到。
+    //
+    // ⚠️ 每个账号要**连它的 realm 一起记**：取凭据必须回到**同一个分片**的
+    // DO stub（跨分片拿不到）。丢掉 realm 会让国际版账号在取凭据时丢失，
+    // 或者更糟 —— 拿 cn 分片的同名 uid 去取到别人的凭据。
+    //
+    // 客户端仍可用 `?realm=` 限定只看某一个分片（保留原有语义）。
+    const requestedRealm = url.searchParams.get('realm')
+    const realms = requestedRealm === null || requestedRealm === '' ? ['cn', 'global'] : [requestedRealm]
+
+    const pools = new Map<string, ReturnType<typeof env.ACCOUNT_POOL.get>>()
+    for (const r of realms) pools.set(r, env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r)))
 
     // ⚠️ **只列「有账号」的供应商的模型**（用户要求）。
     //
     // 没有账号的供应商，其模型选了也只会报「没有可用账号」——
     // 列出来只会让客户端挑到一个必然失败的模型。
-    // 这也让「登录后再显示」自然成立：登录后 accountCounts 变化，模型即出现。
+    // 这也让「登录后再显示」自然成立：登录后账号数变化，模型即出现。
     //
     // 只对声明 `listModels` 的家拉目录；逐家**串行**（同时出站连接上限 6，
     // 且并行打上游更容易触发风控）。
-    const byProvider = new Map<string, typeof accounts>()
-    for (const a of accounts) {
-      const pid = a.provider ?? DEFAULT_PROVIDER
-      const list = byProvider.get(pid) ?? []
-      list.push(a)
-      byProvider.set(pid, list)
+    // 账号 + 它所在的分片（取凭据/停用列表都要回到同一分片）
+    type Sourced = { account: AccountState; realm: string }
+    const byProvider = new Map<string, Sourced[]>()
+    for (const r of realms) {
+      const pool = pools.get(r)
+      if (pool === undefined) continue
+      for (const a of await pool.listAccounts(r, Date.now())) {
+        const pid = a.provider ?? DEFAULT_PROVIDER
+        const list = byProvider.get(pid) ?? []
+        list.push({ account: a, realm: r })
+        byProvider.set(pid, list)
+      }
     }
 
     const data: Array<Record<string, unknown>> = []
@@ -1154,17 +1262,31 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     for (const [providerId, list] of byProvider) {
       const provider = findProvider(providerId)
       if (provider === undefined || !provider.capabilities.listModels) continue
-      const account = list.find((a) => !a.disabled)
-      if (account === undefined) continue
-      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      const picked = list.find((x) => !x.account.disabled)
+      if (picked === undefined) continue
+      // ⚠️ 用**该账号自己分片**的 stub 取凭据与停用列表
+      const pool = pools.get(picked.realm)
+      if (pool === undefined) continue
+      const credential = (await pool.getCredential(picked.account.uid)) as ProviderCredential | undefined
       if (credential === undefined) continue
 
-      const disabled = new Set(await pool.getDisabledModels(providerId))
+      // ⚠️ 停用列表是**按供应商**存的，但存在各自 realm 的分片里。
+      // 合并两边，否则「国际版关掉的模型」在国内分片里查不到、会重新冒出来。
+      const disabled = new Set<string>()
+      for (const p of pools.values()) {
+        for (const id of await p.getDisabledModels(providerId)) disabled.add(id)
+      }
       disabledTotal += disabled.size
 
       try {
         const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
-        const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+        // ⚠️ 走**续期重试**：过期的令牌不该让整家从目录里消失。
+        // 实测踩到：raccoon 的 access token 过期后，/v1/models 直接把它
+        // 归到 errors 里，客户端看到的是「这家没有模型」——
+        // 而它其实只需要续期一次就恢复。
+        const { value: models } = await withRefreshRetry(env, pool, providerId, credential, (c) =>
+          bound.listModels(c, AbortSignal.timeout(20_000)),
+        )
         for (const m of models) {
           if (disabled.has(m.id)) continue
           const base = m as unknown as Record<string, unknown>
