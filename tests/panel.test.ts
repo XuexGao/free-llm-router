@@ -14,6 +14,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { splitModelName } from '../src/providers/types.ts'
 
 import { CSP, panelAsset, securityHeaders } from '../src/panel/index.ts'
 
@@ -358,4 +359,37 @@ test('⚠️ 默认视图必须是真实导航项（否则刷新后空白）', (
     /function switchView\(name\)\s*\{[\s\S]{0,240}hasOwnProperty\.call\(VIEW_LOADERS, name\)/.test(js),
     'switchView 应对非法视图名回退',
   )
+})
+
+test('⚠️ /v1/models 目录里不得出现裸名（一律带 provider/ 前缀）', () => {
+  // 用户要求：「api 上没有前缀的 deepseek-v4.1-flash 和 glm-5.3-flash
+  // 是哪个供应商的，加上前缀，方便区分」。
+  //
+  // 早先给默认供应商额外暴露一份裸名，于是同一模型在目录里出现两次
+  //（`buddy/glm-5.3-flash` 与 `glm-5.3-flash`），而多家又有同名模型
+  //（buddy / codearts / trae 都有 `deepseek-v4.1-flash`）——
+  // 裸名根本分不清是哪一家。
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.ok(
+    /data\.push\(\{ \.\.\.base, id: `\$\{providerId\}\/\$\{m\.id\}` \}\)/.test(src),
+    '目录项必须带 provider/ 前缀',
+  )
+  // 不能再有针对默认供应商的裸名分支
+  assert.ok(
+    !/if \(providerId === DEFAULT_PROVIDER\) data\.push\(base\)/.test(src),
+    '不得再单独给默认供应商推裸名',
+  )
+})
+
+test('⚠️ 裸名仍必须能路由（目录不带前缀 ≠ 请求不接受裸名）', () => {
+  // 目录负责「说清楚」，路由负责「不 breaking」——
+  // 已有客户端配置里写的裸名不能因为这个改动而失效。
+  const r = splitModelName('deepseek-v4.1-flash', ['buddy', 'codearts', 'trae'], 'buddy')
+  assert.equal(r.provider, 'buddy', '裸名回退到默认供应商')
+  assert.equal(r.model, 'deepseek-v4.1-flash')
+
+  // 而带前缀时按前缀路由，不会混淆同名模型
+  const c = splitModelName('codearts/deepseek-v4.1-flash', ['buddy', 'codearts', 'trae'], 'buddy')
+  assert.equal(c.provider, 'codearts')
+  assert.equal(c.model, 'deepseek-v4.1-flash')
 })

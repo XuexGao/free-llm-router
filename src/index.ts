@@ -1168,12 +1168,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         for (const m of models) {
           if (disabled.has(m.id)) continue
           const base = m as unknown as Record<string, unknown>
-          // ⚠️ 同时暴露**裸名**与 **`provider/` 前缀名**：
-          // - 裸名保持既有用户兼容（他们已经在用 `deepseek-v4-flash`）；
-          // - 带前缀名让多供应商场景无歧义（多家可能有同名模型）。
+          // ⚠️ **目录里一律带 `provider/` 前缀**（用户要求「加上前缀，方便区分」）。
+          //
+          // 早先还给默认供应商额外暴露一份**裸名**，结果是同一个模型在目录里
+          // 出现两次（`buddy/glm-5.3-flash` 与 `glm-5.3-flash`），
+          // 而多家又有同名模型（`buddy/`、`codearts/`、`trae/` 都有
+          // `deepseek-v4.1-flash`）—— 用户看到裸名根本分不清是哪一家。
+          //
+          // ⚠️ **请求侧仍然接受裸名**（回退到默认供应商，见 `splitModelName`）：
+          // 已有的客户端配置不会因为这个改动而失效，只是目录里不再列它。
+          // 兼容与无歧义两件事分开处理 —— 目录负责「说清楚」，路由负责「不breaking」。
           data.push({ ...base, id: `${providerId}/${m.id}` })
-          // 裸名只给**默认供应商**（否则多家重名会互相覆盖，客户端拿到谁不确定）
-          if (providerId === DEFAULT_PROVIDER) data.push(base)
         }
       } catch (error) {
         // ⚠️ 逐家兜错：一家失败不该让整个目录 500（用户可能只想用另一家）
