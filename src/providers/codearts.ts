@@ -662,40 +662,42 @@ function pickExpiresAt(source: Record<string, unknown>): number {
  * （见 {@link buildCodeArtsLoginUrl}）。直接打开本 URL 不会出现登录表单。
  */
 /**
- * ⚠️ **必须是 `devcloud.huaweicloud.com`，不能带区域前缀**（实测 2026-10-04）。
+ * 华为登录入口。
  *
- * 参考实现写的是 `https://devcloud.cn-north-4.huaweicloud.com/doer/redirect`，
- * 但那个 host 上的该 API **已经下线**：
+ * ## ⚠️ 必须是**带区域**的 `devcloud.cn-north-4.huaweicloud.com`（实测教训）
  *
- * ```
- * GET https://devcloud.cn-north-4.huaweicloud.com/doer/redirect?…
- * → HTTP 404 {"error_code":"APIGW.0101",
- *             "error_msg":"The API does not exist or has not been published in the environment"}
- * ```
+ * 我一度改成不带区域的 `devcloud.huaweicloud.com`，理由是「带区域的那个返回 404」。
+ * **那是误判，而且改坏了**：用户点开后跳到了
+ * `https://devcloud.huaweicloud.com/home?IdeaType=jetbrains&auth_callback_url=…`
+ * —— 一个毫不相关的落地页。
  *
- * 而**去掉区域前缀**的 `devcloud.huaweicloud.com` 返回 **200** 并带一段跳转脚本
- * （把 `service` 参数原样转给 `auth.huaweicloud.com/authui/login`）。
+ * 实测澄清（2026-10-04）：
  *
- * 这正是用户报障「华为登录之后一直显示登录中…」的根因：
- * 用户点开的授权页是 **404 错误页**，根本没有登录框，
- * 于是浏览器永远不会回跳到我们的 callback，面板只能一直等。
+ * | host | 行为 |
+ * |---|---|
+ * | `devcloud.huaweicloud.com` | 对**任意路径**（含 `/doer/nonexistent`、`/home`）都返回同一段跳转脚本 —— 它是**通用兜底路由**，不是真正的 API |
+ * | `devcloud.cn-north-4.huaweicloud.com` | `/doer/redirect` 返回**该路径专属**的跳转脚本（把 `service` 转给 `authui/login`） |
  *
- * ⚠️ 排查手法值得记下：**不要只看「页面能不能打开」**。
- * 那个 404 返回的是 JSON 错误体、HTTP 状态码确实是 404 ——
- * 但如果只看「请求有没有响应」，会误以为端点还活着。
- * 判据应是**响应体是否是预期的跳转脚本**。
+ * ⚠️ **判据不能是「有没有 200 / 有没有响应」**：无区域的兜底对什么路径都回 200，
+ * 看起来"更健康"，实际是把用户丢到一个无关页面。要判断一个端点是否**真的存在**，
+ * 必须用**不存在的路径做对照**（`/doer/nonexistent` 也回同样内容 ⇒ 那是兜底）。
+ *
+ * ⚠️ 我先前那次 404 观察是**偶发**的（同一 URL 连打 6 次：5 次跳转脚本、1 次网络失败），
+ * 被误读成「端点已下线」。**单次探测不足以判定端点存废**。
  */
-export const CODEARTS_LOGIN_BASE = 'https://devcloud.huaweicloud.com/doer/redirect'
+export const CODEARTS_LOGIN_BASE = 'https://devcloud.cn-north-4.huaweicloud.com/doer/redirect'
 
 /** 华为统一认证登录页（`login.ts:12`），用户实际看到的页面。 */
 /**
  * 华为认证页。
  *
- * ⚠️ 路径是 **`/authui/login`（无 `.html`）** —— 这是 `doer/redirect` 的
- * 跳转脚本自己拼出来的目标（实测响应体里的
- * `window.location.replace('https://auth.huaweicloud.com/authui/login?service=' + …)`）。
- * 参考实现写的是 `/authui/login.html`，两者都能打开页面，但**只有
- * `doer/redirect` 认可的那条**才保证 `service` 参数被正确消费。
+ * ⚠️ 用 `/authui/login`（无 `.html`）：`doer/redirect` 的跳转脚本就是拼这个路径
+ *（实测响应体里的
+ *  `window.location.replace('https://auth.huaweicloud.com/authui/login?service=' + …)`）。
+ *
+ * ⚠️ 它自己也只是个**中转**：响应里的脚本把浏览器再转到
+ * `/authui/login.html` 并**保留 `service`**（实测响应体原文）——
+ * 故这里不要直接写 `.html`，让华为自己走它那条链，避免与它的预期分叉。
  */
 export const HUAWEI_AUTH_BASE = 'https://auth.huaweicloud.com/authui/login'
 

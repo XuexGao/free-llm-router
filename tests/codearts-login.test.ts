@@ -424,18 +424,21 @@ test('⚠️ codearts 现在声明 login=true（浏览器回跳流程已实现�
 
 // ─────────────────── 登录入口 host（用户报障「一直显示登录中」） ───────────────────
 
-test('⚠️ 华为登录入口 host 不得带区域前缀（带区域的 API 已下线）', () => {
-  // 实测 2026-10-04：参考实现用的
-  // `devcloud.cn-north-4.huaweicloud.com/doer/redirect` 已返回
-  //   404 {"error_code":"APIGW.0101",
-  //        "error_msg":"The API does not exist or has not been published in the environment"}
-  // 而**去掉区域前缀**的 `devcloud.huaweicloud.com` 返回 200 + 跳转脚本。
+test('⚠️ 华为登录入口必须是**带区域**的 host（无区域的是通用兜底，会跳错页）', () => {
+  // 实测教训（2026-10-04，我改错过一次）：
   //
-  // 这正是用户报障「华为登录之后一直显示登录中…」的根因：
-  // 他点开的授权页是 **404 错误页**，根本没有登录框，
-  // 浏览器永远不会回跳到我们的 callback，面板只能一直等。
-  assert.equal(CODEARTS_LOGIN_BASE, 'https://devcloud.huaweicloud.com/doer/redirect')
-  assert.ok(!CODEARTS_LOGIN_BASE.includes('cn-north-4'), '不得带区域前缀')
+  // | host | 行为 |
+  // |---|---|
+  // | `devcloud.huaweicloud.com` | 对**任意路径**（含 `/doer/nonexistent`、`/home`）都返回同一段跳转脚本 —— **通用兜底路由**，不是真正的 API |
+  // | `devcloud.cn-north-4.huaweicloud.com` | `/doer/redirect` 返回**该路径专属**的跳转脚本 |
+  //
+  // 我一度因为「带区域的返回过 404」而换成无区域的 —— 用户点开后跳到了
+  // `https://devcloud.huaweicloud.com/home?IdeaType=…`，一个毫不相关的落地页。
+  //
+  // ⚠️ 判据不能是「有没有 200 / 有没有响应」：兜底对什么路径都回 200，
+  // 看起来更"健康"。要判断端点是否**真的存在**，必须用**不存在的路径做对照**。
+  assert.equal(CODEARTS_LOGIN_BASE, 'https://devcloud.cn-north-4.huaweicloud.com/doer/redirect')
+  assert.ok(CODEARTS_LOGIN_BASE.includes('cn-north-4'), '必须带区域前缀')
 })
 
 test('⚠️ 认证页路径是 /authui/login（无 .html）—— 那是跳转脚本自己拼的目标', () => {
