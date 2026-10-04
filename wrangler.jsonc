@@ -1,5 +1,22 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  /*
+   * ⚠️ **这个 name 不要改**，尽管项目已改名为 `hivegate`。
+   *
+   * Worker 的 `name` 是它在 Cloudflare 上的**身份**，而 Durable Object 的存储
+   * 是**按 Worker 隔离**的 —— 改掉它等于部署一个**全新的 Worker**，
+   * 旧的 `AccountPoolDO` / `TaskRunnerDO` 数据会**全部成为孤儿**：
+   * 账号池里的全部账号、冷却状态、任务进度、用量记录**都会读不到**。
+   *
+   * 实测确认过：改名前 `cn` 分片 9 个账号 + `global` 分片 1 个账号。
+   *
+   * ⚠️ 而且它对用户是**不可见**的：对外入口是 `routes` 里的自定义域
+   * （见文件末尾），Worker 名只是内部标识。所以保留它**没有任何代价**。
+   *
+   * 若将来确实要改名，必须走「改名 + 迁移数据」：
+   * 先把所有账号的凭据导出（面板逐个复制，或从本地 `.credentials.yaml` 重新导入），
+   * 改名部署后再逐个导入回去。**不要直接改这一行就部署。**
+   */
   "name": "workbuddy-gateway",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",

@@ -1,9 +1,9 @@
 {
-  "name": "workbuddy-serverless",
+  "name": "hivegate",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "WorkBuddy 任务自动化 + OpenAI 兼容 API 聚合（Cloudflare Workers）",
+  "description": "HiveGate —— 多供应商账号池 + 任务自动化 + OpenAI 兼容 API 聚合（Cloudflare Workers）",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

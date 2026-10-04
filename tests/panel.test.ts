@@ -393,3 +393,76 @@ test('⚠️ 裸名仍必须能路由（目录不带前缀 ≠ 请求不接受�
   assert.equal(c.provider, 'codearts')
   assert.equal(c.model, 'deepseek-v4.1-flash')
 })
+
+// ─────────────────── 移动端适配（用户报障：超出屏幕 / 文字换行） ───────────────────
+
+test('⚠️ 面板不得使用可能缺字形的 Unicode 图标（手机上会显示成空框）', () => {
+  // 用户报障：「右上角的退出登录按钮没有图标，只有一个框」。
+  // 根因：`⏻`（U+23FB POWER SYMBOL）在很多手机字体里**缺字形**，
+  // 渲染成一个空方框。同类风险符号还有 `✕`（U+2715）等。
+  // 改用内联 SVG —— 不依赖系统字体，尺寸完全可控。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+
+  // 明确禁止的「高风险图标字符」（几何图形/杂项符号区，字体覆盖不全）
+  //
+  // ⚠️ 必须先**剥掉注释**再查：注释里会**提到**这些字符作为反例
+  //（「不要用 `⏻`」），直接 includes 会把说明文字误判成违规用法。
+  const stripComments = (t) =>
+    t.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const htmlCode = stripComments(html)
+  const jsCode = stripComments(js)
+
+  // ⚠️ `✓`（U+2713）刻意**不**列入：字体覆盖较广，且用作**文本标记**而非按钮。
+  // 但 `✕`（U+2715）必须列入 —— 它与 `✓` 同区却覆盖差得多，实测会变空框。
+  const RISKY = ['⏻', '✕', '⏭', '⌫', '⏎']
+  for (const ch of RISKY) {
+    assert.ok(!htmlCode.includes(ch), `HTML 里不得使用 ${ch}（U+${ch.codePointAt(0)?.toString(16).toUpperCase()}）`)
+    assert.ok(!jsCode.includes(`'${ch}`) && !jsCode.includes(`"${ch}`), `JS 里不得使用 ${ch} 作图标`)
+  }
+
+  // 退出按钮必须是 SVG
+  assert.ok(/id="logout"[\s\S]{0,220}<svg/.test(html), '退出按钮必须用内联 SVG')
+  // 主题按钮也必须是 SVG（三态图标）
+  assert.ok(/THEME_ICON\s*=\s*\{[\s\S]{0,400}<svg/.test(js), '主题图标必须是 SVG')
+})
+
+test('⚠️ 所有表格必须包在 .table-wrap 里（否则手机上横向溢出）', () => {
+  // `table { width: 100% }` 只表示「尽量占满」；默认 `table-layout: auto`
+  // 会按**内容最小宽度**算列宽 —— 长 uid / 长模型名 / 长原因会把表撑得比屏幕宽，
+  // 整个页面横向溢出。手机上标准做法是让表格自己滚动。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // 每一处 buildTable( 调用都必须被 wrapTable 包住
+  const calls = [...js.matchAll(/(\w+)\(buildTable\(/g)].map((m) => m[1])
+  const bare = [...js.matchAll(/(?<![\w(])buildTable\(/g)].length
+  const wrapped = calls.filter((c) => c === 'wrapTable').length
+  // 允许 buildTable 的定义体本身（`function buildTable(`）
+  assert.equal(bare, 1, `buildTable 只应在定义处出现一次裸调用，实际 ${bare}`)
+  assert.ok(wrapped >= 5, `应有至少 5 处 wrapTable(buildTable(...))，实际 ${wrapped}`)
+
+  assert.ok(css.includes('.table-wrap'), 'CSS 必须有 .table-wrap 规则')
+  assert.ok(/\.table-wrap\s*\{[^}]*overflow-x:\s*auto/.test(css), '.table-wrap 必须横向可滚动')
+})
+
+test('⚠️ 必须有移动端断点，且长串要能断行', () => {
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  // 至少一个手机断点
+  assert.ok(/@media\s*\(max-width:\s*720px\)/.test(css), '需要 720px 断点')
+  assert.ok(/@media\s*\(max-width:\s*420px\)/.test(css), '需要 420px 断点（老机型/分屏）')
+  // 长串断行（uid / URL / token 这类无空格长串否则会顶破容器）
+  assert.ok(/overflow-wrap:\s*anywhere/.test(css), '长串必须能在任意位置断行')
+  // ⚠️ 不能只用 break-all：那会把正常英文单词也拦腰截断。
+  // 同样要剥注释 —— 注释里写着「不用 break-all」这句说明本身。
+  const cssCode = css.replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.ok(!/word-break:\s*break-all/.test(cssCode), '不得使用 break-all（会截断正常单词）')
+  // 手机上计数卡片应能收缩（flex 项默认 min-width:auto 不收缩）
+  assert.ok(/@media[\s\S]*?\.count\s*\{[^}]*min-width:\s*0/.test(css), '计数卡片在手机上必须可收缩')
+})
+
+test('文案：统一叫「模型限流」，不叫「模型级限流」', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(js.includes('模型限流'), '应有「模型限流」文案')
+  assert.ok(!js.includes('模型级限流'), '不得再出现「模型级限流」')
+})

@@ -329,3 +329,80 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   font-family: ui-monospace, monospace; font-size: 26px; font-weight: 700;
   letter-spacing: 4px; user-select: all;
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════
+   移动端适配（用户报障：手机上界面超出屏幕、文字换行错乱）
+
+   ## 三个真实成因（逐条对应下面的规则）
+
+   1. **表格是「不可收缩」的**：`table { width: 100% }` 只保证「尽量 100%」，
+      但单元格内容（长 uid、长模型名、长原因）会把表撑宽 —— 因为默认
+      `table-layout: auto` 会按内容计算最小宽度。手机上必然横向溢出。
+   2. **固定宽度元素**：`.bar-label`（78px）、`.bar-val`（60px）、
+      `.model-row .mname`（150px）在小屏上占比过大，把中间内容挤到换行。
+   3. **长串不换行**：uid / token / URL 这类无空格长串不会自动断行，
+      会直接顶破容器。
+
+   ⚠️ 断行只用 `overflow-wrap: anywhere`（配合 `word-break: break-word`），
+   **不用** `word-break: break-all` —— 后者会把正常英文单词也拦腰截断，
+   中文界面里读起来很难受。
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* 长串（uid / URL / token）必须能在任意位置断行，否则顶破容器 */
+.uid, .out, td, th, .hint, .card strong, .model-row .mname {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 表格：允许横向滚动而不是撑破页面（手机上的标准做法） */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table { table-layout: auto; }
+/* 表格里不换行的小单元格（数字列）保持紧凑，但整体可滚动 */
+
+@media (max-width: 720px) {
+  /* ── 整体留白收紧，把宽度让给内容 ── */
+  main { padding: 12px; gap: 12px; }
+
+  /* ── 顶栏：标题与按钮在小屏上容易挤成两行 ── */
+  header { flex-wrap: wrap; gap: 8px; }
+
+  /* ── 计数卡片：手机上 2 列，比「一列太长、三列太窄」都好读 ── */
+  .counts { gap: 8px; }
+  .count {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;          /* ⚠️ 关键：不清掉 min-width 时 flex 项不会收缩 */
+    padding: 7px 10px;
+  }
+  .count b { font-size: 16px; }
+
+  /* ── 柱状图：标签与数值改窄，把空间留给进度条 ── */
+  .bar-label { width: 52px; font-size: 10px; }
+  .bar-val { width: 46px; font-size: 10px; }
+
+  /* ── 模型开关行：名字可换行，不再固定 150px ── */
+  .model-row .mname { width: auto; flex: 1 1 auto; min-width: 0; white-space: normal; }
+
+  /* ── 弹窗：手机上几乎全屏，避免内部内容被压窄后疯狂换行 ── */
+  .modal-box { width: calc(100vw - 24px); max-width: none; max-height: 88vh; }
+  .modal-head, .modal-tabs { padding-left: 12px; padding-right: 12px; }
+  .modal-body { padding: 12px; }
+
+  /* ── 二维码：小屏上略缩，避免把弹窗撑到需要滚动 ── */
+  .qr-box svg { width: 168px; height: 168px; }
+
+  /* ── 表格字号再收一档，配合横向滚动 ── */
+  table { font-size: 11px; }
+  th, td { padding: 5px 6px; }
+
+  /* ── 导航项：手机上横向滚动，不换行堆成两排 ── */
+  nav { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
+  .nav-item { white-space: nowrap; flex: 0 0 auto; }
+}
+
+/* 极窄屏（老机型 / 分屏）再收一档 */
+@media (max-width: 420px) {
+  .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
+  .bar-label { width: 44px; }
+  .qr-box svg { width: 148px; height: 148px; }
+}

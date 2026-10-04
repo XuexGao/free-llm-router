@@ -10,8 +10,29 @@
 <header>
   <div class="brand"><h1>WorkBuddy Serverless</h1><span id="auth-status" class="pill"></span></div>
   <div class="auth">
-    <button id="toggle-theme" class="ghost icon-btn" title="切换主题（自动/浅色/深色）">🌗</button>
-    <button id="logout" class="ghost icon-btn" title="退出登录" aria-label="退出登录">⏻</button>
+    <!--
+  ⚠️ 主题图标用 SVG 而不是 emoji：emoji 的字形随系统差异很大（大小、基线、
+  颜色都可能不同），在手机上容易与相邻按钮不齐。SVG 尺寸完全可控。
+-->
+<button id="toggle-theme" class="ghost icon-btn" title="切换主题（自动/浅色/深色）" aria-label="切换主题">
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+       stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none" />
+  </svg>
+</button>
+    <!--
+  ⚠️ 图标用**内联 SVG**，不用 `⏻` 这类 Unicode 字符。
+  实测：`⏻`（U+23FB）在很多手机字体里缺字形，渲染成一个**空方框** ——
+  用户看到的就是「右上角只有一个框」。SVG 不依赖系统字体，到哪都一样。
+-->
+<button id="logout" class="ghost icon-btn" title="退出登录" aria-label="退出登录">
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+       stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <path d="M12 3v9" />
+    <path d="M6.5 6.8a8 8 0 1 0 11 0" />
+  </svg>
+</button>
   </div>
 </header>
 
@@ -148,7 +169,10 @@
   <div class="modal-box">
     <div class="modal-head">
       <h3 id="info-title"></h3>
-      <button id="info-close" class="ghost icon-btn" title="关闭" aria-label="关闭">✕</button>
+      <button id="info-close" class="ghost icon-btn" title="关闭" aria-label="关闭"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <path d="M5 5l14 14M19 5L5 19" />
+    </svg></button>
     </div>
     <div class="modal-body">
       <div id="info-body"></div>
@@ -160,7 +184,10 @@
   <div class="modal-box">
     <div class="modal-head">
       <h3 id="modal-title"></h3>
-      <button id="modal-close" class="ghost icon-btn" title="关闭" aria-label="关闭">✕</button>
+      <button id="modal-close" class="ghost icon-btn" title="关闭" aria-label="关闭"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <path d="M5 5l14 14M19 5L5 19" />
+    </svg></button>
     </div>
     <div class="modal-tabs">
       <button class="mtab active" data-mtab="accounts">账号</button>

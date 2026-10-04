@@ -941,7 +941,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 
   // ── 免鉴权：存活探针（不含任何敏感信息） ──
   if (path === '/healthz') {
-    return json({ ok: true, service: 'workbuddy-serverless' })
+    return json({ ok: true, service: 'hivegate' })
   }
 
   // ── 管理面板静态资源（**免鉴权**，但统统加安全响应头） ──

@@ -120,6 +120,25 @@ function buildTable(cols, rows, numericFrom) {
   return t
 }
 
+/**
+ * 把表格包进一个可横向滚动的容器。
+ *
+ * ## ⚠️ 为什么必须包（用户报障「手机上界面超出屏幕」）
+ *
+ * `table { width: 100% }` 只表示「尽量占满」，而默认 `table-layout: auto`
+ * 会按**内容的最小宽度**计算列宽 —— 表格里的长 uid、长模型名、长原因
+ * 会把表撑得比屏幕还宽，于是整个页面横向溢出。
+ *
+ * 手机上处理宽表格的标准做法是**让表格自己横向滚动**，而不是让它撑破页面。
+ * 故所有表格统一经过这里。
+ */
+function wrapTable(table) {
+  const box = document.createElement('div')
+  box.className = 'table-wrap'
+  box.appendChild(table)
+  return box
+}
+
 // ─────────────────────────── 视图切换 ───────────────────────────
 
 const VIEW_LOADERS = {
@@ -218,20 +237,22 @@ async function showCoolingDetail() {
   tip.className = 'muted'
   tip.textContent = '这些账号因连续失败被自动退避，到期后会自动恢复，无需人工干预。'
   nodes.push(tip)
-  if (rows.length > 0) nodes.push(buildTable(['供应商', '账号', '剩余', '类型', '原因'], rows, []))
+  // ⚠️ 这两张表（冷却中 / 模型限流）列多且含长 uid、长原因，手机上最易横向溢出。
+  // 统一走 wrapTable 让表格自己滚动。
+  if (rows.length > 0) nodes.push(wrapTable(buildTable(['供应商', '账号', '剩余', '类型', '原因'], rows, [])))
   openInfo(`冷却中的账号（${rows.length}）`, nodes)
 }
 
 /**
  * 「模型限流」明细：列出**具体哪个账号的哪个模型**被限流。
  *
- * ⚠️ 与「冷却中」不同：模型级限流是**按模型**记的（`modelCooldowns`），
+ * ⚠️ 与「冷却中」不同：模型限流是**按模型**记的（`modelCooldowns`），
  * 一个账号可以有多个模型各自限流。故这里按「账号 × 模型」展开成行。
  */
 async function showModelThrottleDetail() {
   const accounts = await fetchAccounts()
   const res = { ok: true, body: { accounts } }
-  if (!res.ok || !res.body) return openInfo('模型级限流', [])
+  if (!res.ok || !res.body) return openInfo('模型限流', [])
   const now = Date.now()
   const rows = []
   for (const a of res.body.accounts) {
@@ -257,14 +278,16 @@ async function showModelThrottleDetail() {
   tip.className = 'muted'
   tip.textContent = '这些「账号 + 模型」组合被上游限流，只会影响该组合，同一账号的其它模型仍可用。'
   nodes.push(tip)
-  if (rows.length > 0) nodes.push(buildTable(['供应商', '账号', '模型', '剩余', '原因'], rows, []))
-  openInfo(`模型级限流（${rows.length}）`, nodes)
+  if (rows.length > 0) nodes.push(wrapTable(buildTable(['供应商', '账号', '模型', '剩余', '原因'], rows, [])))
+  openInfo(`模型限流（${rows.length}）`, nodes)
 }
 
 /** uid 太长时截断显示（保留尾部，尾部才有区分度）。 */
 function shortUid(uid) {
   const s = String(uid || '')
-  return s.length > 26 ? '…' + s.slice(-24) : s
+  // ⚠️ 手机上留 24 字符太占位（会把「剩余」「原因」两列挤到看不见）。
+  // 尾部的 uid 才有区分度（前缀常是 `provider:` 这类固定串），故保留尾部。
+  return s.length > 18 ? '…' + s.slice(-16) : s
 }
 
 /**
@@ -672,7 +695,10 @@ async function runCheckinAll() {
   const d = res.body
   const lines = ['成功 ' + d.ok + ' · 跳过 ' + d.skipped + ' · 失败 ' + d.failed + '（共 ' + d.total + '）', '']
   for (const r of d.results) {
-    const mark = r.ok ? '✅' : (r.skipped ? '⏭️' : '❌')
+    // ⚠️ 跳过用 `⏭`（U+23ED，杂项技术符号区）在部分手机字体里**缺字形**，
+    // 会渲染成空框。这里改用文字标记，语义更清楚且不依赖字体。
+    // （✅ / ❌ 是 emoji，覆盖广，保留。）
+    const mark = r.ok ? '✅' : (r.skipped ? '－' : '❌')
     lines.push(mark + ' [' + r.provider + '] ' + (r.nickname || r.uid.slice(0, 16)))
     if (r.detail) lines.push('     ' + r.detail)
   }
@@ -772,20 +798,20 @@ async function loadUsage() {
 
   const models = $('usage-models'); clear(models)
   if ((d.byModel || []).length) {
-    models.appendChild(buildTable(
+    models.appendChild(wrapTable(buildTable(
       ['模型', '请求', '输入', '输出', '失败'],
       d.byModel.map((m) => [m.model, m.count, m.input, m.output, m.failed]),
       1,
-    ))
+    )))
   } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; models.appendChild(p) }
 
   const accts = $('usage-accounts'); clear(accts)
   if ((d.byAccount || []).length) {
-    accts.appendChild(buildTable(
+    accts.appendChild(wrapTable(buildTable(
       ['账号', '请求', '输入', '输出', '失败'],
       d.byAccount.map((a) => [a.uid, a.count, a.input, a.output, a.failed]),
       1,
-    ))
+    )))
   } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; accts.appendChild(p) }
 }
 
@@ -839,7 +865,7 @@ async function loadModels() {
   clear(box)
   if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '加载失败'; box.appendChild(e); return }
   const data = (res.body && res.body.data) || []
-  box.appendChild(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || ''])))
+  box.appendChild(wrapTable(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || '']))))
   const note = document.createElement('p'); note.className = 'hint'
   note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
   box.appendChild(note)
@@ -975,7 +1001,10 @@ async function loadProviders() {
       const on = prov.capabilities[key] === true
       tag.className = 'cap ' + (on ? 'on' : 'off')
       const shown = key === 'login' ? (LOGIN_KIND_LABEL[prov.id] || label) : label
-      tag.textContent = (on ? '✓ ' : '✕ ') + shown
+      // ⚠️ 用 `×`（U+00D7，拉丁字母区，所有字体都有）而不是 `✕`（U+2715，
+      // 杂项符号区，部分手机字体缺字形会渲染成空框）。
+      // `✓`（U+2713）覆盖较广，且这是**文本标记**而非按钮，保留。
+      tag.textContent = (on ? '✓ ' : '× ') + shown
       caps.appendChild(tag)
     }
     card.appendChild(caps)
@@ -1241,7 +1270,7 @@ async function loadConfig() {
   if (pool.ok && pool.body.counts) {
     const c = pool.body.counts
     pairs.push(['账号总数', c.total], ['可用', c.healthy], ['冷却中', c.cooling],
-      ['模型级限流', c.modelExempt], ['已禁用', c.disabled])
+      ['模型限流', c.modelExempt], ['已禁用', c.disabled])
   }
 
   const waf = await api('/admin/waf?realm=cn')
@@ -1259,7 +1288,7 @@ async function loadConfig() {
     ['任务时点（UTC+8）', '09 签到 / 10 活跃 / 21 签到'],
     ['凭据加密', 'AES-GCM（密钥来自 CREDENTIAL_KEY secret）'])
 
-  box.appendChild(buildTable(['项', '值'], pairs))
+  box.appendChild(wrapTable(buildTable(['项', '值'], pairs)))
 
   const note = document.createElement('p'); note.className = 'hint'
   note.textContent = '⚠️ 运行时配置目前通过 wrangler 的 vars / secret 管理，面板暂不支持在线修改。'
@@ -1305,7 +1334,22 @@ async function loadWaf() {
  * applyTheme 调用）—— 若等 DOMContentLoaded 再切，浅色用户会先看到
  * 一帧深色闪烁（FOUC）。
  */
-const THEME_ICON = { auto: '🌗', light: '☀️', dark: '🌙' }
+/**
+ * 主题按钮的三个图标（内联 SVG，**不用 emoji**）。
+ *
+ * ⚠️ emoji 的字形随系统差异很大（大小、基线、颜色），在手机上容易与相邻
+ * 按钮不齐；且 `⏻`（U+23FB）这类符号在部分手机字体里**缺字形**，
+ * 会渲染成空方框（用户报障「右上角退出按钮只有一个框」）。
+ * 内联 SVG 不依赖系统字体，尺寸完全可控。
+ */
+const THEME_ICON = {
+  // 自动：半明半暗的圆
+  auto: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>',
+  // 浅色：太阳
+  light: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>',
+  // 深色：月亮
+  dark: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
+}
 
 /**
  * 应用主题（三态：auto / light / dark）。
@@ -1317,13 +1361,37 @@ const THEME_ICON = { auto: '🌗', light: '☀️', dark: '🌙' }
  * 设成字符串 'auto' 会让 CSS 的 `[data-theme='light']` 选择器都不匹配，
  * 但同时也失去了「跟随系统」的能力（因为属性存在会覆盖媒体查询的意图）。
  */
+/**
+ * 把一个 SVG 字符串安全地放进元素里（清空原有内容）。
+ *
+ * ⚠️ 用 `DOMParser` 而非 `innerHTML`：解析出的文档**从不执行脚本**，
+ * 且本仓库有不变量测试禁止 `innerHTML` 赋值。
+ * 也不要用 `textContent` —— 那会把标记当纯文本显示出来。
+ */
+function setSvg(el, svg) {
+  clear(el)
+  try {
+    const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
+    const node = doc.documentElement
+    if (node && node.nodeName.toLowerCase() === 'svg') {
+      el.appendChild(document.importNode(node, true))
+    }
+  } catch {
+    // 解析失败：留空（图标缺失不影响功能）
+  }
+}
+
 function applyTheme(theme) {
   const root = document.documentElement
   if (theme === 'light' || theme === 'dark') root.dataset.theme = theme
   else delete root.dataset.theme
   const btn = $('toggle-theme')
   if (btn) {
-    btn.textContent = THEME_ICON[theme] || THEME_ICON.auto
+    // ⚠️ 用 `DOMParser` 注入 SVG，**不用 innerHTML** ——
+    // ① `DOMParser` 解析出的文档从不执行脚本；
+    // ② 本仓库有既有不变量测试禁止任何 `innerHTML` 赋值。
+    // `textContent` 也不行：那会把 SVG 当**文本**显示出来。
+    setSvg(btn, THEME_ICON[theme] || THEME_ICON.auto)
     btn.title = '主题：' + ({ auto: '跟随系统', light: '浅色', dark: '深色' }[theme] || '跟随系统')
   }
   localStorage.setItem('wb_theme', theme)

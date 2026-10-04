@@ -194,7 +194,7 @@ let capabilityAt = 0
 let refreshing: Promise<void> | undefined
 
 /** Cache API 的索引 URL（Cache API 按 URL 索引，需要一个稳定的假 URL）。 */
-const CAPABILITY_CACHE_URL = 'https://workbuddy-gateway.internal/cache/opencode-capabilities.v1'
+const CAPABILITY_CACHE_URL = 'https://hivegate.internal/cache/opencode-capabilities.v1'
 
 /**
  * Cache API 是否可用。

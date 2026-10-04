@@ -1,4 +1,7 @@
-# 项目指令：workbuddy-serverless
+# 项目指令：HiveGate
+
+> 项目原名 `workbuddy-serverless`（仓库与 Worker 名仍是它，见 `wrangler.jsonc` 的说明）。
+> **对外名称统一用 HiveGate**：多供应商账号池 → 一个 OpenAI 兼容入口。
 
 ## 语言约束
 
@@ -13,13 +16,11 @@
 - **服务**：`https://<你的域名>`（备用 `https://workbuddy-gateway.<你的子域>.workers.dev`）
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
-  OpenAI 兼容流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
-- **383 条单测通过**。
+  OpenAI 兼容流式/非流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
+- **389 条单测通过**（`npm test`）。
 
-详见 [docs/01-egress-probe.md](docs/01-egress-probe.md)、[02-skeleton.md](docs/02-skeleton.md)、
-[03-protocol.md](docs/03-protocol.md)、[04-accounts.md](docs/04-accounts.md)、
-[05-task-engine.md](docs/05-task-engine.md)、[06-gateway.md](docs/06-gateway.md)、
-[07-panel.md](docs/07-panel.md)、[08-providers.md](docs/08-providers.md)。
+**第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
+原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
 
 本文件是本项目的**唯一权威设计文档**。实现前必须读完；实现中若发现本文件的判断与实测不符，**先改本文件再改代码**，不要把偏差留在注释里。
 
@@ -125,7 +126,7 @@
 
 - **⚠️ 出口 IP 风险（高风险，已建立验证手段）**：Go 项目的 `internal/server/wafip.go` 记录了真实的**IP 级 WAF 拦截** —— 60 秒内 2 个不同账号接连命中 403 即判定出口 IP 被封。Workers 从 Cloudflare 共享 IP 段出网，且**Free 计划无法指定出口 IP**。
   ⇒ 若上游 WAF 对 CF 网段有额外关照，本项目可能**整体不可用**。
-  **必须实测**。验证探针已实现并自测通过：`probe/`，方法与判据见 [docs/01-egress-probe.md](docs/01-egress-probe.md)。
+  **必须实测**。验证探针已实现并自测通过：`probe/`，方法与判据见 §9.2。
   这是**前置验证项**，不是实现细节。
 
   **🔴 已从本沙箱观测到的关键事实（2026-10-03）**：
@@ -521,79 +522,628 @@ TaskRunner DO
 
 ---
 
-## 九、实施进度
+## 九、实施进度与实测发现
+
+**第 1–8 步全部完成，项目可交付。** `npm test` → **389/389 通过**；`npm run typecheck` → 通过。
+
+> 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
+> 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
+> 合并原则：只保留**实测得出的事实**与**踩过的坑**，不复述代码。
+
+### 9.1 步骤总览
 
 | 步骤 | 状态 |
 |---|---|
-| 1. 出口 IP 前置验证 | ✅ **通过**：CF 出口 `2a06:98c0:3600::103`，25 次请求 0 WAF 拦截。见 [docs/01-egress-probe-result.json](docs/01-egress-probe-result.json) |
-| 2. 骨架（DO + SQLite + 鉴权 + alarm） | ✅ **完成**：alarm 逐步执行队列实测通过。见 [docs/02-skeleton.md](docs/02-skeleton.md) |
-| 3. 上游协议层 | ✅ **完成**：四套指纹、错误分类、设备码登录、任务/签到/旅行/上报、AES-GCM 凭据加密。见 [docs/03-protocol.md](docs/03-protocol.md) |
-| 4. 账号接入 | ✅ **完成**：双形态导入 + 删除（带 confirm）。**凭据全链路打通**（假 token → 上游真实 401）。见 [docs/04-accounts.md](docs/04-accounts.md) |
-| 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功**。见 [docs/05-task-engine.md](docs/05-task-engine.md) |
-| 6. 聚合网关 | ✅ **完成**：`/v1/models`（真实 54 个模型）+ 流式 `/v1/chat/completions`（含工具调用）+ **已接入账号池**（选号/记账/换号）。见 [docs/06-gateway.md](docs/06-gateway.md) |
-| 7. Web 面板 | ✅ **完成**：`/panel/` 已上线。**已重做为 8 视图**（账号池/任务中心/用量/积分包/模型/供应商/配置/日志），并修掉「无密钥时一片空白」。CSP 保持严格。见 [docs/07-panel.md](docs/07-panel.md) |
-| 8. 多供应商 | ✅ **完成**：**11 家 / 12 个变体**接入统一 `Provider` 接口（约 14.5k 行）。含 2 个自实现的密码学原语（MD5、AES-128-CFB，均与 OpenSSL 逐字节对拍）。见 [docs/08-providers.md](docs/08-providers.md) |
+| 1. 出口 IP 前置验证 | ✅ **通过**：CF 出口 `2a06:98c0:3600::103`，25 次请求 0 WAF 拦截 |
+| 2. 骨架（DO + SQLite + 鉴权 + alarm） | ✅ **完成**：alarm 逐步执行队列实测通过 |
+| 3. 上游协议层 | ✅ **完成**：四套指纹、错误分类、设备码登录、任务/签到/旅行/上报、AES-GCM 凭据加密 |
+| 4. 账号接入 | ✅ **完成**：双形态导入 + 删除（带 confirm）。**凭据全链路打通**（假 token → 上游真实 401） |
+| 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功** |
+| 6. 聚合网关 | ✅ **完成**：`/v1/models` + 流式/非流式 `/v1/chat/completions`（含工具调用）+ 已接入账号池 |
+| 7. Web 面板 | ✅ **完成**：`/panel/` 上线，**7 视图**，CSP 严格 |
+| 8. 多供应商 | ✅ **完成**：**11 个变体 / 10 家厂商**接入统一 `Provider` 接口（约 14.5k 行） |
 
-**测试**：`npm test` → **383/383 通过**。`npm run typecheck` → 通过。
+### 9.2 第 1 步：出口 IP / WAF 前置验证（✅ 通过）
 
-### 📦 供应商能力矩阵（**12 个变体**）
+**为什么必须先做**：Go 参考实现在 `internal/server/wafip.go` 记录了真实的 IP 级拦截 ——
+60 秒内 2 个不同账号接连命中 403 即判定出口 IP 被封。Workers 从**共享 IP 段**出网，
+Free 计划**无法指定出口 IP**；若上游对 CF 网段有额外关照，项目在写第一行业务代码前就不成立。
+
+**探针**：`probe/` 是一个独立的最小 Worker，只发**只读、零配额**请求，出站头**逐字对齐**
+Go 侧 `internal/panel/login.go:54-64` 的 `commonHeaders`（否则风控看到的指纹与生产不同，验证失去意义）。
+三个目标：`cn-auth-state`（登录第一步）、`cn-billing`（负向，预期鉴权拒绝）、`cn-web`（web 域负向）。
+
+**WAF 判据（关键）**：严格照抄 Go 的 `IsWafBlocked`（`internal/upstream/client.go:337-340`）——
+**仅 HTTP 403 且无业务信封**（HTML/空体/纯文本）判为 WAF；
+HTTP 200 + `{code:0}` 判通；4xx 但带业务信封判通；**401 / 302 且无信封也判通**。
+⚠️ 实测 APISIX 对「缺 Authorization」回的是 **401**，`www.workbuddy.cn/console/account` 回 **302**；
+把 401/302 也当 WAF 会产生**假警报**，误导决策。
+
+**实测结果（2026-10-03，探针原始输出已并入下表）**：
+
+| 项 | 值 |
+|---|---|
+| Cloudflare 出口 IP | `2a06:98c0:3600::103`（IPv6；`loc=SG`、`colo=SIN`） |
+| 请求总数 | 5 轮 × 3 目标 + 10 轮加压 = **25 次，0 次 WAF 拦截** |
+| `cn-auth-state` | **15/15 = HTTP 200 + `code:0`**，耗时 253–973 ms |
+| `cn-billing` | 5/5 = **401**（正常鉴权拒绝，非 WAF） |
+| `cn-web` | 5/5 = **302**（正常鉴权拒绝，非 WAF） |
+| 汇总 | `waf_blocked: 0`、`network_error: 0`、`unexpected: 0` |
+
+**⇒ 判定：可行，进入第 2 步。**
+⚠️ **边界**：本次测的是**无凭据的只读请求**；带真实凭据 + 真实对话的完整链路
+在第 8 步时仍以低频为主，**未覆盖高频场景**（见 §9.14）。
+
+**同批观测到的协议事实（可直接用于实现）**：
+
+1. **登录第一步可用且零配额**：`POST /v2/plugin/auth/state?platform=CLI` 稳定返回 HTTP 200
+   与 `{code:0, data:{state, authUrl}}`，连续多轮 200 且 `state` 每次不同
+   ⇒ **确认轮询式设备码流程无需本地回调，天然适配 Workers**。
+2. **🔴 上游网关是 EdgeOne + APISIX**：响应头实证 `server: APISIX/3.9.1`、`eo-log-uuid`、
+   `eo-cache-status`、`set-cookie: tgw_l7_route=…`。⇒ WAF 大概率是 APISIX 插件，
+   其拦截面对**机房 IP 段**可能比住宅 IP 更敏感（与 §8.2b 的 EdgeOne 生态观察互相印证）。
+3. `www.workbuddy.cn/console/account` 是**只读 GET 端点**，可安全用于探测；
+   **不要**用领奖端点做探针（那是写操作）。
+
+**探针自身的质量保证**：判据函数用**真实观测到的响应体**做了 9 条单测
+（含 403 带信封不该误判、401/302/500 不该误报），9/9 通过；
+`wrangler deploy --dry-run` 构建通过（9.67 KiB / gzip 3.78 KiB）；
+探针**串行请求 + 1.2 s 间隔**、上限 10 轮 —— 避免探针自己变成风控触发源。
+
+### 9.3 第 2 步：骨架（✅ 完成）
+
+**部署实测**：Worker + 两个 DO（`AccountPoolDO` 每 realm 一个、`TaskRunnerDO` 每账号一个），
+DO 存储后端 **SQLite**（Free 计划唯一可选）；体积 37.34 KiB / gzip 11.57 KiB；启动 **2 ms**；
+Cron **1 条**（`0 * * * *`）；单测 **26/26**；类型检查通过。
+
+**已验证的行为**：`/healthz` 免鉴权返回 `{ok:true}`；无密钥访问 `/admin/pool` → **401**；
+正确密钥 → DO 计数；**DO 自动建表**（`blockConcurrencyWhile` + `migrate()`）生效；
+`POST /admin/tasks/start` 返回 `queued: 3`；**alarm 逐步执行 3 步队列，顺序正确**
+（`listTasks → balance → checkin`）；**失败如实上报**（未传 accessToken ⇒ 3 步均报 401
+并带**响应原文片段**，不静默）；`/v1/models` 返回空列表 + 明确说明未实现（**不编造数据**）。
+
+**🔴 实测发现的平台约束：cron 配额只剩 1 条。**
+原设计声明 3 条 cron（`0 9` / `0 21` / `0 10`），部署失败：
+`This account has reached the Workers Free limit of 5 cron triggers per account. [code: 10072]`。
+排查后实测该账号 5 个配额**已被其他 Worker 占用**：`cf-server-monitor`（2 条）、
+`cloud-mail`（1 条）、`nodewarden`（1 条），**剩余 1 条**。
+⇒ 改为 **1 条每小时 cron + Worker 内按 UTC+8 时分发**（`src/index.ts` 的 `SCHEDULE_UTC8`）。
+这反而更好：省 4 条配额、改时点不用重新部署、非任务时点**零 DO 调用**（连 DO Duration 都不消耗）。
+**代价**：所有任务时点粒度只能是**整点**（Go 侧支持任意分钟）。
+
+**🐛 实测踩到并修复：DO SQLite 的 `.one()` 在零行时抛异常**（不是返回 `undefined`）。
+现象：`POST /admin/tasks/start` 传不存在的 uid，返回 `error code: 1101`（Worker 抛异常），
+本意是 404「账号不存在」。`wrangler tail` 抓到的真实堆栈是
+`Error: Expected exactly one result from SQL query, but got no results.`
+**为什么危险**：本项目里「查不到」是**完全正常**的路径（账号不存在、会话未绑定、进度未创建），
+用 `.one()` 会把每个正常路径都变成 500。
+**修法**：`src/store/db.ts` 加 `firstRow()` 助手（`toArray()` 取首元素），替换全部 5 处调用点。
+
+### 9.4 第 3 步：上游协议层（✅ 完成）
+
+**范围**：`upstream/events.ts`、`auth.ts`、`tasks.ts`、`checkin.ts`、`travel.ts`、`report.ts`、
+`store/crypto.ts`；单测 **78/78**；类型检查通过；已部署。
+
+**线上实测**：`POST /admin/login/start` 返回真实 `copilot.tencent.com/login?platform=CLI&state=…`
++ 5 分钟有效期；`GET /admin/login/poll` 未授权时返回 `{done:false}` + **HTTP 200**（不是错误）、
+未知 state 返回 **404** + 明确提示重新发起；`GET /admin/credentials` 返回持有凭据的 uid 列表
+（**不回 token**）；`POST /admin/tasks/start` 无凭据时报「没有凭据，请先登录」。
+
+**🔴 凭据加密落地（不再明文）**：Go 侧把 token **明文**写进 `auths/*.json`（其 README 自承这是弱点），
+本项目**不继承**：
+
+- **AES-GCM** 加密后落 DO SQLite，每次加密用**新 IV**（GCM 下 IV 重用是灾难性的：
+  会同时泄漏明文异或值并允许伪造认证标签）；
+- 密钥来自 Worker secret `CREDENTIAL_KEY`；
+- **未配置密钥时抛错拒绝写入**（fail-closed），不静默降级明文 —— 静默降级是最糟的选择，
+  用户会以为「已经加密了」；
+- 篡改密文会因认证标签校验失败而抛错，**不返回垃圾明文**。
+
+12 条加密单测锁定这些性质（明文不出现在密文里、两次加密 IV 不同、换密钥无法解密、篡改被检测）。
+
+**🐛 单测发现的两个真实缺陷**：
+
+1. **`parseTasks` 把脏数据变成空任务**：上游返回 `tasks:[null]` 或 `tasks:[{}]` 时产出
+   `{taskCode:'', title:'', …}` 的**空任务对象**。空任务会进入执行队列，无法 accept、无法领奖，
+   只会污染 `lastError` 并白打上游请求。**修法**：`taskCode` 是唯一标识，**缺它就丢弃该条目**
+   （而不是补默认值）。
+2. **测试断言了错误的字段名（测试错，不是代码错）**：断言 `chat_request_send` 上同时有
+   `parentConversationId` 与 `conversationId` 时失败。回查 Go 侧 `desktop.go` 确认
+   `chat_request_send` **只有 `parentConversationId`**，而 `chat_message_response` 两个都有。
+   **代码是对的，测试是错的**。已修正测试并把「哪些事件有哪些会话键」显式钉住 ——
+   因为**字段名写错不会报错**，只会让服务端 join 不上、任务静默不点亮。
+
+**📌 本步固化的关键协议事实**（实现位置见括号）：
+
+| 事实 | 为什么重要 |
+|---|---|
+| 领奖走 `{web}/activity/growth/tasks/<code>/claim`（码在路径、无 body、带 `x-client-platform: web`）（`tasks.ts`） | Go 侧曾误用 chat 域 `/v2/…/reward/claim`（码放 body），该路径**不存在**，恒返 400 并长期误诊为「任务没做完」 |
+| mp 领奖 chat 域 400 时**降级 web 域**（`tasks.ts:claimRewardMp`） | 实测 web 域可领，只试一个域名会失败 |
+| 余额取 `CycleCapacityRemain`（本周期），不是 `CapacityRemain`（终身）（`checkin.ts`） | 同一响应里两者差异巨大（655 vs 155.67），取错会高估余额 |
+| 签到状态用 `checkin-activity-status`，**不是** `checkin-status`（`checkin.ts`） | 后者返回占位数据，会误判「活动未开启」而放弃签到 |
+| 桌面事件链 6 个，`chat_message_response.isSuccessful` 必须是 `true`（`events.ts`） | 只发前半段或 `isSuccessful:false` 点不亮 |
+| 裸数字 `11128` 必须改写（`11-128`）（`report.ts`） | 它出现在请求里**本身就是拦截条件**；零宽空格无效（上游会归一化） |
+| uid 只放行 `[A-Za-z0-9_-]` 且 ≤64（`auth.ts:isValidUid`） | uid 来自上游且用作 storage key，是安全边界 |
+| `expiresIn` 缺省**不编造**过期时间（`auth.ts`） | 编造会让续期逻辑误判「还有一小时」，然后打到 401 |
+
+**刻意的范围裁剪**：不做真实对话类任务（`NEEDS_REAL_CHAT` 显式拒绝，而非静默跳过）；
+不做 zcode 类需浏览器产 captcha 的能力；不做积分保底分层选号（1–3 账号时收益低于复杂度）。
+**当时的能力边界**：登录流程可用，但还没有真实账号跑通完整签到（需先浏览器授权一次）。
+
+### 9.5 第 4 步：账号接入（✅ 完成）
+
+**范围**：`src/upstream/import.ts`、`tests/import.test.ts`；单测 **98/98**；类型检查通过。
+三条接入路径都打通：设备码登录（第 3 步）、**凭据导入** `POST /admin/import`、
+**删除账号** `POST /admin/accounts/remove`（带 `confirm` 守卫）。
+
+**🔑 核心验证：凭据全链路打通**（本步最重要的验证）：
+
+| 环节 | 证据 |
+|---|---|
+| ① 导入解析 | 嵌套形正确解析，`expiresAt` 秒→毫秒转换正确（`1799999999` → `1799999999000`） |
+| ② 加密落盘 | `GET /admin/credentials` 返回该 uid（**不返回 token**） |
+| ③ 账号条目建立 | `GET /admin/accounts` 返回昵称等字段 |
+| ④ **解密并注入出站请求** | 用导入的**假 token** 启动任务 → 上游返回**真实 HTTP 401** |
+
+**第 ④ 条是关键**：之前（凭据层未做时）报的是「没有凭据」；现在报的是**上游的 401** ——
+说明 token 真的被解密、注入到出站请求、并发到了上游。换成真 token 即可直接工作。
+
+**导入格式兼容 Go 侧双形态**（用户可能已在跑 Go 版，账号都在 `auths/`；不兼容就得重新登录每个账号）：
+判据是**顶层有没有 `auth` 键**，不是猜字段（扁平形也含 `domain`/`expiresAt`）。
+**嵌套形**（插件 OAuth 输出，主形态）：`{auth:{accessToken,refreshToken,expiresAt,domain,realm}, account:{uid,enterpriseId,nickname}, device_token}`；
+**扁平形**（手写/旧版）直接铺平。载荷支持**单对象 / 数组 / `{accounts:[…]}`** 三种。
+另兼容 DSH 的 snake_case（`access_token` / `user_id` / `expires_at`）。
+
+**⚠️ 单位陷阱：`expiresAt` 是 Unix 秒**。Go 侧存**秒**（`auth.go:302-305` 用 `.Unix()`），
+本项目用**毫秒**。⇒ 导入时不 ×1000，过期时间会落到 1970 年，续期逻辑会**永远判定「需要续期」
+并反复打上游** —— 表现为「莫名其妙一直在刷新」，而不是一个显眼的报错。
+已用启发式归一化（`< 1e12` 视为秒）并单测锁定。
+
+**逐条独立 + 失败必回报**：批量导入时单条失败不影响其他条（账号目录里混一个坏文件很常见），
+但失败原因**必须回报**，不静默丢弃：
+`{ok:true, imported:[{uid,nickname,realm,expiresAt}], skipped:[{reason, source}]}`。
+**报告里不含 token**（会进日志），有单测专门断言「序列化后的报告不含 token 字符串」。
+
+**🔒 本步新增/强化的安全约束**：
+
+| 约束 | 实现 | 理由 |
+|---|---|---|
+| uid 白名单 | `isValidUid`：`[A-Za-z0-9_-]` 且 ≤64 | uid 来自上游且**用作 storage key**；Go 侧记录过同型风险的严重形态：uid 曾直接被拼进**文件名**，构成路径穿越 |
+| 删除需显式确认 | 请求体必须带 `"confirm": true` | 删除**不可逆**（连带凭据），防手滑 |
+| 未配密钥拒绝写入 | `requireCredentialKey` 抛错 | 不静默明文落盘 |
+| 响应脱敏 | 所有端点只回非敏感字段 | token 绝不回给客户端 |
+
+### 9.6 第 5 步：任务引擎动作（✅ 完成）
+
+**范围**：`taskrunner/verify.ts`、`taskrunner/steps.ts`，扩展 `actions.ts` / `plans.ts`；
+单测 **111/111**；线上验证 `growth` 计划入队 **23 步**，全部按序执行完毕。
+
+**线上实测（用假 token 跑，验证编排与错误分层）**：`finished: True | 队列剩: 0 | 已完成: 23`，
+其中 `listTasks` / `chat5` / `firstBuddy` 因假 token 报 401（`ok=False`），
+而 `richMeow` / `buddyApp` 的**事件上报成功**（`ok=True`，`/v2/report` 200）。
+**这个结果恰好验证了分层是正确的**：事件上报端点**不严格校验 token**，故 `ok=True`；
+回读/领奖端点**需要有效 token**，故 401 —— 换成真 token 即可工作。
+
+**已实现的 11 个零对话消耗动作**：
+
+| 任务码 | 动作 | 判据要点 |
+|---|---|---|
+| `chat_5` | `chat5` | CLI `chat_request_send` × 差额（自动补足） |
+| `first_buddy` | `firstBuddy` | **前置上报 → 同意协议 → 领养**（顺序不可调换） |
+| `RichMeow_Chat` | `richMeow` | 桌面 6 事件链，`isSuccessful:true` 是核心 |
+| `Buddy_App` / `Buddy_App_QQ` | `buddyApp` | 桌面 5 事件链（共用实现） |
+| `automation_1` | `automationCreate` | 单事件 `automated_task_create_suc` |
+| `Library_read` | `libraryRead` | **web 域** + `x-client-platform: web` |
+| `template_5` | `templateUse` | 事件组 × 差额 |
+| `playbook_prompt` | `playbookPrompt` | 判据是 `playbook_prompt_send`（非曝光/点击） |
+| `create_canvas` | `createCanvas` | `wbx_design_canvas_*` 事件组 |
+| `Hp_Appearance` | `hpAppearance` | `appearance/set` API + `appearance_skin_apply` 事件 |
+| （通用） | `verifyAndClaim` | 回读 + 自动领奖 |
+
+**明确默认不入队**（`NEEDS_REAL_CHAT`，会消耗配额）：`Model_chat_GLM5.2`、`expert_5`、
+`Expert_team_use_3`、`skill_1`、`Expert_lighthouse`、`black_cat`。有单测核对这个集合与 §6.4 一致。
+
+**🔑 领奖闭环：为什么必须「回读 → 有界轮询 → 领奖」。**
+上游计分是**异步**的（Go 侧实测：上报后立即回读仍是 0/1，**约 5–8 秒后**才变 1/1）。
+⇒ 只读一次会误判「未达标」→ **跳过领奖** → 任务做了但积分永远拿不到，**且没有任何报错**。
+故实现为固定预算轮询（沿用 Go 侧实测值）：`claimPollAttempts = 4` 次、`claimPollGap = 3 秒`、
+总预算 **≈12 秒**。**为什么必须有界**：不能用 `while(!done)` 无限等 ——
+上游若永久不达标，会无限占用 DO alarm 并白烧 Free 计划的 Duration 配额。
+**为什么轮询期间的查询失败不覆盖已有结果**（Go 侧 `autotask.go:260` 同口径）：
+中途失败若覆盖了先前的成功结果，会把「已达标」误判成「未知」。
+单测锁定：轮询次数 > 1（不能只读一次）、≤ 10（必须有界）、总预算在 6–30 秒区间。
+
+**🐛 本步踩到并修复的两个问题**：
+
+1. **单测把 DO 代码拽进来，导致 Node 无法加载**：加 `verify.test.ts` 后**整个测试套件崩在加载阶段**
+   （`Could not resolve "cloudflare:workers"`）。根因：`plans.ts` / `actions.ts` / `verify.ts`
+   原先从 `TaskRunnerDO.ts` import `TaskStep` 与 `GAP`，而后者
+   `import { DurableObject } from 'cloudflare:workers'` —— 那是 **Workers 运行时内置模块，Node 下不存在**。
+   **修法（架构性，不是打补丁）**：把纯数据（`TaskStep` / `RunState` / `RunContext` / `GAP`）
+   抽到新文件 `taskrunner/steps.ts`，依赖方向变成
+   `steps.ts（纯数据）← plans/actions/verify/TaskRunnerDO` ⇒ **动作层不再依赖 DO**，
+   单测也就不再需要 Workers 运行时（`TaskRunnerDO.ts` 保留 re-export，既有 import 路径不破坏）。
+2. **`step` 变量名写错（类型检查抓到）**：`chat5` 的参数命名成 `_step`（表示未使用），
+   但函数体里引用了 `step.delayMs`，类型检查直接报 `Cannot find name 'step'`。
+   修的时候顺手纠正了一个概念错误：那段代码本意是「步内多条上报之间留间隔」，
+   不该看 `step.delayMs`（那是**步间**间隔，由 DO 的 alarm 负责），改为固定 `REPORT_GAP_MS = 1050`。
+
+**✅ 编排正确性（单测锁定的不变式）**：每个业务动作后**必须**跟一次 `verifyAndClaim`
+（少了它 → 达标也不领奖，静默失败）；计划里**绝不**包含需要真实对话的任务；
+所有 `delayMs ≥ 0`（负数会让 alarm 立即重排，形成忙循环）；计划引用的动作**必须**都已注册。
+另有一条：**上报类动作间隔 ≥ 1000 ms** —— 防止有人为「跑快」把这些反风控间隔调小。
+
+**⚠️ 当时留下的观察点**：线上 `Hp_Appearance` 的 `lastError` 是
+`领奖失败（auth_error）：任务列表拉取失败（auth_error）：upstream 401` ——
+这是**假 token 导致的**；但 `verifyAndClaim` 用 `findTask` 拉任务列表，
+若某任务的领奖路径与列表路径口径不一致，可能出现「能做但查不到」。
+已实现默认 + mp 口径合并，真实账号验证结果见 §9.12。
+
+### 9.7 第 6 步：OpenAI 兼容聚合网关（✅ 完成）
+
+**范围**：`gateway/payload.ts`、`stream.ts`、`server.ts`、`models.ts`、`http.ts`；
+单测 **163/163**；体积 118.99 KiB / gzip 29.97 KiB，启动 1 ms。
+
+**🔗 已接入账号池（不是裸代理）** —— 这是本步最重要的修正。
+初版网关直接取「第一个可用账号」，问题很严重：一个号 429 或余额耗尽 → **整个服务立刻不可用**；
+而且**不会恢复**（没有任何地方记录「这个号暂时别用」）；池里的冷却/熔断状态机**形同虚设**。
+现在形成完整闭环：
+
+```
+pick(排除已试) → 转发 → 成功 → noteSuccess（清熔断/降权）
+                      ↘ 失败 → applyFailure（按类别落到正确维度）+ 换号重试
+```
+
+**两条守住的纪律**：**`tried` 集合跨重试保留** —— 否则会在两个账号之间无限来回
+（Go 侧 `account-pool.ts:905-914` 记录过这个缺陷）；**按错误类别罚正确的维度**。
+
+**错误 → 惩罚维度映射**（`mapErrorToPunishment`，9 条单测锁定）：
+
+| 上游错误 | 罚哪个维度 | 换号？ | 理由 |
+|---|---|---|---|
+| `rate_limited`（6004 细分） | 模型级 / 账号级 | ✅ | 6004 切模型即可用，**不该罚整个账号** |
+| `model_unavailable`（11102） | 模型级 | ✅ | 是 (账号,模型) 维度 |
+| `credit_exhausted`（402） | 硬冷却至次日 04:00 | ✅ | 换号有用 |
+| `waf_blocked`（403 无信封） | 账号软冷却 | ❌ | **可能是 IP 级**，换号无用、只会放大请求 |
+| `request_illegal`（11140） | 熔断 | ❌ | 强信号；同样非法请求换号也失败 |
+| `session_dead`（12153） | 连续 3 次才禁用 | ✅ | 单次多为网络抖动 |
+| `server`（5xx） | 熔断 | ✅ | |
+| `auth_error`（401） | **不罚号** | ✅ | 续期凭据即可，不该惩罚账号 |
+| `context_exceeded` / `image_invalid` | **不罚号** | ❌ | 是**请求**的问题，不是账号的问题 |
+| `network` | **不罚号** | ❌ | 抖动量不构成「这个号坏了」的证据 |
+
+**记账已线上验证**：跑一次成功对话后 `successCount` 从 0 变 **2**，`errTotal` / `fails` 保持 0。
+> ⚠️ 为了让这一步**可验证**，把 `successCount` / `errTotal` / `lastSuccess` / `fails` /
+> `modelCooldowns` 加进了 `/admin/accounts` 的返回。不暴露它们就无法确认记账有没有发生 ——
+> 而**记账失效是静默的**（冷却/熔断形同虚设，但表面一切正常）。
+
+**🏗️ 请求体准备（`payload.ts`，纯函数）—— 四处必须的改写（每处都对应一个真实失败）**：
+
+| 改写 | 不做的后果 |
+|---|---|
+| `max_completion_tokens` → `max_tokens` | 上游只认旧字段 → 回落默认上限 → **长回答被截断**（无报错） |
+| 强制 `stream: true` | 上游按流式处理，语义不符 |
+| `tool_choice` 对象 → `'auto'` | **400 `code=11101`**（不说是哪个字段） |
+| 补 `stream_options.include_usage` | 末帧没有 usage → 用量统计恒为 0 |
+
+**外加工具配对清理**（Go 侧记录过的严重缺陷）：不完整的 `tool_calls` / `tool` 配对会让上游
+**对之后每条消息都返 400** —— 整条会话报废。另剔除**名称为空的 tool_call**
+（它会跨 provider 传染，报 `11133` 且不指出字段）。
+
+**流式透传铁律**：绝不 `await response.text()` 上游响应。逐 chunk 解码 → 按行切 SSE 帧 → 转换 → enqueue。
+用 `decoder.decode(value, { stream: true })` 处理**跨 chunk 的多字节字符**（不用 stream 选项会解码出乱码）；
+正常帧**原样转发**（不 `JSON.parse` 再 `stringify`，省 CPU）；
+**只在可能是错误帧时才解析**（先看字符串里有没有 `"error"` / `"code"` / `"statusCodeValue"` / `"stackTrace"`）。
+
+**错误必须显式（不做静默失败）**：Go 侧记录过多个「**客户端看到干净地停止、无任何报错**」的缺陷，
+全部源于解析器不认错误帧。故识别 **4 种**错误形态：
+
+| 形态 | 例子 |
+|---|---|
+| OpenAI 标准 | `{error:{message,type}}` |
+| 业务码 | `{code:6004, msg:'模型限流'}` |
+| **网关形态**（最易漏） | `{stackTrace:[…], message, statusCodeValue:400}` — **既无 code 也无 error** |
+| 非 JSON 数据帧 | `data: <html>…` |
+
+另两条兜底：流结束但**从未产生任何内容** → 推错误帧（「疑似被截断」，而不是假装模型没话说）；
+流中途异常 → 推错误帧再收尾（**绝不静默关闭**）。
+
+**🐛 本步踩到并修复的缺陷**：
+
+1. **模型目录路径搞错 → 静默返回空列表（本步最隐蔽的坑）**：`GET /v1/models` 返回
+   **HTTP 200 但 `data: []`** —— 没有报错、没有异常、没有日志，表现为「这个账号看起来没有模型」。
+   根因：从 global 域的企业端点家族抄的形状，误以为是 `data.data.models`。
+   实测抓取 `/v3/config` 骨架，真实形状是 **`data.models[]`（单层，54 个）**，
+   同级还有 `agents[]`、`productFeatures{}`、`config{}`。
+   ⇒ 修法：**先试 `data.models`（CN 域真实形态），再回落 `data.data.models`**，
+   并用**实测抓取的结构**加 3 条测试锁死，防回归。
+2. **加密测试有 flakiness（测试写错，不是代码错）**：`篡改密文会被检测到` 间歇性失败。
+   根因：原先翻转密文**最后**一个字符，但 base64 末字符若处于非 4 的倍数位置，
+   **其低位是填充位、解码器会忽略** —— 翻转后解码出**完全相同的字节**，「篡改」根本没发生。
+   实测：翻转**首字符**后解码必定改变（80640 次采样，0 次相同）。
+   ⇒ 改为翻转首字符，并补一条「篡改 IV」用例，连跑 3 次全部通过。
+
+**真实账号端到端实测（2026-10-03）**：
+
+- **`GET /v1/models`** —— 从上游 `/v3/config` 拉到 **54 个真实模型**（`auto`/`fast-model`/
+  `balanced-model`/`deep-model`/`hy3`… 等）。
+- **流式对话** —— **22 帧 + `[DONE]` + `finish_reason: stop`**，
+  `usage: {prompt_tokens:10, completion_tokens:19, total_tokens:29}`，正文真实回复。
+- **工具调用** —— `tool_choice` 对象形式 + `tools` 数组：**零错误帧、`[DONE]`、
+  `finish: tool_calls`、10 个 tool_calls 帧**。这条尤其关键：它证明 `tool_choice` 归一化
+  在真实上游生效了 —— 若未归一化，上游会返 **400 `code=11101`**（且不说是哪个字段）。
+
+**本步刻意的范围裁剪**：会话粘性（同一会话可能落不同账号 → 上游 prompt cache 未命中）、
+`provider/model` 式命名空间（当时只有 WorkBuddy 一族）、图片入站（Free 计划 10ms CPU 下
+base64 解码可能超限）、`/v1/embeddings`（上游无对应能力）、IP 级 WAF 护栏
+（当时只有账号级软冷却，真遇到 IP 级拦截会轮转完所有号才停 —— 后来已补，见 §9.10）。
+
+### 9.8 第 7 步：Web 管理面板（✅ 完成）
+
+**范围**：`src/panel/index.ts`（路由 + 安全头）、`src/panel/assets/{index.html,style.css.txt,app.js.txt}`；
+单测 **179/179**（其中面板 20 条）；体积 136.52 KiB / gzip 36.27 KiB。
+
+**线上验证**：`/panel/` 200 + `text/html`（2,312 字节）；`/panel/style.css` 200 + `text/css`
+（**2,975 字节**，真实样式）；`/panel/app.js` 200 + `application/javascript`（**10,611 字节**，真实代码）；
+安全响应头（CSP / `X-Frame-Options: DENY` / `nosniff` / `no-referrer` / `no-store`）全部就位；
+`/admin/*` 无密钥 → **401**（面板不泄漏数据）。
+
+**当时的面板功能**：账号池（列表 + 状态标签 / 积分 / 冷却倒计时 / 成功与错误计数 / 模型冷却 + 删除）、
+导入凭据、添加账号（设备码登录 + 自动轮询）、任务（选账号 + 选计划 → 自动轮询进度，渲染成
+易读的逐步清单）、模型目录。
+
+**🔒 安全设计（这部分比功能更重要）**：
+
+1. **CSP 保持严格：不用 `unsafe-inline`**。取舍：把 JS 内联进 HTML 会迫使 CSP 放开
+   `script-src 'unsafe-inline'`，那等于放弃 XSS 防护。Go 侧（`internal/panel/index.go:24-31`）
+   记录了同样的取舍，本项目沿用：**脚本走独立文件**，CSP 保持 `script-src 'self'`。
+   有单测**静态检查** HTML 里没有内联脚本、CSP 里没有 `unsafe-inline`。
+2. **页面免鉴权，但数据接口必须鉴权**。页面**不含任何敏感信息**（不知道有哪些账号、也不知道 token），
+   故可免鉴权加载；真正的数据全在 `/admin/*` 与 `/v1/*` 后面，**一律要 Bearer 密钥**。
+3. **刻意不用 cookie**。cookie 会被浏览器**自动附带**，因此需要额外的 CSRF 防护（SameSite + token）；
+   而 `Authorization` 头**不会被自动附带**，天然免疫 CSRF。密钥存 `localStorage`，每个请求显式带上。
+   有单测静态检查前端没有 `document.cookie`、且密钥不出现在 URL query 里（后者会进日志与 Referer）。
+4. **不把上游返回的 URL 拼进 innerHTML**。授权 URL 来自上游响应，拼进 `innerHTML` 就有注入风险。
+   前端改用 `document.createElement` + `textContent` 构造。有单测静态检查。
+
+**🐛 本步踩到并修复的两个真实渲染坑**：
+
+1. **`.css` 被 Wrangler 当成 CSS module → 线上返回 `[object Object]`**：
+   `/panel/style.css` 返回 **200 但只有 15 字节**，内容是 `[object Object]`，面板**完全没有样式**
+   （但页面能打开，很容易被忽略）。根因：Wrangler 对 `.css` 有**内建**的模块处理
+   （把它当 CSS module 对象而不是字符串），`import css from './style.css'` 拿到的是对象，
+   直接塞进 `Response` 就被字符串化。**修法**：CSS 源文件改名 `style.css.txt`，
+   只命中本项目的 Text 规则；服务时仍声明 `text/css`，浏览器侧无感。
+   > 同类问题：`.js` 也一样（esbuild 有自己的 loader，报
+   > `No matching export in "app.js" for import "default"`），故面板 JS 也是 `app.js.txt`。
+2. **Text 规则必须标 `fallthrough: true`，否则与内建规则冲突**：构建失败，报
+   `The file ./assets/index.html matched a module rule … but was ignored because a previous
+   rule with the same type was not marked as 'fallthrough = true'`。
+   根因：Wrangler **自带**一条 Text 规则覆盖 `**/*.html` / `**/*.txt` 等，
+   另加的规则与它同类型却排在前面，把内建规则挡住了。
+   **修法**：只声明真正需要的 glob（`*.js.txt` / `*.css.txt`）并标 `fallthrough: true`。
+   **教训**：不要试图覆盖 Wrangler 的内建模块规则，而是**换个文件扩展名**绕开它。
+
+**面板 20 条测试覆盖**：CSP 纪律（不含 `unsafe-inline`、`script-src 'self'`、`connect-src 'self'`、
+`frame-ancestors 'none'`、`default-src 'none'`、`base-uri 'none'`）；6 个安全头齐全；
+资源路由（带/不带尾斜杠都认）；**渲染正确性**（CSS 不得是 `[object Object]` 且长度 > 500、
+JS 需 `application/javascript` 且长度 > 2000）；前端安全（不用 cookie、密钥不进 URL、
+`authUrl` 不拼 `innerHTML`、HTML 无内联脚本）。
+
+### 9.9 第 8 步：多供应商接入（✅ 完成）
+
+**范围**：`src/providers/`（**约 14,500 行**）；单测 **383/383**（当步）；
+体积 826.70 KiB / gzip 272.44 KiB（Free 计划上限 1 MiB）；**零 `node:` 导入** ——
+全部纯 Web 标准（`fetch` / WebCrypto / `TransformStream`）。
+
+**🏗️ 抽象层设计**：供应商差异**全部**收敛到 `Provider` 接口。网关只做
+「选号 → 调接口 → 记账 → 换号」这件与供应商无关的事，**没有**一处 `if (provider === 'xxx')`。
+
+**两个必须自己实现的密码学原语**（Workers 的 WebCrypto **只有** AES-CBC/GCM/CTR + SHA-1/SHA-256）：
+
+| 原语 | 用在哪 | 为什么不能绕 |
+|---|---|---|
+| **MD5**（`md5.ts`） | raccoon 从 token 确定性派生 uid | `parseCredential` **必须同步**（接口签名如此），而 WebCrypto 的 SHA-256 是异步的；此处只需「确定性 + 单向」，不是安全边界。（算法源自 loomy 的 `Content-MD5`，但 loomy 已删除） |
+| **AES-128-CFB**（`aes-cfb.ts`） | raccoon 的手机号加密 | CFB 是流模式（密文等长），**CBC 强制 PKCS#7 补位、CTR 反馈源不同**，都拼不出来 |
+
+两者都与 Node/OpenSSL **逐字节对拍**过：MD5 用 RFC 1321 向量 + 填充边界（55/56/57/63/64/65）
++ UTF-8/代理对；AES-CFB 用 14 种长度 + 25 组随机 IV + **NIST SP 800-38A CFB128** + **FIPS-197**。
+
+> 🔴 **移植时真踩到并修掉一个静默错误**：AES 密钥扩展第一列漏了「与上一轮同列异或」。
+> 症状是**不抛异常、只是密文全错**，靠 FIPS-197 轮密钥向量抓出来。
+> 若没做这层对拍，就会带着「能跑但全错」的加密上线（上游只回一个 `100003 params_encryted_error`）。
+
+**qoder 的 298 KB WASM**：`qoder-auth-wasm.wasm` 用于生成 `Bearer COSY.<载荷>.<签名>`。
+参考实现从磁盘 `readFileSync` 读它（Workers 没有文件系统）。**✅ 不需要任何配置**：
+wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import mod from './x.wasm'`
+直接得到 `WebAssembly.Module`。已实测：产物 292 KB，`generate_runtime_auth_fields` 返回
+`keyLen=172`，20 个签名头齐全。
+> ⚠️ 单测用的 esbuild 给的不是 `Module`（它按 ESM 包装），故 `compileWasm()` 做了运行时归一化 ——
+> 是 `Module` 就直接用，是字节就 `WebAssembly.instantiate` 编译。两种打包器都能跑。
+
+**🐛 本步过程中修掉的 5 个真实缺陷**：
+
+1. **⚠️ 模型名前缀泄漏到上游（放大器级，最严重）**：客户端发 `workbuddy/deepseek-v4-flash` 后，
+   **连裸名 `deepseek-v4-flash` 也全部失败**，报「没有可用账号」。根因链（每一环单独看都不显眼）：
+   ```
+   ① prepareChatBody 复制整个 body（含 model）但**不改写 model** → 上游收到带前缀的名字
+   ② 上游回 `model [workbuddy/deepseek-v4-flash] service info not found`
+   ③ 该错误被归类为 `model_unavailable`（11102）
+   ④ → 给这个模型写入 **6 小时**模型级冷却
+   ⑤ → 此后**裸名**请求也因模型级冷却选不到号
+   ⑥ → 对外表现为「没有可用账号」，与真实原因毫无关系
+   ```
+   **修法**：把 body 里的 `model` 换成去前缀的裸名（**必须在 `prepareChatBody` 之前**做）；
+   并加 `POST /admin/cooldowns/clear` 人工解冻入口（模型级退避 6h 起步，修好代码后不该再等）。
+   **教训**：**错误分类会放大输入错误** —— 一个纯粹由我方造成的失败，被归到「上游没有这个模型」
+   这个语义上，就变成了对健康资源的长期拉黑。
+2. **⚠️ 用量统计恒为 0（静默失败）**：对话成功，但 `/admin/usage` 永远是 0，**且没有任何错误日志**。
+   根因：记账发生在**响应流结束之后**，而 Worker 在响应结束时会**取消所有未完成的 promise**；
+   第一版写成 `.catch(() => {})`，于是被取消这件事连日志都没有。
+   **修法**：把 `ExecutionContext` 传进网关，用 `ctx.waitUntil()` 托住记账。
+   验证：`successCount` / 用量从 0 变 1（输入 7 / 输出 5 / 214 ms）。
+3. **⚠️ minimax 静默无内容**：MiniMax 对话**没有任何报错**，但客户端一帧正文都读不到。
+   根因：MiniMax 上游说 **Anthropic 协议**（`{"type":"content_block_delta",…}`，**没有 `choices`**），
+   而网关的 `streamResponse` 对 OpenAI 帧是**零解析直通**（刻意如此：Free 计划 10ms CPU，不 parse 才省）。
+   两者相遇 → Anthropic 帧被原样转发 → 标准 OpenAI 客户端按 `choices[0].delta.content` 取值
+   → 读不到，且不报错。**修法**：在**供应商层**就地转换（出站流统一为 OpenAI SSE）。
+   回归测试锁死：`withChoices > 0`、正文落在 `delta.content`、
+   `thinking_delta` 进 `reasoning_content`（**不得污染正文**）。
+4. **⚠️ 凭据被别家抢走（4 家都犯）**：`{accessToken, uid}` 被 **cline 抢走**，存成永远 401 的
+   cline 账号，而用户以为导入的是 WorkBuddy。根因（两层）：**令牌形状无法区分** ——
+   WorkBuddy、cline、minimax、zcode 的 access token **都是三段式 JWT**
+   （实测 WorkBuddy 的就是标准 `eyJhbGciOiJSUzI1NiIsImtpZCI6…`，1500 字符）；
+   **字段名重叠** —— cline 把 `uid`/`user_id` 当 `accountId` 的别名，而 DSH 形态的 WorkBuddy
+   凭据恰好有 `user_id`。更糟的是有 4 家支持「直接粘贴令牌字符串」，且**无条件接受任何非空字符串**
+   （实测 `parseCredentialAnywhere('str')` 被 minimax 收下）。
+   **修法（两把闸门，都加在接口上）**：`bareStringPattern`（裸字符串必须**形状匹配**才收）；
+   `matchesShape`（对象必须含**该供应商独有**的字段，如 cline 的 `workos:` 前缀或 `clineUserId`、
+   opencode 的 `api_key`）。**默认供应商作为兜底总是参与**。
+   验证：9 组输入全部落到正确的家（裸文本/null/数组 → `ProviderError`；
+   workbuddy 对象 → workbuddy；cline（`workos:`/`clineUserId`）→ cline；
+   minimax（`minimax_user_id`）→ minimax；zcode（`zcode_jwt`）→ zcode；opencode（`api_key`）→ opencode）。
+5. **⚠️ 选号未按供应商过滤**：一个「有 cline 账号、没有 workbuddy 账号」的部署，
+   会把 cline 的凭据拿去打 WorkBuddy 的端点 → 上游 401（看起来像「凭据坏了」，实际是选错了账号）。
+   **修法**：`pick()` 支持 `provider` 字段。
+   **⚠️ 修的时候踩了一个二阶坑**：第一版写法是「`pick()` 返回后再筛掉不是该家的」，
+   那会让「池里有账号但当前供应商没账号」表现为**`pick()` 返回了号、调用方却拿不到人**
+   → 被当成「没有可用账号」。⇒ 过滤**必须在 `pick()` 内部**做，不能在返回后筛。
+
+**面板重做（3 → 7 个视图）**：修掉「没输密钥时页面一片空白」—— 显式区分三种状态
+（未填密钥 / 密钥无效 / 正常），**无密钥时也渲染导航与引导卡片**。
+
+| 视图 | 内容 |
+|---|---|
+| 供应商与账号 | 计数（总/可用/冷却/模型限流/禁用）+ 卡片（状态标签、冷却倒计时、成功/错误计数、积分徽标）+ 导入 + 登录 |
+| 任务中心 | 一键签到（全部供应商）、Buddy 每日任务（含真实对话）、扫描全部账号待办 |
+| 用量 | 总请求/成功/失败/token/平均耗时 + 按小时柱状图 + 按模型 + 按账号 |
+| 积分包 | 逐账号实时查上游余额（**串行**，避免放大风控） |
+| 模型 | 模型目录表格 + 按供应商开关模型 |
+| 配置 | 运行时状态（池计数、WAF 窗口与阈值、凭据数、cron 时点） |
+| 日志 | 请求日志（环形缓冲）+ 清空 |
+
+**用量与日志的存储纪律**：**不逐条写行**，而是**整条环形缓冲存在一个 storage key** 里
+（`usage:ring` 500 条 / `log:ring` 200 条）。理由：Free 计划 DO 行写入配额 **100,000/天**，
+而一次对话就产生一条记录 —— 逐行写会在正常使用下撞配额。要的是**近期趋势**，不是审计账本。
+> ⚠️ 截断必须**按时间排序后再截**：写入顺序 ≠ 时间顺序（并发请求完成有先后），
+> 直接 `slice(-N)` 可能丢掉更新的记录而留下旧的。
+
+**本步新增的安全约束**：CSP 保持严格（新增单测静态检查 HTML 无内联脚本、CSP 无 `unsafe-inline`）；
+不用 cookie（密钥存 localStorage、每请求带 `Authorization` 头）；
+不把上游 URL 拼进 `innerHTML`；**PKCE verifier 绝不回给前端**
+（`/admin/providers/login/start` 只回 `{authUrl, state}`，verifier 存在 DO 里，已实测确认不泄漏）；
+前端不出现 `innerHTML` 赋值（单测静态检查）。
+
+### 9.10 第 8 步之后的实测修正（分步文档写就后发生，均已核实）
+
+分步文档写完后仍有若干提交改变了结论，**以本节为准**：
+
+1. **`loomy` 已整体删除**（提交 `9ac653f`）。分步文档与旧矩阵里的 11 家含 loomy，
+   现在注册表是 **10 家厂商 / 11 个变体**（`src/providers/index.ts` 的 `PROVIDERS` 共 11 项）。
+   `md5.ts` 保留（其算法源自 loomy 的 `Content-MD5`，但已无 loomy provider）。
+2. **`/v1/models` 一律带 `provider/` 前缀**（提交 `00a09e6`）。早先为默认供应商额外暴露一份**裸名**，
+   导致同一模型出现两次（`buddy/glm-5.3-flash` 与 `glm-5.3-flash`），而多家又有同名模型
+   （`buddy/`、`codearts/`、`trae/` 都有 `deepseek-v4.1-flash`），裸名根本无从区分。
+   **目录里一律带前缀，裸名 0 项**；**请求侧仍接受裸名**（回退默认供应商，`splitModelName` 未动）——
+   兼容与无歧义分开处理。有测试锁定（`tests/panel.test.ts`：目录里不得出现裸名）。
+3. **`/v1/models` 必须遍历两个 realm**（提交 `2e295ad`）。账号按 `extras.realm` 分片存放
+   （国际版在 `global`），而原实现只看 `?realm=`（缺省 `cn`）⇒ 国际版**永远不会出现**，
+   表现为「账号登录好了、别处也能用，但 `/v1/models` 里没有它」。且**每个账号要连它的 realm 一起记**
+   （取凭据必须回到**同一个分片**的 DO stub）。
+4. **codearts 与 trae 的登录：架构上不可行，已如实改回 `login: false`**
+   （提交 `bcb140a` → `0a4fa3a` → `6ba627e` → `5ce02b7`）。曾尝试「浏览器回跳 + `auth_callback_url`
+   指向本服务」，但实测：
+   - **codearts**：登录跳转链在**服务端会死循环**（浏览器被反复送回登录页），
+     且其回调**只认本机 `127.0.0.1` 端口** —— Worker 收不到；
+   - **trae**：**强制**回调 `127.0.0.1`（本机端口）—— Worker 收不到。
+   ⇒ 两家都只能**导入凭据**。这与旧文档「可以指向本服务 URL」的乐观判断相反，**以本节为准**。
+5. **cline 设备码登录已接线**（提交 `12df087`，RFC 8628 风格 WorkOS **用户码**式：
+   `/admin/providers/login/{start,poll}` 三步 + `/api/v1/auth/register`）。
+   ⚠️ 轮询状态（`intervalMs` / `nextPollAt` / `deadline`）**必须持久化在登录会话载荷里** ——
+   Workers 无跨请求内存，放模块变量会让 `slow_down` 的累积退避**静默失效**。
+   同批修掉「每次请求白续一次期」。
+6. **raccoon 登录已接线（微信扫码）**（提交 `bcb140a`）。目的是让本服务拥有自己的凭据 ——
+   raccoon 的 `refresh_token` 是**一次性轮换**的，本地 DSH 客户端与本服务共用同一份凭据文件时，
+   两边互相续期会把对方顶掉（用户报障「账号用一天就废」）。
+7. **IP 级 WAF 护栏已实现**（提交 `2536c30`，§6.7 与 §2.6 对应的待办）。
+   `AccountPoolDO` 内：60 秒窗口内 **2 个不同账号**接连命中 403 即判定 IP 级拦截，
+   进入激活期后 `pick()` **直接放弃，连一个号都不试**（避免把一次请求放大 `MaxRotate` 倍去撞同一堵墙）。
+   提供 `/admin/waf`（状态）与 `/admin/waf/clear`（人工解除），面板有 WAF 横幅。
+   有 `tests/waf-realtime.test.ts` 覆盖。
+8. **每日任务按钮包含真实对话任务**（提交 `0540ecf`）。`POST /admin/tasks/daily-all` 用
+   `includeRealChat: true` 跑 `growth`（签到 → 全部成长任务 → 真实对话任务 → 自动领奖）——
+   那些才真正**给积分**。**挂 cron 的自动计划仍然不含它们**，故用户不会被无感知扣配额；
+   每次都是 `fast-model` 的极短对话，且**先查进度**，已达标就跳过。
+9. **非流式请求返回 SSE 原文（已修，提交 `9ac653f`）**：网关**从不检查客户端要流式还是非流式**，
+   一律把上游 SSE 转发回去；非流式客户端拿到 `data: {…}` 文本，`JSON.parse` 报
+   `Expected EOF after parsing, but had : instead`（offset 5 正是 `data:` 的冒号）。
+   ⇒ 新增 `aggregateSse()` 把 SSE 帧合并成一条 `chat.completion`；
+   **工具调用分片必须按 index 合并 `arguments`**，否则客户端拿到截断的 JSON；
+   `reasoning_content` 单独成字段，不混进正文。
+   ⚠️ `stream` 缺省按 **OpenAI 规范是 false**（非流式）。
+10. **续期逻辑曾形同虚设（8 家 provider 都受影响，已修）**：两个独立原因叠加 ——
+    **架构不一致**（8 家 `chat()` 在非 200 时抛异常，只有 opencode 返回 Response，
+    网关的 `!upstream.ok` 续期分支**永远走不到**，故 catch 分支也补上续期）；
+    **判据只看状态码**（`401 || 403`，而 CodeArts 的 security_token 过期报的是
+    **HTTP 400** + `APIG.0602`）⇒ 抽成公共 `isAuthLikeFailure(status, detail)`。
+    实测恢复：Cline 401 → 正常对话；工具调用两种模式全通。
+11. **国际版要求首条消息是 `system`**：`www.workbuddy.ai` 硬要求首条 `role:'system'`，
+    否则报 400 + `11128`（**伪装成安全拦截**）。`VariantConfig.requiresSystemFirst` 只在**缺失**时
+    补一条默认 system（客户端自己传了就尊重它，不覆盖用户的系统提示词）。
+
+### 9.11 供应商能力矩阵（**10 家厂商 / 11 个变体**）
 
 > **命名口径**（对齐参考项目 `deepseek-harness-codearts/src/product.ts:76` 的
 > `id: 'buddy' | 'workbuddy'`）：
 > - **`buddy`** = 腾讯**国内版**（`copilot.tencent.com` / `www.codebuddy.cn`）—— **默认供应商**
 > - **`workbuddy`** = 腾讯**国际版**（`www.workbuddy.ai`）
 >
-> ⚠️ 本项目早期只有国内版，且当时的 id 就是 `workbuddy`。
-> 接入国际版后该 id 的含义变了，故**必须做数据迁移**
-> （`AccountPoolDO.migrateBuddyIds`，按凭据 `domain` 判据，
-> 惰性执行一次、幂等）—— 否则既有国内账号会被当成国际账号，
-> 拿国内凭据打 `www.workbuddy.ai`，**必然 401** 且看不出真实原因。
+> ⚠️ 本项目早期只有国内版，且当时的 id 就是 `workbuddy`。接入国际版后该 id 的含义变了，
+> 故**必须做数据迁移**（`AccountPoolDO.migrateBuddyIds`，按凭据 `domain` 判据，惰性执行一次、幂等）——
+> 否则既有国内账号会被当成国际账号，拿国内凭据打 `www.workbuddy.ai`，**必然 401** 且看不出真实原因。
 
 | id | login | chat | checkin |
 |---|---|---|---|
-| `buddy`（国内版，**默认**） | ✓ | ✓ | ✓ |
-| `workbuddy`（国际版） | ✓ | ✓ | ✕ |
+| `buddy`（腾讯国内版，**默认**） | ✓ | ✓ | ✓ |
+| `workbuddy`（腾讯国际版） | ✓ | ✓ | ✕ |
 | `cline` | ✓ | ✓ | ✕ |
 | `minimax` | ✕ | ✓ | ✓ |
-| `codearts` | ✓ | ✓ | ✓ |
+| `codearts` | ✕ | ✓ | ✓ |
 | `lobsterai` | ✕ | ✓ | ✓ |
-| `trae` | ✓ | ✓ | ✓ |
+| `trae` | ✕ | ✓ | ✓ |
 | `qoder` | ✓ | ✓ | ✓ |
 | `opencode` | ✕ | ✓ | ✕ |
-| `loomy` | ✕ | ✓ | ✓ |
-| `raccoon` | ✕ | ✓ | ✕ |
+| `raccoon` | ✓ | ✓ | ✕ |
 | `zcode` | ✓ | ✓ | ✕ |
 
-**每个 `✕` 都有可操作的具体原因**（`/admin/providers` 返回 `loginBlockedReason`），
-不用「不支持」这种无信息量文案。典型原因：
-- **lobsterai**：登录需 `127.0.0.1` 回调监听，Workers 无监听 socket，且无轮询替代路径；
-  ⚠️ `codearts` 与 `trae` **已不在此列** —— 它们的回调地址是**调用方给的参数**
-  （`auth_callback_url`），故可以指向本服务自己的 URL，由 Worker 接住浏览器回跳
-  （见 `src/providers/trae.ts` 文件头与「浏览器回跳登录」小节）。
-- **zcode**：签到需 headful Chromium 过阿里云 captcha（推理不受影响）；
-- **raccoon**：无签到端点（每日额度由服务端自动发放）；
-- **workbuddy（国际版）**：上游**本就没有**每日签到接口（积分在 CodeBuddy 侧领）；
-- **minimax / loomy**：协议支持（或函数已实现）但本服务未接线发起流程。
-  ⚠️ `cline` 已接线（WorkOS 设备码，**用户码**式）；`raccoon` 亦已接线（微信扫码）。
+**每个 `✕` 都有可操作的具体原因**（`/admin/providers` 返回 `loginBlockedReason` /
+`checkinBlockedReason`），不用「不支持」这种无信息量文案（有单测强制原因 ≥10 字且可指导行动）：
 
-### 🔴 第 8 步实测发现的 5 个真实缺陷
+- **codearts**：登录跳转链在服务端死循环，且回调只认本机 `127.0.0.1` 端口 —— 上游协议限制，
+  只能从码道 IDE / 桌面端导出凭据后粘贴导入。
+- **trae**：**强制**回调 `127.0.0.1`（本机端口），Worker 收不到 —— 上游协议限制，只能导入凭据。
+- **lobsterai**：登录把授权回调打回本机 `127.0.0.1` 的临时端口，Workers 无法监听本地端口，
+  也没有设备码轮询之类的替代流程；需在桌面客户端完成登录后导出凭据 JSON
+  （含 `access_token` / `refresh_token` / `user_id` / `uuid` / `first_keyfrom` / `latest_keyfrom`，
+  缺 `uuid` 与 `keyfrom` 会导致之后无法自动续期）。
+- **minimax**：协议支持设备码，但本服务**未接线**发起流程；从已登录客户端导出 `access_token` 粘贴导入。
+- **opencode**：**没有登录流程**（无 OAuth / 设备码）；到 opencode.ai 登录后复制 Zen 的 API key
+  （形如 `sk-…`）粘贴导入；匿名免费通道需显式导入 `{"api_key":"public"}`。
+- **zcode**：`login: true`（设备码可用），但**签到**接口始终要求阿里云验证码
+  （需 headful Chromium，`--headless=new` 实测过不了风控）；**推理不受影响**。
+- **raccoon**：**没有签到端点** —— 每日 300 积分由服务端**按日自动发放**
+  （账单 `biz_type: 'daily_grant'`，实测注册后 1 分钟即到账）；有一次性登录奖励（3000 分，幂等），
+  由 `grantLoginReward` 独立导出，不登记为 `dailyCheckin`。登录为**微信扫码**。
+- **workbuddy（国际版）**：上游**本就没有**每日签到积分接口（积分在 CodeBuddy 侧领）——
+  上游产品形态，不是本服务的缺失。
+- **cline**：**没有每日签到端点**（对官方客户端做过端点扫描，无命中）；余额可在「积分包」页查看。
 
-1. **模型名前缀泄漏到上游（放大器级）**：`prepareChatBody` 复制 body 却不改 `model`，
-   带前缀的名字发给上游 → 回 `model [...] service info not found` →
-   被归类为 11102 → **给该模型写 6 小时冷却** → 此后**裸名**请求也选不到号，
-   表现为「没有可用账号」。**教训：错误分类会放大输入错误。**
-2. **用量恒为 0（静默）**：记账在流结束后发生，被 Worker 取消；写成
-   `.catch(()=>{})` 连日志都没有。修：传 `ExecutionContext` + `ctx.waitUntil`。
-3. **minimax 静默无内容**：上游是 Anthropic SSE，网关对 OpenAI 帧零解析直通
-   → 客户端读不到 `choices` 且不报错。修：供应商层就地转换。
-4. **凭据被别家抢走（4 家都犯）**：WorkBuddy/cline/minimax/zcode 的令牌
-   **都是三段式 JWT**，形状无法区分；且字段名重叠（cline 把 `uid` 当 `accountId` 别名）。
-   修：加 `bareStringPattern` + `matchesShape` 两把闸门（只认各家独有特征）。
-5. **选号未按供应商过滤**：会把 cline 的凭据拿去打 WorkBuddy 端点。
-   修：`pick()` 支持 `provider`。**⚠️ 过滤必须在 `pick()` 内部做** ——
-   第一版写成「选完再筛」，会让「池里有账号但当前家没账号」误报成「没有可用账号」。
+**登录方式并非都是标准设备码**（面板标签必须如实区分，否则会误导用户去找不存在的设备码）：
+`codearts` / `trae` 曾是「浏览器回跳」式（现均为 `login:false`）；`raccoon` 是**微信扫码**；
+`cline` 是**用户码**式（用户要先把一个短码抄进授权页）；
+`buddy` / `workbuddy` / `qoder` / `zcode` 是标准设备码轮询。
 
-### 🎯 真实账号端到端验证结果（2026-10-03）
+### 9.12 真实账号端到端验证结果（2026-10-03）
 
 用真实凭据实测，**全部成功**：
 
@@ -603,15 +1153,16 @@ TaskRunner DO
 | 任务自动化 `growth` 计划 | ✅ **23/23 步全部成功，零失败** |
 | 其中 `first_buddy` | ✅ **真实领到 +300 积分 +8 能量** |
 | 剩余未领任务 | 3 个，**恰好都是确实无法自动化的**（微信关注 / 真实对话 / mp 专家对话）—— 与 Go 项目声称的「17/18 可自动化」吻合 |
-| `/v1/models` | ✅ 真实 **54 个模型** |
+| `/v1/models` | ✅ 真实 **54 个模型**（现均带 `provider/` 前缀，且只列有账号的供应商） |
 | 流式对话 | ✅ 真实回复，22 帧 + `[DONE]` + usage 完整 |
 | 工具调用 | ✅ `finish: tool_calls`，10 个 tool_calls 帧，零错误 |
 | 网关记账 | ✅ `successCount` 从 0 → 2（证明回写池状态） |
 
-### 🔴 已实测发现的约束（都必须记住）
+### 9.13 已实测发现的平台/协议约束（都必须记住）
 
 1. **cron 配额只剩 1 条**（账户 Free 上限 5，被其他 Worker 占 4）
-   ⇒ 用「1 条每小时 + Worker 内按 UTC+8 分发」（`src/index.ts` 的 `SCHEDULE_UTC8`）。
+   ⇒ 用「1 条每小时 + Worker 内按 UTC+8 分发」（`src/index.ts` 的 `SCHEDULE_UTC8`，
+   时点沿用 Go 侧默认：签到 9/21、活跃上报 10）。
    **代价**：任务时点粒度只能是整点。
 2. **DO SQLite 的 `.one()` 在零行时抛异常**（不是返回 undefined）
    ⇒ 统一用 `firstRow()` 助手。**新增 SQL 查询不要直接用 `.one()`**。
@@ -620,37 +1171,42 @@ TaskRunner DO
 4. **DO 不能接收函数**（RPC 只传可结构化克隆的值）
    ⇒ 动作用「字符串名 + 注册表」，不注入执行器。
 5. **`expiresAt` 单位**：Go 存**秒**，本项目用**毫秒**，导入时必须 ×1000（否则永远「需要续期」）。
+6. **Wrangler 有内建的 `.css` / `.js` 模块规则**：面板资源必须用 `*.css.txt` / `*.js.txt` 绕开，
+   自加的 Text 规则必须标 `fallthrough: true`（见 §9.8）。
+7. **轮换型 refresh token**：`raccoon` 与 `codearts` 的 refresh token 是**单次使用**的，
+   续期成功后旧的立刻作废（codearts 实测报 `STS5.1806 invalid refresh token: 'the refresh token has been used'`）。
+   ⇒ 本地客户端与本服务**不能共用同一份凭据文件**，否则互相顶掉。
 
-### ⚠️ 仍未消除的风险（诚实记录，优先级从高到低）
+### 9.14 仍未消除的风险（诚实记录，优先级从高到低）
 
 | 项 | 影响 | 状态 |
 |---|---|---|
-| **带真实凭据的高频请求是否会被 IP 级拦截** | 第 1 步只验证了**无凭据只读**请求；第 8 步的实测也以低频为主 | ⚠️ 未验证 |
+| **带真实凭据的高频请求是否会被 IP 级拦截** | 第 1 步只验证了**无凭据只读**请求；第 8 步的实测也以低频为主 | ⚠️ 未验证（护栏已实现，但触发条件本身未被真实命中过） |
 | **opencode 每账号代理丢弃** | 参考实现靠「不同匿名槽配不同出口 IP」扩容免费额度；Workers 的 `fetch` 不接受 `dispatcher` ⇒ 多个匿名槽共享同一出口 IP，**额度不再能通过多开扩容** | ❌ 真实功能损失 |
-| **流内换号（trae / lobsterai）** | 需先消费整个 SSE 才能决定重发，与逐帧透传（10ms CPU 铁律）冲突 | ❌ 未实现 |
-| **会话粘性** | 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） | ❌ 未实现 |
+| **流内换号（trae / lobsterai）** | 需先消费整个 SSE 才能决定重发，与逐帧透传（10ms CPU 铁律）冲突 | ❌ 未实现（流内错误转成错误帧；换号由 HTTP 状态驱动） |
+| **会话粘性** | `AccountPoolDO` 已有 `getSession` / `bindSession` / `unbindSession` / `pruneSessions`，但**网关侧没有调用点** ⇒ 同一会话可能落不同账号 → 上游 prompt cache 未命中（多花钱、更慢） | ❌ 未接线 |
 | **图片入站** | Free 计划 10ms CPU 下 base64 图片解码可能超限 | ❌ 未实现 |
-| **连登兑换 / 抽奖 / 旅行** | `travel.ts` 已实现但**未接入计划表**（当前 `growth` 计划只覆盖 11 个任务动作） | ❌ 未接入 |
-| **minimax/loomy 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
-| **cline 设备码登录** | ✅ 已接线（`/admin/providers/login/{start,poll}`，WorkOS 三步 + 用户码式 UI）。⚠️ 会话内的 `intervalMs`/`nextPollAt`/`deadline` **必须持久化在登录会话载荷里** —— Workers 无跨请求内存，放模块变量会让 `slow_down` 的累积退避**静默失效** | 已实现，见 `src/providers/cline.ts` 的「设备码登录」小节 |
+| **连登兑换 / 抽奖 / 旅行** | `upstream/travel.ts` 已实现（`travelStatus` / `travelDepart` / `travelClaim` / `streakStatus` / `redeemTier` / `lotteryDraw` / `drawAllLottery`），但**未接入计划表或动作表**（当前计划只覆盖 11 个零消耗动作 + 5 个真实对话动作） | ❌ 未接线 |
+| **minimax / lobsterai / opencode 的登录发起** | 协议可移植（或函数已实现），但未接线 `/admin/providers/login/*` | 已如实声明 `login:false` |
+| **codearts / trae 的登录** | 上游协议限制（服务端死循环 / 强制 `127.0.0.1` 回调），**架构上不可行**，非本服务缺失 | 已如实声明 `login:false`，只能导入凭据 |
 
-### 项目结构（最终）
+### 9.15 项目结构（最终）
 
 ```
 src/
 ├── index.ts              Worker 入口：路由 + 鉴权 + Cron 扇出
 ├── env.ts                Bindings 与「禁止 parseInt(x) || 默认值」的解析助手
 ├── gateway/              ① OpenAI 兼容网关
-│   ├── server.ts         选号 → 转发 → 记账 → 失败换号（流式透传）
+│   ├── server.ts         选号 → 转发 → 记账 → 失败换号（流式透传 + 非流式聚合）
 │   ├── payload.ts        请求体准备（4 处必改 + 工具配对清理）
 │   ├── stream.ts         SSE 帧解析与转换（4 种错误形态识别）
 │   ├── models.ts         模型目录（data.models 单层 + 双层兼容）
 │   └── http.ts           JSON 响应助手
-├── pool/                 ② 账号池（AccountPoolDO + 四维正交状态机）
-├── taskrunner/           ③ 任务引擎（TaskRunnerDO + 11 个动作 + 领奖闭环）
-├── upstream/             ④ 上游协议层（四套指纹 / 错误分类 / 登录 / 导入）
-├── panel/                ⑤ 管理面板（8 视图 + 严格 CSP + 安全头）
-├── providers/            ⑥ **多供应商抽象层（11 家 / 12 变体，约 14.5k 行）**
+├── pool/                 ② 账号池（AccountPoolDO + 四维正交状态机 + IP 级 WAF 护栏）
+├── taskrunner/           ③ 任务引擎（TaskRunnerDO + 11 个零消耗动作 + 5 个真实对话动作 + 领奖闭环）
+├── upstream/             ④ 上游协议层（四套指纹 / 错误分类 / 登录 / 导入 / 旅行）
+├── panel/                ⑤ 管理面板（7 视图 + 严格 CSP + 安全头）
+├── providers/            ⑥ **多供应商抽象层（10 家厂商 / 11 变体，约 14.5k 行）**
 │   ├── types.ts          Provider 接口 + 能力声明 + 判别式
 │   ├── index.ts          注册表 + 自动识别（含顺序纪律）
 │   ├── anthropic.ts      Anthropic ↔ OpenAI 转换（共享层）
@@ -658,8 +1214,10 @@ src/
 │   ├── aes-cfb.ts        纯 TS AES-128-CFB（WebCrypto 没有）
 │   ├── buddy.ts          ★ 参考实现（**一套工厂产出 buddy/workbuddy 两个变体**）
 │   └── qoder-auth-wasm.wasm  （wrangler 内建 CompiledWasm 规则）
-└── store/                ⑦ 存储（DO SQLite + AES-GCM 凭据加密 + 用量环形缓冲）
+└── store/                ⑦ 存储（DO SQLite + AES-GCM 凭据加密 + 用量/日志环形缓冲）
 ```
+
+---
 
 ## 十、参考文件
 
