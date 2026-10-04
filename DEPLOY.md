@@ -63,7 +63,14 @@ openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY
 ## 绑定 GitHub 自动部署（可选）
 
 Dashboard → Workers & Pages → `workbuddy-gateway` → **Settings** → **Build** →
-Connect to Git → 选 `XuexGao/workbuddy-serverless`。
+Connect to Git → 选 `XuexGao/hivegate`。
+
+> ⚠️ 仓库已从 `workbuddy-serverless` 改名为 `hivegate`（GitHub 会自动重定向旧地址，
+> 但**建议改成新名** —— 否则 Dashboard 里可能一直显示旧名）。
+>
+> ⚠️ **Worker 名仍是 `workbuddy-gateway`，不要改** —— 它是 Worker 在 Cloudflare 上的
+> 身份，而 Durable Object 存储**按 Worker 隔离**。改名等于部署新 Worker，
+> 账号池里的全部账号会读不到。详见 `wrangler.jsonc` 开头的说明。
 
 - Build command：`npm install`
 - Deploy command：`npx wrangler deploy`
