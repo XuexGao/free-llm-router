@@ -84,7 +84,7 @@ export const RACCOON_DESKTOP_PREFIX = '/api/web/desktop/v1'
  * 手机号传输层加密密钥（**公开常量**，`src/raccoon.ts:36-43`）。
  *
  * ⚠️ 客户端把它硬编码在前端 bundle 里，只用于防止手机号明文出现在日志/代理里，
- * **不是安全边界**。与 Loomy 的 AccessKey 同性质。
+ * **不是安全边界**（与其它家的 AccessKey 同性质）。
  */
 export const RACCOON_PHONE_CIPHER_SECRET = 'senseraccoon2023'
 
@@ -371,7 +371,7 @@ function pickTimestamp(source: Record<string, unknown>, ...keys: string[]): numb
  * ## 判别特征（严格）
  *
  * 必须能与别家区分开。Raccoon 的 `access_token` 是**服务端下发的 JWT**
- * （三段 base64url，`src/raccoon.ts:78-83`），这与 Loomy 的 32 位 hex session
+ * （三段 base64url，`src/raccoon.ts:78-83`），这与其它家的 32 位 hex session
  * **形态完全不同**，是最可靠的判别依据。
  *
  * 故判据是：有 token 字段**且**（是 JWT，**或**有 `refresh_token`，
@@ -460,7 +460,7 @@ function parseCredential(input: unknown): ProviderCredential {
       ...(phone === '' ? {} : { phone }),
       ...(userId === '' ? {} : { userId }),
       ...(deviceId === '' ? {} : { deviceId }),
-      // 诚实标记：raccoon **有** refresh 端点（与 Loomy 恒 false 不同）
+      // 诚实标记：raccoon **有** refresh 端点
       refreshable: refreshToken === '' ? 'false' : 'true',
       apiBase: RACCOON_API_BASE,
     },
@@ -644,13 +644,13 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
 /**
  * 准备出站请求体。
  *
- * ⚠️ 与 loomy 同理：网关对**非默认供应商**传的是**未清洗的原始 body**，
+ * ⚠️ 网关对**非默认供应商**传的是**未清洗的原始 body**，
  * 故这里必须自己补两件事：
  *
  * 1. `model` 换成去掉 `provider/` 前缀的值（body 里那份还带前缀）；
  * 2. `stream` 必须为 `true`。
  *
- * 另外做工具配对清理（见 `loomy.ts` 的说明）。
+ * 另外做工具配对清理。
  *
  * ## 思考档位
  *
@@ -683,7 +683,7 @@ export function prepareRaccoonBody(body: Record<string, unknown>, model: string)
   return JSON.stringify(out)
 }
 
-/** 清理孤儿 `tool` 消息与不完整 `tool_calls`（见 `loomy.ts` 的同名实现说明）。 */
+/** 清理孤儿 `tool` 消息与不完整 `tool_calls`。 */
 function cleanupToolPairing(messages: unknown[]): unknown[] {
   const declared = new Set<string>()
   for (const raw of messages) {

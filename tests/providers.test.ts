@@ -14,6 +14,7 @@
  */
 
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
 import {
@@ -487,4 +488,19 @@ test('⚠️ 声明 refresh 的供应商必须也保持 refreshToken 非空才�
   const withRefresh = PROVIDERS.filter((p) => typeof p.refresh === 'function').map((p) => p.id)
   assert.ok(withRefresh.length > 0, '至少应有一家实现了 refresh')
   assert.ok(withRefresh.includes('buddy'), 'buddy 应有 refresh')
+})
+
+test('⚠️ 国际版必须声明 requiresSystemFirst（否则 400 + 11128 伪装成安全拦截）', () => {
+  // 实测：www.workbuddy.ai 要求首条消息是 system，否则返回
+  // HTTP 400 + code 11128 "first message is not system prompt"，
+  // 且 displayMsg 把它伪装成「blocked by security」。
+  // 依据 deepseek-harness-codearts/src/account-probe.ts:93-107。
+  const intl = findProvider('workbuddy')
+  assert.notEqual(intl, undefined)
+  // 通过 Provider 是否声明该行为来间接断言（配置字段不外露，
+  // 故这里断言行为：缺失 system 时 chat 应自动补一条 —— 用源码级断言）
+  const src = readFileSync('src/providers/buddy.ts', 'utf8')
+  assert.ok(src.includes('requiresSystemFirst'), '应有 requiresSystemFirst 配置')
+  assert.ok(/requiresSystemFirst: true/.test(src), '国际版应打开它')
+  assert.ok(src.includes("role: 'system'"), '应在缺失时自动补 system 首条')
 })

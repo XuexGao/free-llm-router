@@ -32,9 +32,10 @@ import {
   parseSseLine,
   sseHeaders,
   translateFrame,
+  aggregateSse,
 } from '../src/gateway/stream.ts'
 import { extractModels } from '../src/gateway/models.ts'
-import { mapErrorToPunishment } from '../src/gateway/server.ts'
+import { isAuthLikeFailure, mapErrorToPunishment } from '../src/gateway/server.ts'
 
 // ─────────────────────── max_completion_tokens 翻译 ───────────────────────
 
@@ -442,4 +443,95 @@ test('映射表覆盖所有 ErrorKind（不漏分支）', () => {
     assert.equal(typeof m.rotate, 'boolean', `${k} 缺少 rotate`)
     assert.ok(typeof m.dimension === 'string' && m.dimension !== '', `${k} 缺少 dimension`)
   }
+})
+
+// ─────────────────── 非流式聚合（客户端 stream:false） ───────────────────
+
+test('⚠️ 非流式请求必须聚合成一个 JSON（不能把 SSE 原文返回）', () => {
+  // 实测踩到：客户端 `stream: false` 时我们仍返回 SSE 原文，
+  // 客户端 JSON.parse 报
+  // `Unexpected JSON token at offset 5: Expected EOF after parsing, but had :`
+  //（offset 5 正是 `data:` 的冒号）。
+  const sse = [
+    'data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"你好"},"finish_reason":""}]}',
+    '',
+    'data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"content":"世界"},"finish_reason":"stop"}]}',
+    '',
+    'data: {"id":"chatcmpl-1","model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n')
+
+  const out = aggregateSse(sse, { model: 'm', now: 1_700_000_000_000 })
+  assert.equal(out.object, 'chat.completion')
+  assert.equal(out.id, 'chatcmpl-1')
+  assert.equal(out.choices[0]?.message.content, '你好世界', '正文必须被合并')
+  assert.equal(out.choices[0]?.finish_reason, 'stop')
+  assert.deepEqual(out.usage, { prompt_tokens: 5, completion_tokens: 2 })
+})
+
+test('⚠️ 非流式聚合必须按 index 合并分片的 tool_calls arguments', () => {
+  // 工具调用的 arguments 是**分片**到达的；不合并的话客户端拿到被截断的
+  // JSON，无法解析（这是真实缺陷，不是理论问题）。
+  const sse = [
+    'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\\"ci"}}]},"finish_reason":""}]}',
+    'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\\":\\"北京\\"}"}}]},"finish_reason":"tool_calls"}]}',
+    'data: [DONE]',
+  ].join('\n')
+
+  const out = aggregateSse(sse, { model: 'm', now: 0 })
+  const tc = (out.choices[0]?.message.tool_calls ?? [])[0] as Record<string, unknown>
+  assert.notEqual(tc, undefined, '应有 tool_calls')
+  const fn = tc['function'] as Record<string, unknown>
+  assert.equal(fn['name'], 'get_weather')
+  assert.equal(fn['arguments'], '{"city":"北京"}', 'arguments 必须完整合并')
+  // 合并后必须是合法 JSON（这正是原缺陷的判据）
+  assert.doesNotThrow(() => JSON.parse(String(fn['arguments'])))
+  assert.equal(out.choices[0]?.finish_reason, 'tool_calls')
+})
+
+test('⚠️ 非流式聚合：reasoning_content 不能混进正文', () => {
+  const sse = [
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"想想"},"finish_reason":""}]}',
+    'data: {"choices":[{"index":0,"delta":{"content":"答案"},"finish_reason":"stop"}]}',
+    'data: [DONE]',
+  ].join('\n')
+  const out = aggregateSse(sse, { model: 'm', now: 0 })
+  assert.equal(out.choices[0]?.message.content, '答案')
+  assert.equal(out.choices[0]?.message.reasoning_content, '想想')
+})
+
+test('非流式聚合：空流不崩，且不编造 id', () => {
+  const out = aggregateSse('', { model: 'm', now: 0 })
+  assert.equal(out.choices[0]?.message.content, '')
+  assert.ok(out.id.startsWith('chatcmpl-'), '空流也应有一个 id')
+})
+
+// ─────────────────── 鉴权失败判据（续期触发条件） ───────────────────
+
+test('⚠️ isAuthLikeFailure 必须认出 CodeArts 的 HTTP 400 + APIG.0602', () => {
+  // 实测踩到两次：CodeArts 的 security_token 过期报的是 **HTTP 400**
+  //（不是 401/403）+ `security token has expired`。
+  // 只看状态码的判据会漏掉它 → 续期从不触发 → 账号明明能续期却一直报错。
+  assert.equal(
+    isAuthLikeFailure(400, '{"error_code":"APIG.0602","error_msg":"Bad request: the security token has expired"}'),
+    true,
+  )
+  // 各家真实文案
+  assert.equal(isAuthLikeFailure(401, 'upstream 401'), true)
+  assert.equal(isAuthLikeFailure(0, 'WorkBuddy auth_error'), true)
+  assert.equal(isAuthLikeFailure(0, 'Raccoon 失败（code=200003）：authorization_verify_error'), true)
+  assert.equal(isAuthLikeFailure(0, 'Cline 对话失败（http=401）：Unauthorized'), true)
+  assert.equal(isAuthLikeFailure(403, 'Forbidden'), true)
+})
+
+test('⚠️ isAuthLikeFailure 不该把普通故障判成鉴权失败', () => {
+  // 否则会无谓地触发续期（白打上游，且可能把好凭据写坏）
+  assert.equal(isAuthLikeFailure(500, '内部错误'), false)
+  assert.equal(isAuthLikeFailure(429, 'rate limit'), false)
+  assert.equal(isAuthLikeFailure(0, '网络超时'), false)
+  assert.equal(isAuthLikeFailure(502, '上游网关错误'), false)
+  // ⚠️ 400 本身不是鉴权信号（只有配合具体文案才是）
+  assert.equal(isAuthLikeFailure(400, 'invalid parameter: model'), false)
 })

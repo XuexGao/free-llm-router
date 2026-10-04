@@ -604,6 +604,40 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /** 设置某供应商的停用模型列表。 */
+  /**
+   * 清账号级冷却与熔断（`until` / `breakerUntil` / `degradeUntil` / 连续失败计数）。
+   *
+   * ⚠️ 运维入口：排查「账号明明健康却选不到号」时用 ——
+   * 实测踩到：codearts 账号因连续失败进了熔断（`breakerUntil` 未来 7 分钟），
+   * 面板显示 disabled=false、until=0，但 pick 就是不返回它，
+   * 报的是「没有可用账号」—— 完全看不出是熔断。
+   *
+   * 与 `clearModelCooldowns` 分开：那个清**模型级**，这个清**账号级**。
+   */
+  async clearCooldowns(realm: string, uid?: string): Promise<number> {
+    const states: Array<AccountState | undefined> = uid === undefined
+      ? listAccounts(this.ctx.storage.sql, realm).map((r) => normalizeAccountState(JSON.parse(r)))
+      : [normalizeAccountState(JSON.parse(readAccount(this.ctx.storage.sql, uid) ?? 'null'))]
+    let n = 0
+    for (const state of states) {
+      if (state === undefined) continue
+      if (state.until !== 0 || state.breakerUntil !== 0 || state.degradeUntil !== 0 || state.fails !== 0) {
+        state.until = 0
+        state.breakerUntil = 0
+        state.degradeUntil = 0
+        state.coolKind = ''
+        state.fails = 0
+        state.retryCount = 0
+        state.softStreak = 0
+        state.consecutiveFails = 0
+        state.sessionDeadFails = 0
+        writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+        n += 1
+      }
+    }
+    return n
+  }
+
   async setDisabledModels(provider: string, models: string[]): Promise<void> {
     const all = (await this.ctx.storage.get<Record<string, string[]>>('disabledModels')) ?? {}
     all[provider] = models

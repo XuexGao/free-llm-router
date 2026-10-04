@@ -13,7 +13,7 @@
  * ```
  *
  * Workers 没有 listen socket，所以「起本地端口收 OAuth 回调」那类 provider
- * （CodeArts / LobsterAI / TRAE / Loomy / Raccoon）在这里**整体不可行**。
+ * （CodeArts / LobsterAI / TRAE / Raccoon）在这里**整体不可行**。
  * WorkBuddy 的轮询式流程是它能落地 serverless 的前提之一（AGENTS.md §2.5）。
  *
  * ## 登录状态放在 DO 里，不放内存

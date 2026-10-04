@@ -142,3 +142,118 @@ export function sseHeaders(): Record<string, string> {
     'x-accel-buffering': 'no',
   }
 }
+
+
+// ─────────────────── 非流式聚合（客户端要 stream:false 时用） ───────────────────
+
+/** 聚合后的单次补全（OpenAI 非流式形状）。 */
+export interface AggregatedCompletion {
+  id: string
+  object: 'chat.completion'
+  created: number
+  model: string
+  choices: Array<{
+    index: number
+    message: { role: 'assistant'; content: string; reasoning_content?: string; tool_calls?: unknown[] }
+    finish_reason: string | null
+  }>
+  usage?: unknown
+}
+
+/**
+ * 把上游 SSE 流聚合成**一个**非流式补全。
+ *
+ * ## ⚠️ 为什么必须做（实测踩到的严重缺陷）
+ *
+ * 上游**只支持流式**（`AGENTS.md §6.x`：请求体必须 `stream: true`），
+ * 故我们一律以流式请求上游。但**客户端**可能要非流式（`stream: false`。
+ *
+ * 原来的实现**从不检查客户端要什么**，一律把 SSE 转发回去 ——
+ * 于是非流式客户端拿到 `data: {...}` 这样的文本，试图 `JSON.parse` 就报
+ * `Unexpected JSON token at offset 5: Expected EOF after parsing, but had : instead`
+ *（offset 5 正是 `data:` 的冒号）。
+ *
+ * 修法：客户端要非流式时，在这里把 SSE 帧合并成一条完整回复。
+ *
+ * ⚠️ 与流式路径的取舍不同：这里**必须缓冲**（非流式的语义就是「一次给完」）。
+ * 故它只用于非流式请求；流式路径仍然逐帧透传（10ms CPU 纪律）。
+ */
+export function aggregateSse(
+  rawSse: string,
+  meta: { model: string; now: number },
+): AggregatedCompletion {
+  const result: AggregatedCompletion = {
+    id: '',
+    object: 'chat.completion',
+    created: Math.floor(meta.now / 1000),
+    model: meta.model,
+    choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: null }],
+  }
+
+  let content = ''
+  let reasoning = ''
+  const toolCalls: Array<Record<string, unknown>> = []
+  const choice = result.choices[0]
+  if (choice === undefined) return result
+
+  for (const line of rawSse.split('\n')) {
+    if (!line.startsWith('data: ')) continue
+    const payload = line.slice(6).trim()
+    if (payload === '' || payload === '[DONE]') continue
+
+    let frame: Record<string, unknown>
+    try {
+      frame = JSON.parse(payload) as Record<string, unknown>
+    } catch {
+      continue // 非 JSON 帧（心跳等）直接跳过
+    }
+
+    // 顶层 id / usage 取最后一次出现的值
+    if (typeof frame['id'] === 'string' && frame['id'] !== '') result.id = frame['id']
+    if (frame['usage'] !== undefined && frame['usage'] !== null) result.usage = frame['usage']
+
+    const choices = frame['choices']
+    if (!Array.isArray(choices)) continue
+    for (const c of choices) {
+      if (c === null || typeof c !== 'object') continue
+      const ch = c as Record<string, unknown>
+      const delta = ch['delta']
+      if (delta !== null && typeof delta === 'object') {
+        const d = delta as Record<string, unknown>
+        if (typeof d['content'] === 'string') content += d['content']
+        if (typeof d['reasoning_content'] === 'string') reasoning += d['reasoning_content']
+        if (Array.isArray(d['tool_calls'])) {
+          // ⚠️ 工具调用的 arguments 是**分片**到达的，必须按 index 合并，
+          // 否则客户端拿到的是被截断的 JSON（无法解析）。
+          for (const tc of d['tool_calls']) {
+            if (tc === null || typeof tc !== 'object') continue
+            const t = tc as Record<string, unknown>
+            const idx = typeof t['index'] === 'number' ? t['index'] : toolCalls.length
+            const slot = (toolCalls[idx] ??= { index: idx, id: '', type: 'function', function: { name: '', arguments: '' } })
+            const fn = slot['function'] as Record<string, unknown>
+            if (typeof t['id'] === 'string' && t['id'] !== '') slot['id'] = t['id']
+            const tf = t['function']
+            if (tf !== null && typeof tf === 'object') {
+              const f = tf as Record<string, unknown>
+              if (typeof f['name'] === 'string' && f['name'] !== '') fn['name'] = f['name']
+              if (typeof f['arguments'] === 'string') fn['arguments'] = String(fn['arguments'] ?? '') + f['arguments']
+            }
+          }
+        }
+      }
+      const fr = ch['finish_reason']
+      if (typeof fr === 'string' && fr !== '') choice.finish_reason = fr
+    }
+  }
+
+  choice.message.content = content
+  if (reasoning !== '') choice.message.reasoning_content = reasoning
+  if (toolCalls.length > 0) choice.message.tool_calls = toolCalls
+  // ⚠️ 流里没给 finish_reason 时**不能编造** —— 但也不能留 null 让客户端困惑。
+  // 有 tool_calls 说明是工具调用，否则按正常结束。
+  if (choice.finish_reason === null) {
+    choice.finish_reason = toolCalls.length > 0 ? 'tool_calls' : 'stop'
+  }
+  if (result.id === '') result.id = `chatcmpl-${Math.random().toString(36).slice(2, 15)}`
+  return result
+}

@@ -67,6 +67,27 @@ import type {
 // ─────────────────────────── 产品配置 ───────────────────────────
 
 /** OpenCode Zen 的固定端点与产品常量。 */
+/**
+ * ## ⚠️ 匿名通道（`Bearer public`）已被上游关闭（实测，2026-10 复核）
+ *
+ * 参考项目把 `public` 当作「官方 CLI 无 key 时的字面量」，据此实现了匿名通道。
+ * 但**实测该通道已失效**：
+ *
+ * ```
+ * POST https://opencode.ai/zen/v1/chat/completions
+ * authorization: Bearer public
+ * → HTTP 401 {"type":"error","error":{"type":"AuthError","message":"Missing API key."}}
+ * ```
+ *
+ * 已排除的可能：换成 `x-api-key` 头、补 `user-agent`、换模型 —— 全部同样 401。
+ * 故这是**上游的策略变更**，不是本项目的接线错误。
+ *
+ * 影响：`{"api_key":"public"}` 形态的凭据**仍然能导入、能列模型**（列模走静态表，
+ * 不发请求），但**对话一定失败**。这不是「配错了」，是这条路已经不通。
+ *
+ * 处置：用户在 https://opencode.ai/auth 取真实 `sk-…` key 后重新导入即可。
+ * 若要恢复匿名通道，得先确认上游是否重新放开 —— 不要再照着参考项目改回来。
+ */
 export const OPENCODE = {
   baseUrl: 'https://opencode.ai/zen',
   chatPath: '/v1/chat/completions',

@@ -4,13 +4,13 @@
  * ## 为什么必须在项目内自带一份（这是一个真实阻塞点）
  *
  * 讯飞账号（CAccount）端点的 HMAC-SHA1 签名里，第 4 段是 `Content-MD5`
- * （参考项目 `src/loomy-sign.ts:40-43`，由 `createHash('md5')` 产出）。
+ * （参考项目 `src/loomy-sign.ts:40-43` 的算法，由 `createHash('md5')` 产出）。
  * 而 **WebCrypto 压根没有 MD5**：`crypto.subtle.digest()` 支持的算法只有
  * SHA-1/256/384/512（`MD5` 会抛 `NotSupportedError`），且 Workers 里
  * 不可能引入 `node:crypto`。
  *
  * ⇒ 结论：**签名头这一整个能力**取决于「有没有 MD5」。故这里内联一份，
- * 使 `loomyAuthHeaders` 全链路可用（见 `loomy.ts`）。
+ * 供 Raccoon 等需要 md5 摘要的签名头使用。
  *
  * ## 它不是安全边界
  *

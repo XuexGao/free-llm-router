@@ -23,7 +23,6 @@ import { lobsteraiProvider } from './lobsterai.js'
 import { traeProvider } from './trae.js'
 import { qoderProvider } from './qoder.js'
 import { opencodeProvider } from './opencode.js'
-import { loomyProvider } from './loomy.js'
 import { raccoonProvider } from './raccoon.js'
 import { zcodeProvider } from './zcode.js'
 import { parseJsonLenient } from '../upstream/import.js'
@@ -48,7 +47,6 @@ export const PROVIDERS: readonly Provider[] = [
   traeProvider,
   qoderProvider,
   opencodeProvider,
-  loomyProvider,
   raccoonProvider,
   zcodeProvider,
 ]
@@ -117,7 +115,7 @@ export function parseCredentialAnywhere(
   // 它的凭据形态是最宽松的（只要 `accessToken` + `uid`），因此会把别的供应商的
   // 凭据也「认下来」，然后拿去打 WorkBuddy 的端点 → 永远 401。
   // 而其它供应商的凭据有更强的判别特征（cline 的 `workos:` 前缀、
-  // codearts 的 AK/SK、loomy 的 ak/sk 对等）。
+  // codearts 的 AK/SK 对）。
   // 故顺序是：**特征强的先试，最宽松的兜底**。
   const ordered = [...PROVIDERS].sort((a, b) => {
     if (a.id === DEFAULT_PROVIDER) return 1

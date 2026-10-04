@@ -28,7 +28,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
-import { detectErrorFrame, doneFrame, errorFrame, parseSseLine, sseHeaders, translateFrame } from './stream.js'
+import { aggregateSse, detectErrorFrame, doneFrame, errorFrame, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
@@ -156,10 +156,28 @@ export async function handleChatCompletions(
   const providerId = routed.provider
   const model = routed.model
 
+  // ⚠️ **读客户端要的是流式还是非流式**（实测踩到的严重缺陷）。
+  //
+  // 上游只支持流式，故我们一律以流式请求它；但客户端可能要非流式。
+  // 原实现**从不检查**这个字段，一律把 SSE 转发回去 ——
+  // 非流式客户端拿到 `data: {...}` 文本，JSON.parse 直接报
+  // `Unexpected JSON token at offset 5`（offset 5 就是 `data:` 的冒号）。
+  /**
+   * 客户端是否要流式。
+   *
+   * ⚠️ **OpenAI 规范里 `stream` 缺省是 `false`（非流式）**。
+   * 我第一版写成「缺省按流式」，结果非流式工具调用（客户端没传 stream）
+   * 仍返回 SSE 原文 —— 客户端 `JSON.parse` 报
+   * `Unexpected JSON token at offset 5`。已用真实请求复现。
+   *
+   * 故判据是**严格等 true**：只有显式 `stream: true` 才走流式。
+   */
+  const wantsStream = (rawBody as Record<string, unknown>).stream === true
+
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, rawBody, request, env, realm, ctx, tried: [] })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [] })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -315,7 +333,7 @@ export async function handleChatCompletions(
 
     const startedAt = Date.now()
     return {
-      response: streamResponse(upstream.body, {
+      response: await streamResponse(upstream.body, {
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
           const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
@@ -353,7 +371,7 @@ export async function handleChatCompletions(
             .applyFailure({ uid: candidate.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })
             .catch(() => {})
         },
-      }),
+      }, wantsStream ? undefined : { model }),
     }
   }
 
@@ -381,8 +399,20 @@ function streamResponse(
     /** 流结束时回调，带上从流里解析到的 usage（用于面板用量统计）。 */
     onFinish?: (usage: { input: number; output: number } | undefined) => void
   },
-): Response {
+  /**
+   * 客户端要**非流式**时传 true：内部仍按流式读上游，但最后聚合成一个
+   * JSON 响应（见 `aggregateSse` 的说明）。
+   */
+  nonStreaming?: { model: string },
+): Response | Promise<Response> {
   let notified = false
+
+  // ⚠️ 非流式：**必须缓冲**（非流式的语义就是「一次给完」）。
+  // 与流式路径的取舍相反 —— 那条路径逐帧透传是为了省 CPU（10ms 纪律），
+  // 而这条只在客户端显式要非流式时走。
+  if (nonStreaming !== undefined) {
+    return nonStreamingResponse(upstreamBody, nonStreaming.model, hooks)
+  }
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -504,6 +534,8 @@ function tryDetectError(data: string): string | undefined {
 async function handleProviderChat(input: {
   providerId: string
   model: string
+  /** 客户端是否要流式（false ⇒ 聚合成非流式 JSON）。 */
+  wantsStream: boolean
   rawBody: unknown
   request: Request
   env: Env
@@ -511,7 +543,7 @@ async function handleProviderChat(input: {
   ctx?: ExecutionContext
   tried: string[]
 }): Promise<GatewayResult> {
-  const { providerId, model, rawBody, request, env, realm, ctx } = input
+  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx } = input
 
   const provider = findProvider(providerId)
   if (provider === undefined) {
@@ -563,6 +595,57 @@ async function handleProviderChat(input: {
       upstream = await provider.chat(credential, { model, body, signal: request.signal })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+
+      // ⚠️ **续期也要在 catch 分支里做**（实测踩到的架构不一致）。
+      //
+      // 8 家 provider 的 `chat()` 在非 200 时**抛 `ProviderError`**，
+      // 而不是返回 `Response`（只有 opencode 返回）。于是网关的
+      // `!upstream.ok` 分支**永远走不到** —— 401 续期逻辑形同虚设，
+      // 表现为「cline 的 token 明明可以续期，却一直报 401」。
+      //
+      // 这里按同样的判据（鉴权类错误）尝试续期并重放一次。
+      if (isAuthLikeFailure(0, message) && provider.refresh !== undefined && !refreshed) {
+        try {
+          refreshed = true
+          const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+          await pool.putCredential(picked.uid, fresh, Date.now())
+          console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
+          const retry = await provider.chat(fresh, { model, body, signal: request.signal })
+          if (retry.ok && retry.body !== null) {
+            const startedAt2 = Date.now()
+            return {
+              response: await streamResponse(retry.body, {
+                onFirstChunk: () => {
+                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+                onError: (m) => {
+                  const t = pool
+                    .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: m.slice(0, 200) })
+                    .catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+                onFinish: (usage) => {
+                  const t = pool
+                    .recordUsage({
+                      at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
+                      input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
+                      ms: Date.now() - startedAt2,
+                    })
+                    .catch(() => {})
+                  if (ctx !== undefined) ctx.waitUntil(t)
+                },
+              }, wantsStream ? undefined : { model }),
+            }
+          }
+        } catch (refreshError) {
+          console.error(
+            `[refresh] ${providerId} 续期失败：`,
+            refreshError instanceof Error ? refreshError.message : String(refreshError),
+          )
+        }
+      }
+
       lastError = { status: 502, message }
       // 传输层失败：换号可能有用（也可能是本地出口抖动）
       continue
@@ -579,7 +662,13 @@ async function handleProviderChat(input: {
       //
       // 只试**一次**（`refreshed` 标记）：续期后仍 401 说明 refresh token 也废了，
       // 再试只是无谓地打上游。
-      if ((upstream.status === 401 || upstream.status === 403) && provider.refresh !== undefined && !refreshed) {
+      // ⚠️ **判据是「响应内容像鉴权失败」，不是「状态码等于 401/403」**。
+      //
+      // 实测踩到：CodeArts 的 security_token 过期报的是 **HTTP 400** +
+      // `{"error_code":"APIG.0602","error_msg":"...security token has expired"}`。
+      // 只看状态码的话，这个分支根本不进 —— 续期逻辑形同虚设，
+      // 而 catch 分支（另一条路）已经改成按内容判了，两条路判据必须一致。
+      if (isAuthLikeFailure(upstream.status, text) && provider.refresh !== undefined && !refreshed) {
         try {
           refreshed = true
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
@@ -590,7 +679,7 @@ async function handleProviderChat(input: {
           if (retry.ok && retry.body !== null) {
             const startedAt2 = Date.now()
             return {
-              response: streamResponse(retry.body, {
+              response: await streamResponse(retry.body, {
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
@@ -611,7 +700,7 @@ async function handleProviderChat(input: {
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
                 },
-              }),
+              }, wantsStream ? undefined : { model }),
             }
           }
         } catch (error) {
@@ -645,7 +734,7 @@ async function handleProviderChat(input: {
     }
 
     return {
-      response: streamResponse(upstream.body, {
+      response: await streamResponse(upstream.body, {
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
@@ -673,7 +762,7 @@ async function handleProviderChat(input: {
           if (ctx !== undefined) ctx.waitUntil(t)
           else void t
         },
-      }),
+      }, wantsStream ? undefined : { model }),
     }
   }
 
@@ -681,9 +770,149 @@ async function handleProviderChat(input: {
     response: jsonError(
       lastError?.status ?? 503,
       lastError === undefined
-        ? `供应商「${provider.name}」没有可用账号（请先在面板导入该供应商的凭据）`
+        // ⚠️ 区分「真的没账号」与「有账号但全在冷却/熔断」。
+        // 实测踩到：账号因连续失败进了熔断，报的却是「请先导入凭据」——
+        // 用户会去重新导入一份好凭据，而真实原因是**等几分钟就好**。
+        ? (await describeNoAccount(env, realm, providerId))
         : `供应商「${provider.name}」请求失败：${lastError.message}`,
       'provider_error',
     ),
   }
+}
+
+
+/**
+ * 这次失败看起来是**鉴权类**问题吗（该续期）。
+ *
+ * ## ⚠️ 为什么必须抽成公共函数（实测踩到两次）
+ *
+ * 这个判据在网关里有**两个调用点**（`!upstream.ok` 分支与 `catch` 分支），
+ * 因为 provider 的 `chat()` 有两种失败风格：有的返回非 2xx Response
+ *（opencode），有的直接抛 `ProviderError`（其余 8 家）。
+ *
+ * 我第一版只放宽了 `catch` 分支，忘了 `!upstream.ok` 分支 ——
+ * 于是 CodeArts（返回 Response 的那条路）仍然不续期，
+ * 表现为「明明能续期却一直报 security token expired」。
+ * 抽出来从根上避免两处再分叉。
+ *
+ * ## 判据要**宽**
+ *
+ * 各家的鉴权错误文案千差万别，且**状态码也各不相同**：
+ * - WorkBuddy: `auth_error` / `upstream 401`
+ * - Raccoon:   `code=200003` + `authorization_verify_error`
+ * - Cline:     `http=401` + `Unauthorized`
+ * - CodeArts:  **HTTP 400** + `APIG.0602` + `security token has expired`
+ *
+ * 宁可偶尔多试一次续期（续期失败会落回原错误），也不要漏掉真正的鉴权失败。
+ */
+/**
+ * 生成「选不到号」的**准确**说明。
+ *
+ * ⚠️ 不能一律说「请先导入凭据」（实测踩到的误导）：
+ * 账号可能只是**在冷却/熔断**里（`until` / `breakerUntil` / `degradeUntil`），
+ * 等几分钟自己就好了。让用户去重新导入凭据是纯粹的浪费时间。
+ */
+export async function describeNoAccount(
+  env: Env,
+  realm: string,
+  provider: string,
+): Promise<string> {
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const accounts = (await pool.listAccounts(realm, Date.now())).filter(
+    (a) => (a.provider ?? 'workbuddy') === provider,
+  )
+  if (accounts.length === 0) {
+    return `供应商「${provider}」没有账号（请先在面板导入该供应商的凭据）`
+  }
+  const now = Date.now()
+  const cooling = accounts.filter((a) => a.until > now || a.breakerUntil > now || a.degradeUntil > now)
+  if (cooling.length > 0) {
+    // 取最长的剩余时间（用户关心的是「还要等多久」）
+    const waits = cooling.map((a) => Math.max(a.until, a.breakerUntil, a.degradeUntil) - now)
+    const maxWait = Math.max(...waits)
+    const mins = Math.max(1, Math.round(maxWait / 60_000))
+    return `供应商「${provider}」的 ${accounts.length} 个账号都在冷却中（因连续失败触发退避），约 ${mins} 分钟后自动恢复`
+  }
+  const disabled = accounts.filter((a) => a.disabled)
+  if (disabled.length === accounts.length) {
+    return `供应商「${provider}」的账号都被手动禁用了（请在面板启用）`
+  }
+  return `供应商「${provider}」暂时没有可用账号（请稍后重试或查看面板状态）`
+}
+
+export function isAuthLikeFailure(status: number, detail: string): boolean {
+  // 状态码：401/403 是标准鉴权失败；400 也可能（CodeArts 就是这样）
+  if (status === 401 || status === 403) return true
+  return /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|42400/i.test(
+    detail,
+  )
+}
+
+/**
+ * 非流式响应：把上游 SSE 读完、聚合成一个 `chat.completion`。
+ *
+ * ⚠️ 这里的 `await reader.read()` 会一直读到上游结束 —— 对长回答可能耗时较久。
+ * 这是**非流式的固有代价**（客户端要的就是「等完整结果」），
+ * 且等待网络 I/O **不计入 CPU 预算**（AGENTS.md §8.2.2 第 2 条）。
+ */
+async function nonStreamingResponse(
+  upstreamBody: ReadableStream<Uint8Array>,
+  model: string,
+  hooks: {
+    onFirstChunk: () => void
+    onError: (message: string) => void
+    onFinish?: (usage: { input: number; output: number } | undefined) => void
+  },
+): Promise<Response> {
+  const reader = upstreamBody.getReader()
+  const decoder = new TextDecoder()
+  let raw = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      raw += decoder.decode(value, { stream: true })
+    }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // 忽略
+    }
+  }
+
+  const completion = aggregateSse(raw, { model, now: Date.now() })
+  const choice = completion.choices[0]
+
+  // 上游错误以 SSE 帧形式返回（HTTP 200）：必须显式报错，不能假装成功
+  if (choice !== undefined && choice.message.content === '' && (completion.usage === undefined || completion.usage === null)) {
+    // 流里没有任何内容 —— 找一下是不是错误帧
+    for (const line of raw.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      const payload = line.slice(6).trim()
+      if (payload === '' || payload === '[DONE]') continue
+      try {
+        const parsed = JSON.parse(payload) as Record<string, unknown>
+        const err = detectErrorFrame(parsed)
+        if (err !== undefined) {
+          hooks.onError(err)
+          return jsonError(502, err, 'upstream_error')
+        }
+      } catch {
+        // 非 JSON 帧，继续找
+      }
+    }
+  }
+
+  hooks.onFirstChunk()
+  const usage = completion.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
+  hooks.onFinish?.(
+    usage === undefined
+      ? undefined
+      : { input: usage.prompt_tokens ?? 0, output: usage.completion_tokens ?? 0 },
+  )
+  return new Response(JSON.stringify(completion), {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  })
 }

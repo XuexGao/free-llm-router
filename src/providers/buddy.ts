@@ -71,6 +71,18 @@ interface VariantConfig {
   checkin: boolean
   /** 不支持签到时给用户的原因。 */
   checkinBlockedReason?: string
+  /**
+   * 是否**要求首条消息必须是 `role: 'system'`**。
+   *
+   * ⚠️ 国际版（workbuddy.ai）有这个硬要求：首条不是 system 时返回
+   * **HTTP 400 + code 11128** `"first message is not system prompt"`，
+   * 而且 `displayMsg` 把它**伪装成安全策略拦截**（"blocked by security"），
+   * 极易误判成账号被封。
+   * 依据：`deepseek-harness-codearts/src/account-probe.ts:93-107,326-327`。
+   *
+   * 国内版（codebuddy.cn）**没有**这个要求（同上文件的对照表）。
+   */
+  requiresSystemFirst?: boolean
 }
 
 /**
@@ -100,12 +112,34 @@ export const BUDDY_CN: VariantConfig = {
  * ⚠️ 故 `checkin: false` 是**如实声明**，不是遗漏 ——
  * 参考项目也因此在 Jet Hub 里不为它渲染「一键领取积分」按钮。
  */
+/**
+ * 若该变体要求「首条必须是 system」，则按需补一条。
+ *
+ * ⚠️ 只在**缺失**时补：客户端自己传了 system 就尊重它，
+ * 不能覆盖用户精心写的系统提示词。
+ */
+function withSystemFirst(input: unknown, required: boolean): unknown {
+  if (!required) return input
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return input
+  const body = input as Record<string, unknown>
+  const messages = body.messages
+  if (!Array.isArray(messages)) return input
+  const first = messages.length > 0 ? (messages[0] as Record<string, unknown> | undefined) : undefined
+  if (first !== undefined && first.role === 'system') return input
+  return {
+    ...body,
+    messages: [{ role: 'system', content: 'You are a helpful assistant.' }, ...messages],
+  }
+}
+
 export const WORKBUDDY_INTL: VariantConfig = {
   id: 'workbuddy',
   name: 'WorkBuddy（国际版）',
   chatBase: 'https://www.workbuddy.ai',
   billingBase: 'https://www.workbuddy.ai',
   webBase: 'https://www.workbuddy.ai',
+  // ⚠️ 首条必须是 system（见 VariantConfig 上该字段的说明）
+  requiresSystemFirst: true,
   checkin: false,
   checkinBlockedReason:
     '国际版没有每日签到积分接口（积分领取在 CodeBuddy 侧完成）——'
@@ -226,7 +260,16 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     // 复用网关的请求体准备逻辑（4 处必改 + 工具配对清理）
     let body: string
     try {
-      body = sanitizeChatBody(prepareChatBody(request.body).body)
+      // ⚠️ 国际版**要求首条消息是 `role: 'system'`**，否则返回
+      // HTTP 400 + code 11128 `"first message is not system prompt"`，
+      // 且被 `displayMsg` 伪装成「安全策略拦截」，极易误判成账号被封。
+      // 依据：`deepseek-harness-codearts/src/account-probe.ts:93-107,326-327`。
+      //
+      // 用户不会知道这个要求，故在这里**自动补一条**。必须在
+      // `prepareChatBody` **之前**改（它返回的是已序列化的字符串）。
+      // 已有 system 首条则原样保留，不覆盖用户自己的系统提示词。
+      const input = withSystemFirst(request.body, config.requiresSystemFirst === true)
+      body = sanitizeChatBody(prepareChatBody(input).body)
     } catch (error) {
       throw new ProviderError({
         provider: config.id,

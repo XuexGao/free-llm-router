@@ -293,3 +293,26 @@ export function splitModelName(
   }
   return { provider: defaultProvider, model: raw }
 }
+
+/**
+ * ## ⚠️ 关于「轮换型 refresh token」的操作纪律（实测教训）
+ *
+ * 部分上游的 refresh token 是**单次使用**的。续期成功后会返回一个**新的**
+ * refresh token，旧的立刻作废：
+ *
+ * | 供应商 | 行为 |
+ * |---|---|
+ * | Raccoon | 轮换（实测：手工 curl 一次后，文件里的 token 再也不能用） |
+ * | CodeArts | 轮换（实测：`STS5.1806 invalid refresh token: 'the refresh token has been used'`） |
+ * | Trae | 轮换（已在 trae.ts 注明） |
+ * | Cline | 不轮换（响应里正常不带新 refresh_token） |
+ *
+ * **教训**：我曾在排查时直接拿**用户的真实** refresh token 手工发一次
+ * 续期请求做验证 —— 那一次就把凭据消耗掉了，用户只能重新登录。
+ *
+ * 故：**任何需要消耗 refresh token 的验证，都必须先把它落盘的新值存下来**，
+ * 或者干脆不要用真实凭据做这种验证（改用 mock）。
+ * 上面的 `refresh()` 契约已经保证「返回新凭据、由调用方落盘」，
+ * 手工验证时也必须遵守这条 —— 拿到返回值就写回，而不是只看它成不成功。
+ */
+export type RefreshRotationDiscipline = never

@@ -134,7 +134,7 @@ async function withRefreshRetry<T>(
     //
     // 宁可偶尔多试一次续期（续期失败会走 catch 落回原错误），
     // 也不要漏掉真正的鉴权失败。
-    const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|200003|\b401\b|\b403\b/i.test(
+    const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|\b401\b|\b403\b/i.test(
       message,
     )
     if (!isAuth) throw error
@@ -543,7 +543,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const realm = body.realm ?? 'cn'
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const cleared = await pool.clearModelCooldowns(realm, body.uid, body.model)
-    return json({ ok: true, realm, cleared })
+    // 同时清账号级熔断/冷却（排查「明明健康却选不到号」时用）
+    const resetCount = await pool.clearCooldowns(realm, body.uid)
+    return json({ ok: true, realm, cleared, resetCount })
   }
 
   // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
