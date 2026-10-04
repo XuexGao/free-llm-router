@@ -19,15 +19,40 @@
  *    `extras` 里，缺失时**现场生成一次并提示**（见 `parseCredential`）。
  * 5. 有**每日签到**（`checkin_credits/status` → `checkin_credits/claim`）。
  *
- * ## 🔴 登录为什么不可用（实测结论，不是偷懒）
+ * ## ✅ 登录：浏览器回跳（`auth_callback_url` 指向**本服务**）
  *
- * TRAE 登录回调**默认直接把 token 放在 query string 里回传**
- * （`auth_callback_url` 参数，老流程没有 `?code=`；`AGENTS.md` 的「TRAE 协议要点」
- * 记录了这一点），宿主必须在本机 `127.0.0.1` 起监听接收
- * （源实现 `trae-oauth.ts:604` 与 `:723` 两处 `createServer`）。
- * **Workers 没有监听 socket**；又因为「tokens 直接在回调 query 里」而不是
- * `?code=`，连「换一个渠道拿 code 再换 token」的轮询替代也不成立。
- * ⇒ `capabilities.login = false`，只支持从 TRAE 桌面端导出凭据后粘贴导入。
+ * 源实现把回调地址写死成 `http://127.0.0.1:<port>/authorize` 并自己起
+ * `createServer` 接收（`trae-oauth.ts:565`、`:692`），那是**宿主的**限制，
+ * 不是协议的限制：`auth_callback_url` 是**我们构造并随登录 URL 一起发给
+ * TRAE** 的普通参数，服务端原样回跳（`trae-oauth.ts:114-115` 的参数表）。
+ * 因此可以把它指到**本服务自己的 URL**，由 Worker 接住浏览器回跳
+ * —— 与 codearts 的 `auth_callback_url` 同一思路（`codearts.ts:723`）。
+ *
+ * 流程（三步，跨请求状态全部落在登录会话载荷里）：
+ * 1. `POST /admin/providers/login/start {provider:'trae'}` → 生成
+ *    `machine_id` / `device_id`（各 32 位 hex、**逐账号互异**）与 32 字节
+ *    CSPRNG `state`，回 `authUrl` + `callbackUrl`；
+ * 2. 浏览器授权后 TRAE 回跳 `GET /login/trae/callback/<state>?<凭证>`
+ *    （**免鉴权**：浏览器带不了管理密钥，`state` 就是能力凭证）→ 只把解析出的
+ *    凭证材料写回会话；
+ * 3. 面板轮询 `GET /admin/providers/login/poll?state=…` 才**真正**调
+ *    `ExchangeToken`（+ `GetUserInfo`）并落盘。
+ *
+ * ⚠️ **第 3 步刻意只由轮询执行，回调不做交换**：`ExchangeToken` 会**轮换**
+ * `refresh_token`（见 {@link refresh}），而回调里的 `ctx.waitUntil` 与面板轮询
+ * 是**两个独立请求**，两边都交换就会用同一个旧 refreshToken 打两次 ——
+ * 第二次必然失败，且第一次的结果可能被丢弃。codearts 能在回调里轮询是因为
+ * 那边的 ticket 换取是**幂等 GET**（`fetchCodeArtsTicket`），trae 不是。
+ *
+ * ## ⚠️ 未验证：TRAE 是否接受非 localhost 的 `auth_callback_url`
+ *
+ * 参考实现与 Go 端**只验证过** `http://127.0.0.1:18080/authorize`
+ * （`trae-oauth.ts:4-11` 的文件头明确写着「强制回调 `127.0.0.1`」，
+ * 但同处也写着「服务端会原样回跳」）。**本服务用的是自己的 Worker URL**，
+ * 两者不同源。若 TRAE 侧对回调地址有白名单/格式校验，浏览器这一程会
+ * **停在授权页不跳转**（症状与 `auth_callback_url` 参数名写错时一致）。
+ * 这是**未验证**的一环，部署后必须用真实浏览器实测一次；不要因为
+ * 代码里写通了就当成可用。
  */
 
 import {
@@ -66,6 +91,14 @@ export const TRAE_ENT_USAGE_PATH = '/trae/api/v2/pay/ide_user_ent_usage'
  * 签到用的 Ug host —— 三个 host 不可互换，挂错会 404 或 401。
  */
 export const TRAE_EXCHANGE_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken'
+/**
+ * 用户信息端点（`trae.ts:57` 的 `TRAE_USER_INFO_PATH`）。
+ *
+ * ⚠️ 与 {@link TRAE_EXCHANGE_PATH} 同 host（`api.trae.com.cn`），但鉴权方式
+ * **不同**：ExchangeToken 无签名，本端点要额外的 `X-Cloudide-Token` 头
+ * （`trae-oauth.ts:418`）。漏了它拿不到用户信息 —— 表现为「登录成功但昵称是空的」。
+ */
+export const TRAE_USER_INFO_PATH = '/cloudide/api/v3/trae/GetUserInfo'
 /**
  * OAuth `client_id`（`trae-product.ts:270` 的 `TRAE.clientId`）。
  *
@@ -1750,6 +1783,552 @@ const SESSION_DEAD_MARKERS: readonly string[] = [
   'login', 'token 失效', 'token invalid', 'session', 'unauthorized', '401',
 ]
 
+// ── 浏览器回跳登录 ──
+
+/**
+ * 登录门户基址（`trae-product.ts:161` 的 `TRAE_CONSOLE_HOST`）。
+ *
+ * ⚠️ 它与 {@link TRAE_OAUTH_HOST} / {@link TRAE_UG_HOST} / {@link TRAE_AGENT_HOST}
+ * 是**四个不同的 host**，不可互换：登录页在 `www.trae.cn`，换 token 在
+ * `api.trae.com.cn`（`trae-oauth.ts:126`）。
+ */
+export const TRAE_CONSOLE_HOST = 'https://www.trae.cn'
+
+/** 登录页路径（`trae-oauth.ts:126` 的 `${product.consoleHost}/authorization`）。 */
+export const TRAE_AUTHORIZATION_PATH = '/authorization'
+
+/**
+ * 本服务接收浏览器回跳的路径前缀。
+ *
+ * ⚠️ `state` 放在**路径**里（与 codearts 同款，`codearts.ts:716-722`）：
+ * 参考实现的回调 URL 里没有 query，无法推断 TRAE 回跳时是「按 URL API 合并
+ * query」还是「字符串拼 `?refreshToken=…`」。state 在路径里对两种行为都成立
+ * —— 若是后者，state 会变成 `state?refreshToken=…`，而凭证本来就要从
+ * query 里读，两者不冲突（见 `parseTraeCallback`）。
+ */
+export const TRAE_LOGIN_CALLBACK_PATH = '/login/trae/callback'
+
+/**
+ * 登录会话（= `state`）的有效期：**10 分钟**。
+ *
+ * 取值与 codearts 一致（`codearts.ts:726-734`）：用户那一程（打开登录页 →
+ * 登录/扫码 → 回跳）实测在分钟级，10 分钟留了一倍余量。
+ * **刻意不设更长**：`state` 是「能领取一份凭据」的能力凭证，窗口越短越安全。
+ */
+export const TRAE_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+
+/**
+ * 登录页要求的产品版本号（`trae-product.ts:282` 的 `pluginVersion`）。
+ *
+ * ⚠️ 它与 {@link TRAE_IDE_VERSION}（`0.1.52`）是**两个独立字段**：
+ * 前者给登录门户（实测值 `2.3.62834`，`login.sh:54`），后者是 chat 端点的
+ * **模型准入版本**（见 {@link TRAE_IDE_VERSION} 的说明）。混用会让其中一个失效
+ * —— `AGENTS.md` 的「TRAE 协议要点」专门记了这条。
+ */
+export const TRAE_PLUGIN_VERSION = '2.3.62834'
+
+/**
+ * 由 `machine_id` + `device_id` 派生 `login_trace_id`（hex16）。
+ *
+ * 对齐 `trae-oauth.ts:71-76` 的 `machineTraceId`：取拼接串的**尾部 16 字符**
+ * （不足则左侧补 `0`）。作用是让回调能被关联回本次登录的 pending ——
+ * TRAE 回调**不保证**回传 machine_id/device_id，但会回传 login_trace_id。
+ *
+ * ⚠️ **不要自创派生方式**（如取 sha256 前 16 位）：它是服务端侧的关联键，
+ * 值不一致会让回调认不出是哪个 pending。
+ */
+export function machineTraceId(machineId: string, deviceId: string): string {
+  const joined = machineId + deviceId
+  return joined.length >= 16
+    ? joined.slice(-16)
+    : joined.padStart(16, '0')
+}
+
+/**
+ * 构建 TRAE 登录 URL（`trae-oauth.ts:99-127` 的 `buildTraeLoginURL`）。
+ *
+ * ## ⚠️ 18 个参数**一个都不能少**（`trae-oauth.ts:84-97` 记录的真实缺陷）
+ *
+ * 早期实现只发了 `client_id` / `machine_id` / `device_id` / `callback_url` /
+ * `redirect_uri` 五个参数，与真实协议**完全不匹配**，用户症状是
+ * **「网页一直停在认证中」**：
+ *
+ * 1. 回调地址的参数名是 **`auth_callback_url`**，不是 `callback_url`
+ *    （也没有 `redirect_uri`）。名字错了 TRAE 拿不到回调地址，登录页既不跳转
+ *    也不回传任何东西；
+ * 2. `auth_from` / `login_channel` / `auth_type` / `redirect` 决定走哪条授权
+ *    通道，缺失时流程走不到回传分支；
+ * 3. `login_trace_id` 是回调反查 pending 的唯一凭据；
+ * 4. `x_*` 系列是客户端形态伪装（设备/应用信息），缺席可能被风控拦截。
+ *
+ * @param callbackUrl 浏览器回跳地址（**本服务自己的 URL**，见文件头「未验证」）
+ */
+export function buildTraeLoginURL(
+  machineId: string,
+  deviceId: string,
+  callbackUrl: string,
+): string {
+  const params = new URLSearchParams({
+    login_version: '1',
+    auth_from: 'solo',
+    login_channel: 'native_ide',
+    plugin_version: TRAE_PLUGIN_VERSION,
+    auth_type: 'local',
+    client_id: TRAE_OAUTH_CLIENT_ID,
+    redirect: '0',
+    login_trace_id: machineTraceId(machineId, deviceId),
+    // ⚠️ 参数名必须是 auth_callback_url（见上方注释第 1 条）。
+    auth_callback_url: callbackUrl,
+    machine_id: machineId,
+    device_id: deviceId,
+    x_device_id: deviceId,
+    x_machine_id: machineId,
+    x_device_brand: 'PC',
+    x_device_type: 'PC',
+    x_os_version: '1.0',
+    x_app_version: TRAE_IDE_VERSION,
+    x_app_type: 'stable',
+  })
+  return `${TRAE_CONSOLE_HOST}${TRAE_AUTHORIZATION_PATH}?${params.toString()}`
+}
+
+/**
+ * 生成本服务接收浏览器回跳的 URL。
+ *
+ * `origin` 取**收到本次请求的那个 origin**（`url.origin`），故自定义域与
+ * `workers.dev` 域都自动正确，无需配置（与 `buildCodeArtsCallbackUrl` 同款）。
+ *
+ * ⚠️ 与 codearts 一样**不带 query**：见 {@link TRAE_LOGIN_CALLBACK_PATH}。
+ */
+export function buildTraeCallbackUrl(origin: string, state: string): string {
+  return `${origin.replace(/\/+$/, '')}${TRAE_LOGIN_CALLBACK_PATH}/${encodeURIComponent(state)}`
+}
+
+/**
+ * 生成登录会话 id（= 回调 URL 里的 `state`）。
+ *
+ * ⚠️ **这就是本流程唯一的权限凭证**：谁拿到 state，谁就能把浏览器的回跳绑到
+ * 某个会话上。故用 **32 字节 CSPRNG**（256 位）而不是 `crypto.randomUUID()`
+ * （122 位）—— 前者没有可猜的结构（与 `generateCodeArtsLoginState` 同口径）。
+ */
+export function generateTraeLoginState(): string {
+  const buf = new Uint8Array(32)
+  crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * 解析 TRAE 登录回调 URL 得到的原始凭证材料。
+ *
+ * 对齐 `trae-oauth.ts:134-162` 的 `TraeCallbackInfo` 与 Go 端 `CallbackInfo`
+ * （`callback.go:66-73`）。
+ */
+export interface TraeCallbackInfo {
+  /** 优先取 query.refreshToken；缺失时回退 userJwt.RefreshToken。 */
+  refreshToken: string
+  /** 无 refreshToken 时的兜底 access token（userJwt.Token）。 */
+  accessToken: string
+  uid: string
+  nickname: string
+  /** ⚠️ 回调里字段名是 **TenantID**（不是 EnterpriseID）。 */
+  enterpriseId: string
+  /**
+   * **PKCE 新流程**携带的授权码（`code` / `authCodeInfo.code`）。
+   *
+   * 见 {@link parseTraeCallback} 的说明：TRAE 授权页并存两套流程。
+   */
+  authCode?: string
+}
+
+/**
+ * `parseTraeCallback` 的详细结果（带回**失败原因**）。
+ *
+ * 除了「解出了什么」，还回答「**为什么没解出来**」—— 回调页需要把原因写进
+ * 响应，否则用户只看到一句含糊的失败文案，无法区分「上游换了流程」与
+ * 「参数名变了」（`trae-oauth.ts:164-173`）。
+ */
+export type TraeCallbackParseResult =
+  | { ok: true; info: TraeCallbackInfo }
+  | { ok: false; reason: string; authCodeFlow: boolean }
+
+/**
+ * 解析回调里 URL 编码的 JSON 参数（`userInfo` / `userJwt`）。
+ *
+ * 对齐 `trae-oauth.ts:182-198`：`URLSearchParams` 已解一层 percent-encoding，
+ * 但 TRAE 的 `userInfo` 中文存在**双重编码**（实测昵称乱码
+ * `Óû§8847309959`），故再容错解一层。
+ */
+function parseJsonParam(raw: string | null): Record<string, unknown> | undefined {
+  if (raw === null || raw.length === 0) return undefined
+  const candidates = [raw]
+  try {
+    const unescaped = decodeURIComponent(raw)
+    if (unescaped !== raw) candidates.push(unescaped)
+  } catch { /* 非法编码：只用原串 */ }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch { /* 试下一个 */ }
+  }
+  return undefined
+}
+
+/** 从 JSON 对象读字符串（兼容数字）。 */
+function jsonString(source: Record<string, unknown> | undefined, key: string): string {
+  if (source === undefined) return ''
+  const value = source[key]
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return ''
+}
+
+/**
+ * 修复回调 `userInfo.ScreenName` 的**双重编码乱码**（`trae-oauth.ts:216-232`）。
+ *
+ * TRAE 回调的中文昵称会被错误地按 latin-1/cp1252 解读一次，实测得到
+ * `Óû§8847309959` 这类乱码。这里用 `TextDecoder('latin1')` + `TextDecoder('utf-8')`
+ * 组合回转（源实现用 Node 的 `Buffer.from(raw,'latin1').toString('utf8')`，
+ * 那是**唯一**用到 Node API 的地方，Workers 下必须换掉）。
+ *
+ * ⚠️ 无法修复且**不含任何 CJK 字符**时回退为「用户+uid末4位」——
+ * 宁可给一个可读占位，也不要把乱码写进凭据（那会让用户在面板上认不出账号）。
+ */
+export function fixNicknameMojibake(raw: string, uid: string): string {
+  if (raw.length === 0) return raw
+  try {
+    const bytes = new Uint8Array([...raw].map((ch) => ch.charCodeAt(0) & 0xff))
+    // `ignoreBOM` 与 `fatal` 都要显式给（Workers 的 TextDecoder 选项类型要求
+    // 两者齐全，见 `qoder-wasm.ts:359` 的同款写法）。
+    const fixed = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true }).decode(bytes)
+    if (fixed.length > 0 && !fixed.includes('\uFFFD')
+      && [...fixed].every((ch) => ch.charCodeAt(0) >= 32)) {
+      return fixed
+    }
+  } catch { /* 解码失败：走下面的兜底 */ }
+  // 无 CJK → 判定为乱码，回退到可读占位（防止把乱码写进凭据）。
+  if (!/[\u4e00-\u9fff]/.test(raw)) return `用户${uid.slice(-4)}`
+  return raw
+}
+
+/**
+ * 解析 TRAE 登录回调 URL，提取凭证字段。
+ *
+ * ## ⚠️ 老流程**直接回传 token**（没有 `?code=`）
+ *
+ * 真实回调形如（`trae-oauth.ts:239-243`，`login.sh:117` 注释、`callback.go:117`）：
+ * ```
+ * /login/trae/callback/<state>?refreshToken=…&userInfo={…}&userJwt={…}
+ * ```
+ * 早期实现按 OAuth 惯例去找 `?code=`，于是恒判失败 → 回 400 →
+ * 前端 `login.poll` 永远拿不到 `done:true` → **一直停在认证中**。
+ *
+ * ## ⚠️ 但「带 code」的回调**不是**无效回调
+ *
+ * TRAE 授权页并存两套流程（`trae-oauth.ts:249-259`，出处
+ * `Trae2api-cn/src/main.py:478-484`）：
+ * 1. **新流程**（`code_challenge` / PKCE）：回调带 `authCodeInfo` / `code`；
+ * 2. **老流程**（`auth_type=local`，即 {@link buildTraeLoginURL} 走的这条）：
+ *    回调**直接回传 token**。
+ *
+ * 故本函数对两种形态都返回结果：有 token 就正常解出；**只有** code 时也解出
+ * （放进 `authCode`），由调用方明确报出「上游走了 PKCE 流程」，
+ * 而不是含糊地说「缺少 refreshToken」。
+ */
+export function parseTraeCallback(rawUrl: string): TraeCallbackParseResult {
+  let query: URLSearchParams
+  try {
+    // 允许传入相对形式（`/login/trae/callback/x?...`），补全成完整 URL 再解析。
+    query = new URL(rawUrl.startsWith('http') ? rawUrl : `http://127.0.0.1${rawUrl}`).searchParams
+  } catch {
+    return { ok: false, reason: '回调 URL 无法解析', authCodeFlow: false }
+  }
+
+  const userInfo = parseJsonParam(query.get('userInfo'))
+  const userJwt = parseJsonParam(query.get('userJwt'))
+
+  let refreshToken = query.get('refreshToken') ?? ''
+  const uid = jsonString(userInfo, 'UserID')
+  const nicknameRaw = jsonString(userInfo, 'ScreenName')
+  // ⚠️ 回调字段名是 TenantID（见 TraeCallbackInfo 说明）。
+  const enterpriseId = jsonString(userInfo, 'TenantID')
+
+  const jwtToken = jsonString(userJwt, 'Token')
+  const jwtRefresh = jsonString(userJwt, 'RefreshToken')
+
+  // 对齐 `trae-oauth.ts:294-295`：query 缺 refreshToken 时回退 userJwt.RefreshToken。
+  if (refreshToken.length === 0) refreshToken = jwtRefresh
+
+  // ── PKCE 形态探测：code / authCodeInfo.code ──
+  //
+  // `authCodeInfo` 可能是 JSON 字符串，也可能是纯 code 字符串。
+  const authCodeInfo = parseJsonParam(query.get('authCodeInfo'))
+  //
+  // ⚠️ 逐个来源取第一个**非空**值，不能用 `??` 串起来：`jsonString` 取不到时
+  // 返回**空串**而非 undefined，空串不是 nullish，会让后续来源永远短路掉。
+  const authCodeCandidates: string[] = [
+    query.get('code') ?? '',
+    query.get('authCode') ?? '',
+    jsonString(authCodeInfo, 'code'),
+    jsonString(authCodeInfo, 'authCode'),
+    // authCodeInfo 为**纯 code 字符串**（非 JSON）时 parseJsonParam 解不出，
+    // 故把原始值也作为兜底候选放在最后 —— 前面能解出 JSON 字段时不会走到这里。
+    query.get('authCodeInfo') ?? '',
+  ]
+  const authCode = authCodeCandidates.find((candidate) => candidate.trim().length > 0)?.trim() ?? ''
+
+  const info: TraeCallbackInfo = {
+    refreshToken,
+    // 仅在「无 refreshToken」时才用 userJwt.Token 兜底（`trae-oauth.ts:316-323`）。
+    accessToken: refreshToken.length === 0 ? jwtToken : '',
+    uid,
+    nickname: fixNicknameMojibake(nicknameRaw, uid),
+    enterpriseId,
+  }
+  if (authCode.length > 0) info.authCode = authCode
+
+  // ── 判定 ──
+  if (info.refreshToken.length === 0 && info.accessToken.length === 0) {
+    if (authCode.length > 0) {
+      // ⚠️ 关键：这是**合法回调**，只是走了我们尚未支持的 PKCE 分支。
+      // 不能判为「无效」，否则错误信息会把排查方向带偏。
+      return {
+        ok: false,
+        authCodeFlow: true,
+        reason: '上游返回了 PKCE 授权码（code/authCodeInfo），本实现暂不支持该流程；'
+          + '请确认 TRAE 授权页是否已切换到新流程',
+      }
+    }
+    return {
+      ok: false,
+      authCodeFlow: false,
+      reason: '回调未携带 refreshToken / userJwt.Token / code',
+    }
+  }
+  return { ok: true, info }
+}
+
+/** `exchangeTraeCallback` 的可注入项（单测据此全用 mock）。 */
+export interface TraeExchangeOptions {
+  /** 注入 fetch（单测用；默认全局 `fetch`）。 */
+  fetcher?: typeof fetch
+  /** 调用方取消信号（会与内部超时合并）。 */
+  signal?: AbortSignal
+  /** 当前时间（测试注入）。 */
+  nowMs?: number
+}
+
+/**
+ * 用回调解出的凭证换取最终凭据（`trae-oauth.ts:365-448` 的 `exchangeTraeCallback`）。
+ *
+ * 两条分支（`login.sh:168-212`）：
+ * 1. 有 `refreshToken` → `POST ExchangeToken` 换新 access
+ *    （⚠️ 并**轮换** refreshToken，见 {@link refresh}）；
+ * 2. 无 `refreshToken` → 直接用 `userJwt.Token` 兜底，**不走** ExchangeToken。
+ *
+ * 随后调 `GetUserInfo` 补齐 uid / nickname / enterpriseId / 脱敏手机号；
+ * **失败不阻塞**（回退用回调 `userInfo` 的值，`login.sh:197-209`）。
+ *
+ * ## ⚠️ 调用纪律（会轮换 refresh token）
+ *
+ * 本函数**每个回调只能调用一次**。`ExchangeToken` 每次调用都会作废旧
+ * refreshToken，因此「回调里换一次 + 轮询里再换一次」会让第二次必然失败，
+ * 且可能把第一次拿到的凭据丢掉（`types.ts` 的「轮换型 refresh token 的
+ * 操作纪律」）。故本项目的接线是：**只有面板轮询调它**（见 `src/index.ts`）。
+ *
+ * @param callback `parseTraeCallback` 的解出结果
+ * @param session 登录时生成的 machineId / deviceId（必须持久化进凭据）
+ */
+export async function exchangeTraeCallback(
+  callback: TraeCallbackInfo,
+  session: { machineId: string; deviceId: string },
+  options: TraeExchangeOptions = {},
+): Promise<ProviderCredential> {
+  const fetcher = options.fetcher ?? fetch
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  const signal = options.signal === undefined ? timeout : AbortSignal.any([options.signal, timeout])
+  const nowMs = options.nowMs ?? Date.now()
+
+  let accessToken: string
+  let refreshToken: string
+  let expiresAt = 0
+
+  if (callback.refreshToken.length > 0) {
+    // ── 分支 1：ExchangeToken（access + refreshToken 轮换）──
+    const res = await traePostJson(fetcher, `${TRAE_OAUTH_HOST}${TRAE_EXCHANGE_PATH}`, {
+      ClientID: TRAE_OAUTH_CLIENT_ID,
+      RefreshToken: callback.refreshToken,
+      // ⚠️ 这两个值是**实测常量**，不是占位符（`trae-oauth.ts:376-380`）。
+      ClientSecret: '-',
+      UserID: '',
+    }, signal)
+    const result = asRecordField(res.body, ['Result', 'result'])
+    const token = result === undefined
+      ? ''
+      : (readString(result, 'Token') || readString(result, 'token') || readString(result, 'accessToken'))
+    if (token === '') {
+      throw new ProviderError({
+        provider: 'trae',
+        httpStatus: res.status,
+        message: `TRAE ExchangeToken 响应缺少 Token（HTTP ${res.status}）：${res.snippet}`,
+      })
+    }
+    accessToken = token
+    // ⚠️ 新 refreshToken 为空时保留回调里那个（服务端未轮换的情形）。
+    const rotated = result === undefined ? '' : readString(result, 'RefreshToken')
+    refreshToken = rotated !== '' ? rotated : callback.refreshToken
+    expiresAt = resolveTraeExpiry(result, accessToken, 0)
+  } else {
+    // ── 分支 2：无 refreshToken，直接用 userJwt.Token 兜底 ──
+    accessToken = callback.accessToken
+    refreshToken = ''
+    expiresAt = resolveTraeExpiry(undefined, accessToken, 0)
+  }
+
+  // GetUserInfo 补齐信息；失败不阻塞（回退回调 userInfo，`trae-oauth.ts:405-438`）。
+  let uid = callback.uid
+  let nickname = callback.nickname
+  let enterpriseId = callback.enterpriseId
+  let phone = ''
+  try {
+    const res = await traePostJson(
+      fetcher,
+      `${TRAE_OAUTH_HOST}${TRAE_USER_INFO_PATH}`,
+      { ReqSource: 'IDE', IDEVersion: TRAE_IDE_VERSION },
+      signal,
+      { 'X-Cloudide-Token': accessToken },
+    )
+    const result = asRecordField(res.body, ['Result', 'result'])
+    if (result !== undefined) {
+      uid = readString(result, 'UserID') || readString(result, 'userId') || readString(result, 'uid') || uid
+      nickname = readString(result, 'ScreenName') || readString(result, 'screenName') || nickname
+      enterpriseId = readString(result, 'EnterpriseID') || readString(result, 'enterpriseId') || enterpriseId
+      // ⚠️ 字段名是 NonPlainTextMobile（不是 Mobile / Phone）—— 实测只下发这个
+      // 脱敏形态，且它是多账号消歧最有效的字段（`trae-oauth.ts:423-435`）。
+      phone = readString(result, 'NonPlainTextMobile') || readString(result, 'nonPlainTextMobile')
+    }
+  } catch { /* 容错：沿用回调 userInfo（对齐 `login.sh:208-209`） */ }
+
+  if (uid === '') {
+    throw new ProviderError({
+      provider: 'trae',
+      message: 'TRAE 未能确定 uid（回调 userInfo 与 GetUserInfo 均为空），无法落成账号',
+    })
+  }
+  if (accessToken === '') {
+    throw new ProviderError({
+      provider: 'trae',
+      message: 'TRAE 换 token 后没有 accessToken，请重新发起登录',
+    })
+  }
+
+  // ⚠️ 展示名取**手机号优先**（脱敏形态，如 `130******00`）。
+  //
+  // 依据：`trae.ts` 的 `traeDisplayNickname` 记录了实测 —— `ScreenName` 是字节
+  // passport 按 uid 自动生成的默认名（`用户26815487395` / `用户9340371069` …），
+  // 四个账号形态完全一致，一屏列出来根本认不出谁是谁；而脱敏手机号末两位互异。
+  // 用户明确要求过这个展示形态（`trae.ts` 的「名字区分」提交）。
+  //
+  // 顺序：手机号 → ScreenName → uid。邮箱只在短信登录的账号上为空，
+  // 但我们这一层没有单独的展示名通道，故只做「手机号优先」这一条。
+  const displayName = phone !== '' ? phone : nickname
+
+  // ⚠️ 必须回灌 `parseCredential`（与 codearts 同款理由）：手搓字段会漏掉
+  // 「登录进来」与「粘贴导入」之间的一致性，于是同一账号落成**两条记录**。
+  // 这里顺带把 machine_id / device_id 一并交回（它们不在任何响应里，
+  // 只能来自本次登录会话）。
+  return parseCredential({
+    access_token: accessToken,
+    ...(refreshToken === '' ? {} : { refresh_token: refreshToken }),
+    // ⚠️ 必须转成**字符串**：`parseCredential` 的 `pickExpiresAt` 走 `pickString`
+    // （只认字符串），传数字会被静默丢成 0 = 「过期时间未知」——
+    // 那会让凭据永不触发续期，直到某天全线 401。
+    ...(expiresAt > 0 ? { expires_at: String(expiresAt) } : {}),
+    uid,
+    nickname: displayName,
+    ...(enterpriseId === '' ? {} : { enterprise_id: enterpriseId }),
+    machine_id: session.machineId,
+    device_id: session.deviceId,
+  })
+}
+
+/** 一次 POST JSON 的结果（含响应原文片段，便于报错）。 */
+interface TraeJsonResult {
+  status: number
+  body: Record<string, unknown>
+  snippet: string
+}
+
+/**
+ * 发一次 OAuth 域的 POST JSON。
+ *
+ * ⚠️ 先 `text()` 再自己解析，**不用** `response.json()`：凭据失效时网关会回
+ * **HTML 错误页**，`json()` 抛出的 `Unexpected token '<'` 看不出真实原因
+ * （与 {@link refresh} 同款处理，出处 `trae-auth.ts:397-408`）。
+ */
+async function traePostJson(
+  fetcher: typeof fetch,
+  url: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+): Promise<TraeJsonResult> {
+  let res: Response
+  try {
+    res = await fetcher(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        // OAuth 端点**无签名**，只发 UA（`trae-oauth.ts:408-414`）。
+        'User-Agent': TRAE_USER_AGENT,
+        ...extraHeaders,
+      },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (error) {
+    throw new ProviderError({
+      provider: 'trae',
+      retryable: true,
+      message: `TRAE 登录请求失败（网络层）：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+  const snippet = text.trim().slice(0, 200) === '' ? '(空响应体)' : text.trim().slice(0, 200)
+  if (!res.ok) {
+    throw new ProviderError({
+      provider: 'trae',
+      httpStatus: res.status,
+      // ⚠️ 5xx / 429 值得重试（网络或上游抖动）；4xx 是终态。
+      retryable: res.status >= 500 || res.status === 429,
+      message: `TRAE 登录请求失败（HTTP ${res.status}）：${snippet}`,
+    })
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new ProviderError({
+      provider: 'trae',
+      httpStatus: res.status,
+      message: `TRAE 登录响应不是 JSON（HTTP ${res.status}）：${snippet}`,
+    })
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ProviderError({
+      provider: 'trae',
+      httpStatus: res.status,
+      message: `TRAE 登录响应不是 JSON 对象（HTTP ${res.status}）：${snippet}`,
+    })
+  }
+  return { status: res.status, body: parsed as Record<string, unknown>, snippet }
+}
+
 // ── 供应商实例 ──
 
 export const traeProvider: Provider = {
@@ -1767,16 +2346,10 @@ export const traeProvider: Provider = {
   id: 'trae',
   name: 'TRAE（字节跳动）',
   capabilities: {
-    // 🔴 见文件头「登录为什么不可用」：登录回调把 token 直接放在 query 里回传
-    // 到 127.0.0.1（`trae-oauth.ts:604,723`），Workers 无法监听本地端口，
-    // 且因为没有 `?code=` 连轮询替代都不成立。
-    login: false,
-    loginBlockedReason:
-      'TRAE 登录把访问令牌**直接放在跳转链接的 query 参数里**回传到本机 127.0.0.1 的监听端口，'
-      + 'Cloudflare Workers 无法监听本地端口，也没有设备码轮询之类的替代流程。'
-      + '请在 TRAE 桌面端登录后导出凭据 JSON，粘贴到本项目的「导入凭据」里 —— '
-      + '必须包含 access_token、refresh_token、uid、machine_id 与 device_id'
-      + '（machine_id 是设备指纹，缺失时无法自动生成）。',
+    // ✅ 见文件头「登录：浏览器回跳」：`auth_callback_url` 是**我们构造**的参数，
+    // 故可以指向本服务自己的 URL，由 Worker 接住浏览器回跳（不再需要本地监听）。
+    // ⚠️ 但「TRAE 是否接受非 localhost 的回调地址」**未验证** —— 见文件头。
+    login: true,
     listModels: true,
     chat: true,
     balance: true,

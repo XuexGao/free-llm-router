@@ -85,6 +85,17 @@ import {
   generateCodeArtsLoginState,
   pollCodeArtsTicket,
 } from './providers/codearts.js'
+import {
+  buildTraeCallbackUrl,
+  buildTraeLoginURL,
+  exchangeTraeCallback,
+  generateMachineId,
+  generateDeviceId,
+  generateTraeLoginState,
+  parseTraeCallback,
+  TRAE_LOGIN_CALLBACK_PATH,
+  TRAE_LOGIN_STATE_TTL_MS,
+} from './providers/trae.js'
 import { panelAsset, securityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
@@ -391,7 +402,7 @@ function sessionNumber(payload: Record<string, unknown>, key: string): number | 
 }
 
 /**
- * 渲染 CodeArts 浏览器回调的结果页。
+ * 渲染**浏览器回跳登录**的结果页（codearts 与 trae 共用）。
  *
  * ## 为什么是**纯静态 HTML**
  *
@@ -402,8 +413,15 @@ function sessionNumber(payload: Record<string, unknown>, key: string): number | 
  *
  * ⚠️ 所有插值都经 `escapeHtml`：`detail` 可能包含**上游原文**
  * （如 ticket 端点返回的错误文案），不转义就是反射型 XSS。
+ *
+ * ## ⚠️ 为什么两家必须共用（而不是各写一份）
+ *
+ * codearts 与 trae 的回调页做的是**同一件事**（告诉用户「回面板去，凭据由面板
+ * 写」），差异只有标题与说明文字。各写一份必然漂移 —— 上一轮 codearts 的页面
+ * 就出现过「文案说有脚本、实际没有」这种只有一处改到的问题。
+ * 故这里只保留**一个**渲染函数，两家传不同文案。
  */
-function codeArtsCallbackPage(input: {
+function loginCallbackPage(input: {
   status: number
   ok: boolean
   title: string
@@ -516,7 +534,7 @@ async function handleCodeArtsCallback(
   const upstreamError = params.get('error') ?? params.get('error_code')
   if (upstreamError !== null && upstreamError !== '') {
     const description = params.get('error_description') ?? params.get('error_msg') ?? ''
-    return codeArtsCallbackPage({
+    return loginCallbackPage({
       status: 400,
       ok: false,
       title: '授权未完成',
@@ -525,7 +543,7 @@ async function handleCodeArtsCallback(
   }
 
   if (state === '' || secret === '') {
-    return codeArtsCallbackPage({
+    return loginCallbackPage({
       status: 400,
       ok: false,
       title: '回调参数不完整',
@@ -538,7 +556,7 @@ async function handleCodeArtsCallback(
   // ⚠️ **必须**校验 kind：会话是「谁」只能由服务端记的载荷说了算。
   // 不校验就等于允许用任意 state 把凭据写进任意供应商的流程里。
   if (saved === undefined || saved.payload['kind'] !== 'codearts') {
-    return codeArtsCallbackPage({
+    return loginCallbackPage({
       status: 410,
       ok: false,
       title: '登录会话不存在或已过期',
@@ -548,7 +566,7 @@ async function handleCodeArtsCallback(
 
   const ticketId = sessionString(saved.payload, 'ticketId')
   if (ticketId === '') {
-    return codeArtsCallbackPage({
+    return loginCallbackPage({
       status: 410,
       ok: false,
       title: '登录会话已损坏',
@@ -585,7 +603,7 @@ async function handleCodeArtsCallback(
     })(),
   )
 
-  return codeArtsCallbackPage({
+  return loginCallbackPage({
     status: 200,
     ok: true,
     title: '授权完成，请回到面板',
@@ -655,6 +673,212 @@ async function pollCodeArtsLogin(
   return json(result)
 }
 
+/**
+ * 浏览器落点：`GET /login/trae/callback/<state>?<TRAE 回传的凭证>`（**免鉴权**）。
+ *
+ * ## 为什么不鉴权（以及凭什么安全）
+ *
+ * 与 codearts 完全同款（见 {@link handleCodeArtsCallback} 的说明）：浏览器是被
+ * TRAE **重定向**过来的，带不了 `Authorization` 头，故改用 `state` 本身作为
+ * 能力凭证 —— 32 字节 CSPRNG、绑定到一个**已经存在**的 `trae` 会话
+ * （`kind === 'trae'`，供应商只来自会话载荷、**绝不**从 URL 取）、10 分钟过期。
+ *
+ * ## ⚠️ 与 codearts 的两处关键差异
+ *
+ * 1. **这里不换取凭据，只把材料写回会话。**
+ *    TRAE 的 `ExchangeToken` 会**轮换** `refresh_token`（见 `trae.ts` 的
+ *    {@link refresh}），而回调的 `ctx.waitUntil` 与面板轮询是**两个独立请求**。
+ *    若两边都交换，第二次会用同一个旧 refreshToken 打上游 —— 必然失败，
+ *    且可能把第一次拿到的凭据丢掉（`types.ts` 的「轮换型 refresh token 的
+ *    操作纪律」）。codearts 能在回调里轮询是因为它的 ticket 换取是**幂等 GET**。
+ * 2. **凭证材料必须落在会话里**（`callback` 字段），不能放模块内存 ——
+ *    回调与轮询是两个 HTTP 请求，Workers 无跨请求内存（AGENTS.md §4.2）。
+ *
+ * ## 为什么不需要 `ctx.waitUntil`
+ *
+ * 这一程只做「解析 URL + 写一次 DO」，没有要等的上游请求，故同步完成即可。
+ */
+async function handleTraeCallback(
+  env: Env,
+  url: URL,
+  path: string,
+): Promise<Response> {
+  // ── state：路径优先，其次 query ──
+  let state = path.startsWith(`${TRAE_LOGIN_CALLBACK_PATH}/`)
+    ? decodeURIComponent(path.slice(TRAE_LOGIN_CALLBACK_PATH.length + 1))
+    : ''
+  const params = url.searchParams
+  if (state === '') state = params.get('state') ?? ''
+
+  // ⚠️ 最坏情况的剥离：若 TRAE 把凭证直接拼在了已有 query 后面，我们会解析出
+  // `state = "<state>?refreshToken=…"`（与 codearts 的 `?secret=` 同型风险）。
+  // 把 query 部分还原成可解析的 search，否则 state 找不到会话、
+  // 而凭证又读不到 —— 表现为「回调页报会话不存在」。
+  const questionMark = state.indexOf('?')
+  let search = params
+  if (questionMark >= 0) {
+    const inner = new URLSearchParams(state.slice(questionMark + 1))
+    for (const [key, value] of inner) if (!search.has(key)) search.append(key, value)
+    state = state.slice(0, questionMark)
+  }
+
+  // ⚠️ **诊断日志**（排查「登录后一直显示登录中」必需）。
+  //
+  // 要判断是「浏览器压根没回跳到我们」还是「回跳了但参数形态与预期不符」，
+  // 必须能看见**实际收到的参数名**。
+  //
+  // ⚠️ 只记**参数名与长度**，不记 `refreshToken` / `userJwt` 的值 ——
+  // 它们是能换取凭据的秘密，写进日志等于泄漏（日志会进面板、也可能被导出）。
+  console.log(
+    `[trae-callback] 收到回跳：path=${path.slice(0, 60)} `
+    + `params=[${[...search.keys()].join(',')}] stateLen=${state.length}`,
+  )
+
+  // 用户在 TRAE 页面上取消授权：不是错误，但要如实说明。
+  const upstreamError = search.get('error') ?? search.get('error_code')
+  if (upstreamError !== null && upstreamError !== '') {
+    const description = search.get('error_description') ?? search.get('error_msg') ?? ''
+    return loginCallbackPage({
+      status: 400,
+      ok: false,
+      title: '授权未完成',
+      detail: `TRAE 侧返回了错误：${upstreamError}${description === '' ? '' : `（${description}）`}。请在面板重新发起登录。`,
+    })
+  }
+
+  if (state === '') {
+    return loginCallbackPage({
+      status: 400,
+      ok: false,
+      title: '回调参数不完整',
+      detail: '这次跳转没有带上 state。请在面板重新发起登录；'
+        + '若反复出现，请改用「粘贴凭据导入」。',
+    })
+  }
+
+  const saved = await findLoginSession(env, state)
+  // ⚠️ **必须**校验 kind：会话是「谁」只能由服务端记的载荷说了算。
+  // 不校验就等于允许用任意 state 把凭据写进任意供应商的流程里。
+  if (saved === undefined || saved.payload['kind'] !== 'trae') {
+    return loginCallbackPage({
+      status: 410,
+      ok: false,
+      title: '登录会话不存在或已过期',
+      detail: '会话有效期 10 分钟（浏览器耗时过久会过期）。请回到面板重新点「发起登录」。',
+    })
+  }
+
+  // ⚠️ 从**拼好的 search** 重建相对 URL 交给 provider 解析：这样上面剥离出来的
+  // `state?refreshToken=…` 形态也能被正常解出（provider 只关心凭证参数）。
+  const parsed = parseTraeCallback(`/login/trae/callback?${search.toString()}`)
+  if (!parsed.ok) {
+    // ⚠️ **必须把失败也写回会话**：否则面板只能一直等到超时，
+    // 用户看到的是「一直在等待」，而真实原因是「上游换了流程」或「参数名变了」。
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+    const expiresAt = sessionNumber(saved.payload, 'expiresAt') ?? (Date.now() + TRAE_LOGIN_STATE_TTL_MS)
+    await pool.saveLoginSession(state, { ...saved.payload, failed: parsed.reason }, expiresAt)
+    return loginCallbackPage({
+      status: 400,
+      ok: false,
+      title: '回调无法解析',
+      detail: `${parsed.reason}。请在面板重新发起登录；若反复出现，请改用「粘贴凭据导入」。`,
+    })
+  }
+
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+  // ⚠️ 回写时必须用**会话原本的过期时刻**（载荷里自带的 `expiresAt`）。
+  // 若写成 `Date.now() + TTL`，每次回跳都会把窗口续满 —— 一个被泄漏的 state
+  // 就能被无限续期，能力凭证的窗口形同虚设（与 codearts 同款理由）。
+  const expiresAt = sessionNumber(saved.payload, 'expiresAt') ?? (Date.now() + TRAE_LOGIN_STATE_TTL_MS)
+  await pool.saveLoginSession(
+    state,
+    { ...saved.payload, callback: parsed.info, callbackAt: Date.now() },
+    expiresAt,
+  )
+
+  return loginCallbackPage({
+    status: 200,
+    ok: true,
+    title: '授权完成，请回到面板',
+    detail: '浏览器这一程已经走完。请切回管理面板（本页可以关闭），'
+      + '凭据会自动加密保存到账号池。',
+  })
+}
+
+/**
+ * 完成一次 TRAE 浏览器登录：用回调写下的材料换凭据并落盘。
+ *
+ * ⚠️ **只有这里调 `ExchangeToken`**（回调只解析、不交换）—— 理由见
+ * {@link handleTraeCallback} 的差异说明：该端点会轮换 refreshToken，
+ * 两处都调会让第二次必然失败。
+ *
+ * ⚠️ 单次尝试（不是循环）：面板每 3 秒轮询一次，在这里空等会叠加成并发请求。
+ */
+async function pollTraeLogin(
+  env: Env,
+  saved: { realm: string; payload: Record<string, unknown> },
+  state: string,
+  now: number,
+): Promise<Response> {
+  const payload = saved.payload
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+
+  // 终态失败：反复轮询不会有别的结果，如实复述原因（而不是让面板空等到超时）。
+  const failed = sessionString(payload, 'failed')
+  if (failed !== '') {
+    return json({ done: false, status: 'failed', message: `TRAE 登录失败：${failed}` })
+  }
+
+  // 已有材料 ⇒ 只做「换凭据 + 落盘」，不再看浏览器那一程。
+  // 还没有 ⇒ 说明回调尚未到达，如实告诉面板「等浏览器」。
+  //
+  // ⚠️ 换取失败**不写 `failed`**：`ExchangeToken` 的 5xx / 429 是瞬时的
+  // （`traePostJson` 已标 `retryable`），写死会让用户必须重新发起登录；
+  // 而面板会继续轮询，下一次很可能就成功。只有明确的 4xx 才值得记成终态。
+  const material = payload['callback']
+  if (material === undefined || typeof material !== 'object' || material === null) {
+    return json({
+      done: false,
+      status: 'awaiting_browser',
+      message: '等待浏览器完成授权…（登录后浏览器会跳到本服务的提示页，回到本面板即可）',
+    })
+  }
+
+  const machineId = sessionString(payload, 'machineId')
+  const deviceId = sessionString(payload, 'deviceId')
+  if (machineId === '' || deviceId === '') {
+    return json({
+      done: false,
+      status: 'failed',
+      message: 'TRAE 登录失败：登录会话缺少 machine_id / device_id，请重新发起登录',
+    })
+  }
+
+  let credential: ProviderCredential
+  try {
+    credential = await exchangeTraeCallback(
+      material as never,
+      { machineId, deviceId },
+      { nowMs: now },
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const terminal = error instanceof ProviderError && !error.retryable
+    if (terminal) {
+      const expiresAt = sessionNumber(payload, 'expiresAt') ?? (now + TRAE_LOGIN_STATE_TTL_MS)
+      await pool.saveLoginSession(state, { ...payload, failed: message }, expiresAt)
+      return json({ done: false, status: 'failed', message: `TRAE 登录失败：${message}` })
+    }
+    // 瞬时失败：如实回一句，会话保留，面板下一次轮询会重试。
+    return json({ done: false, status: 'pending', message: `换取凭据失败，正在重试：${message}` })
+  }
+
+  const result = await persistProviderCredential(env, credential, now)
+  // 落盘成功后才清会话：失败时保留，用户可继续轮询重试。
+  await pool.removeLoginSession(state)
+  return json(result)
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
@@ -692,6 +916,17 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET', ...securityHeaders() } })
     }
     return await handleCodeArtsCallback(env, ctx, url, path)
+  }
+
+  // ── TRAE 浏览器登录回调（**免鉴权**，见 handleTraeCallback 的说明） ──
+  //
+  // ⚠️ 与 codearts 同款，必须在鉴权检查**之前**：浏览器是被 TRAE 重定向过来的。
+  // 安全性由 `state`（32 字节 CSPRNG + 10 分钟 TTL + 绑定 trae 会话）保证。
+  if (path === TRAE_LOGIN_CALLBACK_PATH || path.startsWith(`${TRAE_LOGIN_CALLBACK_PATH}/`)) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET', ...securityHeaders() } })
+    }
+    return await handleTraeCallback(env, url, path)
   }
 
   // ── 其余一律鉴权 ──
@@ -885,6 +1120,56 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         callbackUrl,
         realm: loginRealm,
         expiresInMs: CODEARTS_LOGIN_STATE_TTL_MS,
+      })
+    }
+    // ── trae（字节 TRAE）：浏览器回跳 + ExchangeToken ──
+    //
+    // 与 codearts 同型（回调指向**本服务自己的 URL**），但有两处必须照抄的差异：
+    //
+    // 1. `machine_id` / `device_id` 必须**本次生成并持久化进凭据**
+    //    （`trae.ts:17-19`）：它们是设备指纹与签到设备号，且 `device_id`
+    //    **逐账号必须互异**（同一天两个账号共用会被「该设备已签到」拦截）。
+    //    两者都是 **32 位 hex** —— 不是 16 位纯数字（那是 CodeBuddy 的格式）。
+    // 2. `auth_callback_url` 必须是**我们自己的 URL**。参考实现写死
+    //    `http://127.0.0.1:18080/authorize`（`trae-oauth.ts:4-11`），那是宿主的
+    //    限制；该参数由我们构造并随登录 URL 一起发给 TRAE。
+    //    ⚠️ **未验证**：TRAE 是否接受非 localhost 的回调地址 —— 见 trae.ts 文件头。
+    //
+    // `state` 用 32 字节 CSPRNG（不是 randomUUID）：它是这条免鉴权路径上
+    // **唯一**的能力凭证 —— 谁拿到 state，谁就能把浏览器的回跳绑到该会话。
+    // 它同时是「回调 URL 的路径段」与「登录会话主键」，必须是**同一个值**。
+    if (providerId === 'trae') {
+      const state = generateTraeLoginState()
+      const machineId = generateMachineId()
+      const deviceId = generateDeviceId()
+      // 回调地址取**本次请求的 origin** —— 自定义域与 workers.dev 都自动正确。
+      const callbackUrl = buildTraeCallbackUrl(url.origin, state)
+      const authUrl = buildTraeLoginURL(machineId, deviceId, callbackUrl)
+      const expiresAt = Date.now() + TRAE_LOGIN_STATE_TTL_MS
+      // ⚠️ `expiresAt` 也存进载荷：回调回写凭证时要沿用它（否则每次回跳都会把
+      // 窗口续满 —— `getLoginSession` 不回传 expires_at，见 store/db.ts:128）。
+      await pool.saveLoginSession(
+        state,
+        {
+          provider: 'trae',
+          kind: 'trae',
+          realm: loginRealm,
+          machineId,
+          deviceId,
+          callbackUrl,
+          createdAt: Date.now(),
+          expiresAt,
+        },
+        expiresAt,
+      )
+      return json({
+        ok: true,
+        provider: 'trae',
+        state,
+        authUrl,
+        callbackUrl,
+        realm: loginRealm,
+        expiresInMs: TRAE_LOGIN_STATE_TTL_MS,
       })
     }
     // ── raccoon（商汤小浣熊）：微信扫码，二维码由**本服务**渲染 ──
@@ -1216,6 +1501,11 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       // 而不是把三种状态都糊成一句「等待中」。
       if (saved.payload['kind'] === 'codearts') {
         return await pollCodeArtsLogin(env, saved, state, now)
+      }
+      // ── trae：浏览器回跳 + ExchangeToken（**只有这里调交换**） ──
+      // 状态形状与 codearts 一致（awaiting_browser / pending / failed / done）。
+      if (saved.payload['kind'] === 'trae') {
+        return await pollTraeLogin(env, saved, state, now)
       }
     } catch (error) {
       return json({ done: false, message: error instanceof Error ? error.message : String(error) })

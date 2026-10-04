@@ -9,7 +9,7 @@
 |---|---|
 | 新增目录 | `src/providers/`（**约 14,500 行**） |
 | 供应商 | **11 家**（见下表） |
-| 单测 | **231/231 通过** |
+| 单测 | **383/383 通过** |
 | 体积 | 826.70 KiB / gzip 272.44 KiB（Free 计划上限 1 MiB） |
 | 零 `node:` 导入 | ✅ 全部纯 Web 标准（`fetch` / WebCrypto / `TransformStream`） |
 
@@ -20,9 +20,9 @@
 | `workbuddy` | ✓ | ✓ | ✓ | 腾讯 CodeBuddy（默认供应商，反斜杠兼容既有用户） |
 | `cline` | ✓ | ✓ | ✕ | WorkOS **设备码**（用户码式）：`/admin/providers/login/{start,poll}` 三步闭环 |
 | `minimax` | ✕ | ✓ | ✓ | 上游是 **Anthropic Messages** 协议 |
-| `codearts` | ✕ | ✓ | ✓ | 华为云码道；登录需 `127.0.0.1` 回调 |
+| `codearts` | ✓ | ✓ | ✓ | 华为云码道；**浏览器回跳**（`auth_callback_url` 指向本服务） |
 | `lobsterai` | ✕ | ✓ | ✓ | 有道龙虾；登录需 `127.0.0.1` 回调 |
-| `trae` | ✕ | ✓ | ✓ | 字节 TRAE；令牌经回调 query 回传 |
+| `trae` | ✓ | ✓ | ✓ | 字节 TRAE；**浏览器回跳** + `ExchangeToken`（轮换 refresh token） |
 | `qoder` | ✓ | ✓ | ✓ | PKCE 设备码；WASM 生成签名头 |
 | `opencode` | ✕ | ✓ | ✕ | 无登录流程（粘贴 API key）；每账号代理丢弃 |
 | `loomy` | ✕ | ✓ | ✓ | 讯飞；登录函数已实现但未接线 |
@@ -236,7 +236,8 @@ opencode(api_key) → opencode ✓
 
 | 项 | 原因 | 状态 |
 |---|---|---|
-| **codearts / lobsterai / trae 的登录** | 需 `127.0.0.1:<port>` 本地回调监听，Workers **没有监听 socket**。且三家都**没有轮询替代路径**（codearts 的 `secret` 只能从回调拿到；trae 的令牌直接放在回调 query 里） | 只能导入凭据 |
+| **lobsterai 的登录** | 需 `127.0.0.1:<port>` 本地回调监听，Workers **没有监听 socket**，且无轮询替代路径 | 只能导入凭据 |
+| **trae 登录的回调地址** | `auth_callback_url` 是**我们构造**的参数（`trae-oauth.ts:114-115`），故可以指向本服务自己的 Worker URL —— 与 codearts 同款思路。⚠️ 但「TRAE 是否接受**非 localhost** 的回调地址」**未验证**：参考实现与 Go 端只验证过 `http://127.0.0.1:18080/authorize`（`trae-oauth.ts:4-11`）。若上游对回调地址有白名单校验，浏览器会**停在授权页不跳转**（症状与参数名写错一致） | ⚠️ 代码已接线，需真实浏览器实测一次 |
 | **zcode 签到** | `billing/claim` **始终**索要阿里云 captcha，需 **headful** Chromium（`--headless=new` 实测过不了风控） | 推理不受影响 |
 | **raccoon 短信登录** | 需阿里云滑块 `captcha_param` | 仅扫码可用 |
 | **opencode 每账号代理** | 参考实现用 undici + 自实现 SOCKS5；Workers 的 `fetch` 不接受 `dispatcher` | **真实功能损失**：多个匿名槽共享同一出口 IP，免费额度**不再能通过多开扩容** |
@@ -249,7 +250,7 @@ opencode(api_key) → opencode ✓
 ## 复现验证
 
 ```bash
-npm run typecheck && npm test        # 231 条
+npm run typecheck && npm test        # 383 条
 
 BASE=https://<你的域名>; KEY=<API_KEY>
 curl -s -H "Authorization: Bearer $KEY" "$BASE/admin/providers" | jq '.providers | length'   # 11

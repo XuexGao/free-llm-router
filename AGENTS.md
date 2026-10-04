@@ -14,7 +14,7 @@
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式网关（54 个模型、对话、工具调用）、面板 + 安全头。
-- **231 条单测通过**。
+- **383 条单测通过**。
 
 详见 [docs/01-egress-probe.md](docs/01-egress-probe.md)、[02-skeleton.md](docs/02-skeleton.md)、
 [03-protocol.md](docs/03-protocol.md)、[04-accounts.md](docs/04-accounts.md)、
@@ -534,7 +534,7 @@ TaskRunner DO
 | 7. Web 面板 | ✅ **完成**：`/panel/` 已上线。**已重做为 8 视图**（账号池/任务中心/用量/积分包/模型/供应商/配置/日志），并修掉「无密钥时一片空白」。CSP 保持严格。见 [docs/07-panel.md](docs/07-panel.md) |
 | 8. 多供应商 | ✅ **完成**：**11 家 / 12 个变体**接入统一 `Provider` 接口（约 14.5k 行）。含 2 个自实现的密码学原语（MD5、AES-128-CFB，均与 OpenSSL 逐字节对拍）。见 [docs/08-providers.md](docs/08-providers.md) |
 
-**测试**：`npm test` → **231/231 通过**。`npm run typecheck` → 通过。
+**测试**：`npm test` → **383/383 通过**。`npm run typecheck` → 通过。
 
 ### 📦 供应商能力矩阵（**12 个变体**）
 
@@ -555,9 +555,9 @@ TaskRunner DO
 | `workbuddy`（国际版） | ✓ | ✓ | ✕ |
 | `cline` | ✓ | ✓ | ✕ |
 | `minimax` | ✕ | ✓ | ✓ |
-| `codearts` | ✕ | ✓ | ✓ |
+| `codearts` | ✓ | ✓ | ✓ |
 | `lobsterai` | ✕ | ✓ | ✓ |
-| `trae` | ✕ | ✓ | ✓ |
+| `trae` | ✓ | ✓ | ✓ |
 | `qoder` | ✓ | ✓ | ✓ |
 | `opencode` | ✕ | ✓ | ✕ |
 | `loomy` | ✕ | ✓ | ✓ |
@@ -566,7 +566,10 @@ TaskRunner DO
 
 **每个 `✕` 都有可操作的具体原因**（`/admin/providers` 返回 `loginBlockedReason`），
 不用「不支持」这种无信息量文案。典型原因：
-- **codearts / lobsterai / trae**：登录需 `127.0.0.1` 回调监听，Workers 无监听 socket，且无轮询替代路径；
+- **lobsterai**：登录需 `127.0.0.1` 回调监听，Workers 无监听 socket，且无轮询替代路径；
+  ⚠️ `codearts` 与 `trae` **已不在此列** —— 它们的回调地址是**调用方给的参数**
+  （`auth_callback_url`），故可以指向本服务自己的 URL，由 Worker 接住浏览器回跳
+  （见 `src/providers/trae.ts` 文件头与「浏览器回跳登录」小节）。
 - **zcode**：签到需 headful Chromium 过阿里云 captcha（推理不受影响）；
 - **raccoon**：无签到端点（每日额度由服务端自动发放）；
 - **workbuddy（国际版）**：上游**本就没有**每日签到接口（积分在 CodeBuddy 侧领）；

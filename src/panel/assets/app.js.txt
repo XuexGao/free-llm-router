@@ -431,14 +431,19 @@ let loginTimer = null
  * 登录等待文案的**流程相关**后缀。
  *
  * ⚠️ 不同家的完成方式是**相反**的，不能共用一句文案：
- * - 设备码（buddy / workbuddy / qoder / zcode）：用户在别处确认，本页等着即可；
- * - codearts：浏览器回跳式 —— 华为会把浏览器打到**本服务**的提示页，而凭据要由
- *   **本面板的轮询**写入，所以用户必须回到本页（提示页上也没有写凭据的入口）。
+ * - 设备码（buddy / workbuddy / qoder / zcode / cline）：用户在别处确认，本页等着即可；
+ * - 浏览器回跳（codearts / trae）：上游会把浏览器打到**本服务**的提示页，
+ *   而凭据要由**本面板的轮询**写入，所以用户必须回到本页
+ *   （提示页上也没有写凭据的入口）。
  */
 function loginWaitHint(providerId) {
-  return providerId === 'codearts'
-    ? '\n\n（完成华为登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
-    : ''
+  if (providerId === 'codearts') {
+    return '\n\n（完成华为登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
+  }
+  if (providerId === 'trae') {
+    return '\n\n（完成 TRAE 登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
+  }
+  return ''
 }
 
 /**
@@ -859,16 +864,21 @@ const CAPS = [
 /**
  * 登录方式**不是标准设备码轮询**的供应商：卡片标签与弹窗标题要写实际方式。
  *
- * ⚠️ 为什么必须有它：codearts 是**浏览器回跳**式登录（把浏览器的授权结果打回
- * 本服务的 `/login/codearts/callback/<state>`），与设备码轮询完全不是一回事。
+ * ⚠️ 为什么必须有它：codearts 与 trae 都是**浏览器回跳**式登录（把浏览器的授权
+ * 结果打回本服务的 `/login/<家>/callback/<state>`），与设备码轮询完全不是一回事。
  * 标签写成「设备码登录」会误导用户去找一个并不存在的设备码。
  *
  * ⚠️ cline 也是设备码，但它是**用户码**式：用户要先把一个短码抄进授权页，
  * 与 buddy/qoder 那种「点开链接就完事」的体验不同，故标签写明「用户码登录」，
  * 让用户在点之前就知道要准备抄一串代码。
  * 其余家（buddy / workbuddy / qoder / zcode）确实都是标准设备码轮询。
+ *
+ * ⚠️ **它同时决定面板是否把该家放进「添加账号」下拉**（见 `loadProviders`）——
+ * 但入选条件是 `capabilities.login === true`，与本表无关；本表只改**显示文案**。
+ * 也就是说：把 trae 加进来只是让它显示成「浏览器登录」，
+ * 真正让它出现在下拉里的是 `trae.ts` 的 `capabilities.login = true`。
  */
-const LOGIN_KIND_LABEL = { codearts: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录' }
+const LOGIN_KIND_LABEL = { codearts: '浏览器登录', trae: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录' }
 
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
