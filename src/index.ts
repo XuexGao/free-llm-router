@@ -506,6 +506,41 @@ async function handleCodeArtsCallback(
   if (state === '') state = params.get('state') ?? ''
   let secret = params.get('secret') ?? ''
 
+  /**
+   * ⚠️ **`fingerprint` 是华为的另一种回传形态**（实测用户反馈里出现）。
+   *
+   * 参考实现**同时**处理两种（`login.ts:187-200` 与 `:201`）：
+   * - `?secret=<值>` → 拿它去 ticket 端点换凭据；
+   * - `?fingerprint=<base64(URL)>` → 解出那个 URL，从它的 query 里取
+   *   `token` / `access_token` / `accessToken` / `authCode`（`pickToken`，
+   *   `login.ts:149-155`）。
+   *
+   * 我们的实现**原先只有 `secret` 分支** —— 若华为回的是 `fingerprint`，
+   * 我们会直接判「回调参数不完整」，用户看到的就是一直等不到结果。
+   *
+   * ⚠️ `fingerprint` 里的 URL **未必带 token**：实测用户反馈里那个
+   * fingerprint 解出来只是 `/doer/login?...` 自身的地址（没有 token 字段）——
+   * 那种情况下它**不是**完成信号，应继续当作「等待中」，而不是报错。
+   * 故这里只在**真的解出 token** 时才认它。
+   */
+  let fingerprintToken = ''
+  const fingerprintRaw = params.get('fingerprint') ?? ''
+  if (fingerprintRaw !== '') {
+    try {
+      // Workers 里没有 Buffer，用 atob 解 base64（含 URL-safe 变体）
+      const normalized = fingerprintRaw.replaceAll('-', '+').replaceAll('_', '/')
+      const decoded = atob(normalized)
+      const inner = new URLSearchParams(new URL(decoded).search)
+      fingerprintToken = inner.get('token')
+        ?? inner.get('access_token')
+        ?? inner.get('accessToken')
+        ?? inner.get('authCode')
+        ?? ''
+    } catch {
+      // 解码失败：不当作错误（它可能只是我们看不懂的中间态），继续走 secret 分支
+    }
+  }
+
   // ⚠️ 最坏情况的剥离：若华为把 `?secret=` 直接拼在了已有 query 后面，
   // 我们会解析出 `state = "<state>?secret=<secret>"`。把 secret 剥出来，
   // 否则 state 找不到会话、而 secret 又缺失 —— 表现为「回调页报参数缺失」。
@@ -542,13 +577,30 @@ async function handleCodeArtsCallback(
     })
   }
 
-  if (state === '' || secret === '') {
+  // ⚠️ `fingerprint` 里解出 token 时，它**等价于** `secret`（都是完成信号），
+  // 故不能因为它没带 `secret` 就判「参数不完整」。
+  // ⚠️ 第三种可能：华为**直接回传 token**（参考实现的 `pickToken` 就是为这条路径准备的，
+  // 见 `login.ts:149-155`）。它认 `token` / `access_token` / `accessToken` / `authCode`。
+  // 我们的实现原先只认 `secret` —— 若上游换成直接回传，我们会判「参数不完整」。
+  const directToken = params.get('token')
+    ?? params.get('access_token')
+    ?? params.get('accessToken')
+    ?? params.get('authCode')
+    ?? ''
+  if (directToken !== '') secret = secret === '' ? directToken : secret
+
+  if (state === '' || (secret === '' && fingerprintToken === '')) {
+    // ⚠️ 文案要点明**收到了什么**，便于用户与我们一起定位。
+    // 实测用户反馈：华为把他送到了 `/doer/login?...&fingerprint=<base64(当前URL)>`，
+    // 那个 fingerprint 解出来**不含 token** —— 即浏览器还没走到回调。
+    // 只说「参数不完整」会让人以为是我们这边坏了。
+    const got = [...params.keys()].join(', ') || '（无 query 参数）'
     return loginCallbackPage({
       status: 400,
       ok: false,
       title: '回调参数不完整',
-      detail: '这次跳转没有带上 state 或 secret。请在面板重新发起登录；'
-        + '若反复出现，请改用「粘贴凭据导入」。',
+      detail: `这次跳转没有带上可用于换取凭据的 state/secret（实际收到：${got}）。`
+        + '请在面板重新发起登录；若反复出现，请把浏览器地址栏内容反馈给我们。',
     })
   }
 
