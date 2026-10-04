@@ -597,10 +597,35 @@ test('⚠️ 失败必须写回会话（否则面板只会一直等到超时）'
 
 // ─────────────────── ⑥ 能力声明 ───────────────────
 
-test('⚠️ trae 现在声明 login=true（浏览器回跳流程已实现）', () => {
+test('❌ trae 必须声明 login=false —— 它强制回调 127.0.0.1，Worker 接不住', () => {
+  // ## 这是被真实用户实测推翻的结论（2026-10-04）
+  //
+  // 我曾以为 `auth_callback_url` 是通用参数、可以指向本服务 URL
+  //（codearts 正是这么做且能通），于是把 trae 的 `login` 改成 true。
+  // **对 TRAE 不成立**：用户登录后 TRAE 页面自己报
+  //「网络错误，请刷新页面重试」—— 它去连 `127.0.0.1:18080` 但那里没人监听。
+  //
+  // 依据（`deepseek-harness-codearts/src/trae-oauth.ts`）：
+  // - 文件头 `:4-11` 明写「TRAE 强制回调 `127.0.0.1`」，端口固定 18080；
+  // - `:555-566` 起本地服务器并把 `auth_callback_url` 填成
+  //   `http://127.0.0.1:<port>/authorize`；
+  // - 登录 URL 的 `auth_type=local` 字面即「本机回调」。
+  //
+  // ⚠️ 那条错误文案在本仓库里搜不到，正是「不是我们的页面报的」的旁证。
+  //
+  // ⚠️ **不要靠「把地址换成本服务 URL」来修** —— 架构上不成立。
   const provider = findProvider('trae')
-  assert.equal(provider?.capabilities.login, true)
-  // 声明能登录就**必须**真的有可用的登录原语（避免「声明了却做不到」）
+  assert.equal(provider?.capabilities.login, false, 'trae 不能声称支持登录')
+  assert.ok(
+    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
+    '阻塞原因必须点明是「强制回调 127.0.0.1」，而不是含糊的「未实现」',
+  )
+})
+
+test('trae 的登录原语保留（协议已逆向，将来若上游支持远程回调可直接接回）', () => {
+  // 原语本身是好的，只是**上游不允许**我们把回调放到远程。
+  // 保留它们：① 它们是协议的事实记录；② 将来 TRAE 若支持设备码/远程回调，
+  // 接线成本很低。删掉反而会丢失这些已逆向的知识。
   assert.equal(typeof buildTraeLoginURL, 'function')
   assert.equal(typeof parseTraeCallback, 'function')
   assert.equal(typeof exchangeTraeCallback, 'function')

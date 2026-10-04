@@ -645,7 +645,11 @@ async function pollCodeArtsLogin(
       return json({
         done: false,
         status: 'awaiting_browser',
-        message: '等待浏览器完成授权…（登录后浏览器会跳到本服务的提示页，回到本面板即可）',
+        // ⚠️ 文案里带上**自查方法**：这条分支意味着「浏览器还没回到本服务」。
+        // 用户能据此区分「登录没做完」与「回调没接住」——
+        // 前者继续操作即可，后者需要看浏览器地址栏并反馈给我们。
+        message: '等待浏览器完成授权…（登录成功后浏览器应自动跳到本服务的「授权完成」提示页。'
+          + '若浏览器停在华为页面不动、或跳到别处，请把地址栏内容反馈给我们）',
       })
     }
     const ticketId = sessionString(payload, 'ticketId')

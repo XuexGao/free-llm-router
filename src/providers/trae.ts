@@ -2346,10 +2346,33 @@ export const traeProvider: Provider = {
   id: 'trae',
   name: 'TRAE（字节跳动）',
   capabilities: {
-    // ✅ 见文件头「登录：浏览器回跳」：`auth_callback_url` 是**我们构造**的参数，
-    // 故可以指向本服务自己的 URL，由 Worker 接住浏览器回跳（不再需要本地监听）。
-    // ⚠️ 但「TRAE 是否接受非 localhost 的回调地址」**未验证** —— 见文件头。
-    login: true,
+    /**
+     * ❌ **不可用**：TRAE **强制回调 `127.0.0.1`**，Worker 接不住。
+     *
+     * ## 实测结论（用户报障「TRAE 登录显示网络错误，请刷新页面重试」）
+     *
+     * 我一度以为 `auth_callback_url` 是通用参数、可以指向本服务的 URL
+     *（codearts 就是这么做的，且能通）。**对 TRAE 不成立**：
+     *
+     * 1. 参考实现的文件头明写 **「TRAE 强制回调 `127.0.0.1`」**
+     *    （`trae-oauth.ts:4-11`），端口固定 18080；
+     * 2. 它的登录流程是 `startCallbackServer(18080)` +
+     *    `auth_callback_url = 'http://127.0.0.1:<port>/authorize'`
+     *    （`trae-oauth.ts:555-566`）—— 回调是**浏览器直连用户本机端口**；
+     * 3. 登录 URL 里的 `auth_type=local` 也在字面上说明这一点
+     *    （`local` = 本机回调）。
+     *
+     * 故用户看到的是 **TRAE 页面自己报的「网络错误」**（它去连
+     * `127.0.0.1:18080` 但那里没有服务在监听），
+     * 而不是我们的回调页 —— 这也解释了为什么那条文案在本仓库里搜不到。
+     *
+     * ⚠️ **不要靠「把地址换成本服务 URL」来修**：这条路在架构上不成立。
+     * 除非 TRAE 将来支持设备码或远程回调，否则只能「粘贴凭据导入」。
+     */
+    login: false,
+    loginBlockedReason:
+      'TRAE 强制回调 127.0.0.1（本机端口），Worker 收不到 —— 这是上游的协议限制，'
+      + '不是本服务的缺失。请从 TRAE 客户端导出凭据后粘贴导入。',
     listModels: true,
     chat: true,
     balance: true,
