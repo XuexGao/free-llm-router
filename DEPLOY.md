@@ -63,9 +63,9 @@ openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY
 ## 绑定 GitHub 自动部署（可选）
 
 Dashboard → Workers & Pages → `workbuddy-gateway` → **Settings** → **Build** →
-Connect to Git → 选 `XuexGao/hivegate`。
+Connect to Git → 选 `XuexGao/free-llm-router`。
 
-> ⚠️ 仓库已从 `workbuddy-serverless` 改名为 `hivegate`（GitHub 会自动重定向旧地址，
+> ⚠️ 仓库已从 `workbuddy-serverless` 改名为 `free-llm-router`（GitHub 会自动重定向旧地址，
 > 但**建议改成新名** —— 否则 Dashboard 里可能一直显示旧名）。
 >
 > ⚠️ **Worker 名仍是 `workbuddy-gateway`，不要改** —— 它是 Worker 在 Cloudflare 上的

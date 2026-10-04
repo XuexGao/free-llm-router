@@ -1,7 +1,7 @@
-# 项目指令：HiveGate
+# 项目指令：free-llm-router
 
 > 项目原名 `workbuddy-serverless`（仓库与 Worker 名仍是它，见 `wrangler.jsonc` 的说明）。
-> **对外名称统一用 HiveGate**：多供应商账号池 → 一个 OpenAI 兼容入口。
+> **对外名称统一用 `free-llm-router`**：多供应商账号池 → 一个 OpenAI 兼容入口。
 
 ## 语言约束
 

@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   /*
-   * ⚠️ **这个 name 不要改**，尽管项目已改名为 `hivegate`。
+   * ⚠️ **这个 name 不要改**，尽管项目已改名为 `free-llm-router`。
    *
    * Worker 的 `name` 是它在 Cloudflare 上的**身份**，而 Durable Object 的存储
    * 是**按 Worker 隔离**的 —— 改掉它等于部署一个**全新的 Worker**，
