@@ -1,4 +1,4 @@
-/* WorkBuddy Serverless 管理面板样式 */
+/* free-llm-router 管理面板样式 */
 :root {
   --bg: #0f1115; --panel: #171a21; --panel2: #1d2129; --line: #262b36;
   --text: #e6e9ef; --dim: #9aa4b2; --accent: #4f8cff;

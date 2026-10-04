@@ -466,3 +466,27 @@ test('文案：统一叫「模型限流」，不叫「模型级限流」', () =>
   assert.ok(js.includes('模型限流'), '应有「模型限流」文案')
   assert.ok(!js.includes('模型级限流'), '不得再出现「模型级限流」')
 })
+
+test('⚠️ 页面标题必须用当前项目名（不能留历史名）', () => {
+  // 实测踩到：项目从 `workbuddy-serverless` → `hivegate` → `free-llm-router`
+  // 改了两轮名，但**页面标题一直是旧名**「WorkBuddy Serverless」——
+  // 在浏览器标签页上一眼就能看到，是最显眼的一处遗留。
+  //
+  // ⚠️ 这条测试的价值在于：改名是个**跨文件**的操作，很容易只改
+  // package.json / wrangler.jsonc 而漏掉 HTML 里的文案。
+  const index = panelAsset('/panel/')?.body ?? ''
+  const login = panelAsset('/login')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // 历史名（含大小写变体）一个都不许留
+  const HISTORICAL = ['WorkBuddy Serverless', 'workbuddy-serverless', 'HiveGate', 'hivegate']
+  for (const name of HISTORICAL) {
+    assert.ok(!index.includes(name), `面板 HTML 不得残留历史名「${name}」`)
+    assert.ok(!login.includes(name), `登录页不得残留历史名「${name}」`)
+    assert.ok(!css.includes(name), `样式表注释不得残留历史名「${name}」`)
+  }
+
+  // 标题必须含当前项目名
+  assert.ok(/<title>[^<]*free-llm-router[^<]*<\/title>/.test(index), '面板标题应含当前项目名')
+  assert.ok(/<title>[^<]*free-llm-router[^<]*<\/title>/.test(login), '登录页标题应含当前项目名')
+})
