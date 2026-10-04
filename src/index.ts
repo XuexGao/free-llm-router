@@ -469,6 +469,20 @@ async function handleCodeArtsCallback(
     state = state.slice(0, questionMark)
   }
 
+  // ⚠️ **诊断日志**（排查「登录后一直显示登录中」必需）。
+  //
+  // 用户报障：华为登录完成后面板一直停在「等待授权中…」。
+  // 要判断是「浏览器压根没回跳到我们」还是「回跳了但参数形态与预期不符」，
+  // 必须能看见**实际收到的参数名**。
+  //
+  // ⚠️ 只记**参数名与长度**，不记 `secret` 的值 —— 它是换取凭据的能力凭证，
+  // 写进日志等于泄漏（日志会进面板、也可能被导出）。
+  console.log(
+    `[codearts-callback] 收到回跳：path=${path.slice(0, 60)} `
+    + `params=[${[...params.keys()].join(',')}] `
+    + `secretLen=${secret.length} stateLen=${state.length}`,
+  )
+
   // 用户在华为页面上取消授权：不是错误，但要如实说明（参考实现只回 400）。
   const upstreamError = params.get('error') ?? params.get('error_code')
   if (upstreamError !== null && upstreamError !== '') {

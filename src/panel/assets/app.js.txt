@@ -441,24 +441,25 @@ function loginWaitHint(providerId) {
     : ''
 }
 
-async function doLogin() {
-  if (loginTimer) clearInterval(loginTimer)
-  // 空 = 自动识别，此时用默认供应商（buddy）走既有端点
-  const providerId = ($('login-provider') && $('login-provider').value) || 'buddy'
-  // workbuddy 走既有端点；其它供应商走通用端点
-  const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
-  const res = await api(endpoint, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ realm: 'cn', provider: providerId }),
-  })
-  if (!res.ok) { show('login-result', res.body); return }
-  const authUrl = res.body.authUrl
-  const state = res.body.state
-  const qrSvg = res.body.qrSvg
-
-  const el = $('login-result')
-  clear(el)
+/**
+ * 渲染登录提示：**扫码**家显示二维码，其余家显示授权链接。
+ *
+ * ## ⚠️ 为什么必须抽成共享函数（实测踩到）
+ *
+ * 面板里有**两个**登录入口：
+ * - 顶部「一键登录」区（`doLogin`）
+ * - 供应商弹窗的「添加账号」页（`startModalLogin`）
+ *
+ * 我第一版只给 `doLogin` 加了扫码支持，忘了 `startModalLogin` ——
+ * 于是用户在**弹窗里**发起商汤登录时，`res.body.qrSvg` 被完全忽略，
+ * 代码去读不存在的 `res.body.authUrl`（扫码家不返回它），
+ * 页面就显示 **`undefined`**。
+ *
+ * 两个入口渲染同一件事，就该调同一个函数 —— 否则必然再次分叉。
+ */
+function renderLoginPrompt(el, body, providerId) {
+  const qrSvg = body.qrSvg
+  const authUrl = body.authUrl
 
   // ── 扫码登录（raccoon）：二维码由服务端渲染好，这里只负责显示 ──
   //
@@ -472,15 +473,9 @@ async function doLogin() {
     const box = document.createElement('div')
     box.className = 'qr-box'
     // ⚠️ 用 `DOMParser` 解析 SVG，**不用 innerHTML**。
-    //
-    // 理由有两条：
-    // ① 安全：`DOMParser` 解析出的文档**从不执行脚本**，即便上游返回的 SVG
-    //    被污染也只会得到一个死节点；而 `innerHTML` 会走 HTML 解析器。
-    // ② 本仓库有一条既有不变量测试**禁止任何 `innerHTML` 赋值**
-    //    （`tests/panel.test.ts` 的 XSS 用例）—— 不为了这一处破例。
-    //
-    // `image/svg+xml` 是正确的内容类型；解析失败时静默降级为不显示二维码
-    //（下面还有「打不开二维码时点此」的链接兜底）。
+    // ① `DOMParser` 解析出的文档**从不执行脚本**，即便上游返回的 SVG
+    //    被污染也只会得到一个死节点；
+    // ② 本仓库有既有不变量测试**禁止任何 `innerHTML` 赋值**，不为这处破例。
     try {
       const doc = new DOMParser().parseFromString(qrSvg, 'image/svg+xml')
       const svg = doc.documentElement
@@ -495,25 +490,52 @@ async function doLogin() {
     const status = document.createElement('div')
     status.textContent = '等待扫码…'
     el.appendChild(status)
+    // 轮询时只更新这段状态文字 —— 二维码必须留在页面上，不能被文字覆盖掉
     el._loginStatus = status
 
-    // 二维码内容也给出可复制链接，方便手机不在身边时改用别的设备扫
-    if (typeof res.body.qrUrl === 'string') {
+    if (typeof body.qrUrl === 'string' && body.qrUrl !== '') {
       const a = document.createElement('a')
-      a.href = res.body.qrUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+      a.href = body.qrUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
       a.textContent = '（打不开二维码时点此）'
       el.appendChild(document.createElement('br'))
       el.appendChild(a)
     }
-  } else {
-    // 用 DOM API 构造（不把上游返回的 URL 拼进 innerHTML —— 那有注入风险）
-    el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
-    const a = document.createElement('a')
-    a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
-    a.textContent = '打开授权页面'
-    el.appendChild(document.createElement('br'))
-    el.appendChild(a)
+    return
   }
+
+  // ── 链接式（设备码 / 浏览器回跳）──
+  // 用 DOM API 构造（不把上游返回的 URL 拼进 innerHTML —— 那有注入风险）
+  if (typeof authUrl !== 'string' || authUrl === '') {
+    // 既不返回二维码也不返回链接 = 后端与前端版本不匹配，如实说明而不是显示 undefined
+    el.textContent = '服务端未返回可用的登录方式（请刷新页面重试）。'
+    return
+  }
+  el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
+  const a = document.createElement('a')
+  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
+  a.textContent = '打开授权页面'
+  el.appendChild(document.createElement('br'))
+  el.appendChild(a)
+}
+
+async function doLogin() {
+  if (loginTimer) clearInterval(loginTimer)
+  // 空 = 自动识别，此时用默认供应商（buddy）走既有端点
+  const providerId = ($('login-provider') && $('login-provider').value) || 'buddy'
+  // workbuddy 走既有端点；其它供应商走通用端点
+  const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
+  const res = await api(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ realm: 'cn', provider: providerId }),
+  })
+  if (!res.ok) { show('login-result', res.body); return }
+  const authUrl = res.body.authUrl
+  const state = res.body.state
+
+  const el = $('login-result')
+  clear(el)
+  renderLoginPrompt(el, res.body, providerId)
 
   let tries = 0
   loginTimer = setInterval(async () => {
@@ -1115,14 +1137,12 @@ async function startModalLogin(providerId, out) {
     body: JSON.stringify({ realm: 'cn', provider: providerId }),
   })
   if (!res.ok) { out.textContent = JSON.stringify(res.body, null, 2); return }
-  const authUrl = res.body.authUrl
   const state = res.body.state
   clear(out)
-  out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
-  const a = document.createElement('a')
-  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
-  a.textContent = '打开授权页面'
-  out.appendChild(document.createElement('br')); out.appendChild(a)
+  // ⚠️ 必须走**共享**渲染函数：扫码家（raccoon）返回的是 `qrSvg` 而非 `authUrl`。
+  // 我第一版这里直接读 `res.body.authUrl` —— 对扫码家就是 `undefined`，
+  // 用户看到的就是「商汤登录显示 undefined」。
+  renderLoginPrompt(out, res.body, providerId)
 
   let tries = 0
   modalLoginTimer = setInterval(async () => {
@@ -1134,12 +1154,16 @@ async function startModalLogin(providerId, out) {
       clearInterval(modalLoginTimer)
       out.textContent = '授权成功：' + (r.body.nickname || r.body.uid)
       loadModalAccounts(); loadAccounts(); loadPool()
-    } else if (r.ok && r.body && r.body.status === 'failed') {
-      // 终态失败：停下并如实显示（继续轮询只会得到同一答案）
+    } else if (r.ok && r.body && (r.body.status === 'failed' || r.body.status === 'canceled')) {
+      // 终态：停下并如实显示（继续轮询只会得到同一答案）
       clearInterval(modalLoginTimer)
       out.textContent = (r.body.message || '登录失败') + '\n可改用「粘贴凭据导入」，或稍后重试。'
     } else if (r.ok && r.body && r.body.message) {
-      out.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
+      // 扫码流程只更新状态文字（二维码必须留在页面上，不能被文字覆盖掉）
+      if (out._loginStatus) out._loginStatus.textContent = r.body.message
+      else if (typeof res.body.authUrl === 'string') {
+        out.textContent = '请在浏览器打开以下链接完成授权：\n' + res.body.authUrl + '\n\n' + r.body.message
+      } else out.textContent = r.body.message
     }
   }, 3000)
 }

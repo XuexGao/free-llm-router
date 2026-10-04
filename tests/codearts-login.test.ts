@@ -421,3 +421,36 @@ test('⚠️ codearts 现在声明 login=true（浏览器回跳流程已实现�
   assert.equal(typeof buildCodeArtsLoginUrl, 'function')
   assert.equal(typeof fetchCodeArtsTicket, 'function')
 })
+
+// ─────────────────── 登录入口 host（用户报障「一直显示登录中」） ───────────────────
+
+test('⚠️ 华为登录入口 host 不得带区域前缀（带区域的 API 已下线）', () => {
+  // 实测 2026-10-04：参考实现用的
+  // `devcloud.cn-north-4.huaweicloud.com/doer/redirect` 已返回
+  //   404 {"error_code":"APIGW.0101",
+  //        "error_msg":"The API does not exist or has not been published in the environment"}
+  // 而**去掉区域前缀**的 `devcloud.huaweicloud.com` 返回 200 + 跳转脚本。
+  //
+  // 这正是用户报障「华为登录之后一直显示登录中…」的根因：
+  // 他点开的授权页是 **404 错误页**，根本没有登录框，
+  // 浏览器永远不会回跳到我们的 callback，面板只能一直等。
+  assert.equal(CODEARTS_LOGIN_BASE, 'https://devcloud.huaweicloud.com/doer/redirect')
+  assert.ok(!CODEARTS_LOGIN_BASE.includes('cn-north-4'), '不得带区域前缀')
+})
+
+test('⚠️ 认证页路径是 /authui/login（无 .html）—— 那是跳转脚本自己拼的目标', () => {
+  // `doer/redirect` 的响应体里明写：
+  //   window.location.replace('https://auth.huaweicloud.com/authui/login?service=' + …)
+  assert.equal(HUAWEI_AUTH_BASE, 'https://auth.huaweicloud.com/authui/login')
+})
+
+test('⚠️ 登录 URL 必须把我们的 callback 原样带上', () => {
+  const callbackUrl = 'https://example.com/login/codearts/callback/abc123'
+  const { redirectUrl, loginUrl } = buildCodeArtsLoginUrl(callbackUrl, 'ticket-1')
+  // redirectUrl 里的 auth_callback_url 必须是我们给的（编码后）
+  assert.ok(redirectUrl.includes(encodeURIComponent(callbackUrl)), 'auth_callback_url 必须原样带上')
+  assert.ok(redirectUrl.includes('ticket_id=ticket-1'), 'ticket_id 必须在')
+  // loginUrl 必须把整个 redirectUrl 作为 service 参数
+  assert.ok(loginUrl.startsWith(`${HUAWEI_AUTH_BASE}?service=`), 'service 必须指向 redirectUrl')
+  assert.ok(loginUrl.includes(encodeURIComponent(redirectUrl)), 'redirectUrl 必须整体编码进 service')
+})

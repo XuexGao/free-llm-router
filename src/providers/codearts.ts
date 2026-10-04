@@ -661,10 +661,43 @@ function pickExpiresAt(source: Record<string, unknown>): number {
  * `auth_callback_url` / `plugin-name` / `ticket_id` 等参数，真正的登录页是后者
  * （见 {@link buildCodeArtsLoginUrl}）。直接打开本 URL 不会出现登录表单。
  */
-export const CODEARTS_LOGIN_BASE = 'https://devcloud.cn-north-4.huaweicloud.com/doer/redirect'
+/**
+ * ⚠️ **必须是 `devcloud.huaweicloud.com`，不能带区域前缀**（实测 2026-10-04）。
+ *
+ * 参考实现写的是 `https://devcloud.cn-north-4.huaweicloud.com/doer/redirect`，
+ * 但那个 host 上的该 API **已经下线**：
+ *
+ * ```
+ * GET https://devcloud.cn-north-4.huaweicloud.com/doer/redirect?…
+ * → HTTP 404 {"error_code":"APIGW.0101",
+ *             "error_msg":"The API does not exist or has not been published in the environment"}
+ * ```
+ *
+ * 而**去掉区域前缀**的 `devcloud.huaweicloud.com` 返回 **200** 并带一段跳转脚本
+ * （把 `service` 参数原样转给 `auth.huaweicloud.com/authui/login`）。
+ *
+ * 这正是用户报障「华为登录之后一直显示登录中…」的根因：
+ * 用户点开的授权页是 **404 错误页**，根本没有登录框，
+ * 于是浏览器永远不会回跳到我们的 callback，面板只能一直等。
+ *
+ * ⚠️ 排查手法值得记下：**不要只看「页面能不能打开」**。
+ * 那个 404 返回的是 JSON 错误体、HTTP 状态码确实是 404 ——
+ * 但如果只看「请求有没有响应」，会误以为端点还活着。
+ * 判据应是**响应体是否是预期的跳转脚本**。
+ */
+export const CODEARTS_LOGIN_BASE = 'https://devcloud.huaweicloud.com/doer/redirect'
 
 /** 华为统一认证登录页（`login.ts:12`），用户实际看到的页面。 */
-export const HUAWEI_AUTH_BASE = 'https://auth.huaweicloud.com/authui/login.html'
+/**
+ * 华为认证页。
+ *
+ * ⚠️ 路径是 **`/authui/login`（无 `.html`）** —— 这是 `doer/redirect` 的
+ * 跳转脚本自己拼出来的目标（实测响应体里的
+ * `window.location.replace('https://auth.huaweicloud.com/authui/login?service=' + …)`）。
+ * 参考实现写的是 `/authui/login.html`，两者都能打开页面，但**只有
+ * `doer/redirect` 认可的那条**才保证 `service` 参数被正确消费。
+ */
+export const HUAWEI_AUTH_BASE = 'https://auth.huaweicloud.com/authui/login'
 
 /**
  * ticket 换凭据端点（`login.ts:13`）。
