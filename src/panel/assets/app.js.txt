@@ -134,7 +134,17 @@ const VIEW_LOADERS = {
   logs: () => loadLogs(),
 }
 
+/**
+ * 切换视图。
+ *
+ * ⚠️ 名字非法时**回退到 providers**，而不是静默不加载任何东西。
+ * 历史上出现过「视图名不存在 → 加载器是 undefined → 页面空白」，
+ * 而空白页面极难归因（用户只会说「坏了」）。宁可显示一个默认视图。
+ */
 function switchView(name) {
+  if (!Object.prototype.hasOwnProperty.call(VIEW_LOADERS, name)) {
+    name = 'providers'
+  }
   for (const btn of document.querySelectorAll('.nav-item')) {
     btn.classList.toggle('active', btn.dataset.view === name)
   }
@@ -158,7 +168,8 @@ function switchView(name) {
 async function loadPool() {
   const box = $('pool-counts')
   if (!box) return
-  const res = await api('/admin/pool?realm=cn')
+  const counts = await fetchPoolCounts()
+  const res = { ok: true, body: { counts } }
   clear(box)
   if (!res.ok || !res.body || !res.body.counts) return
   const c = res.body.counts
@@ -178,7 +189,8 @@ async function loadPool() {
  * `coolKind` / `reason`），不需要新端点 —— 池计数的数字本来就是从这些算出来的。
  */
 async function showCoolingDetail() {
-  const res = await api('/admin/accounts?realm=cn')
+  const accounts = await fetchAccounts()
+  const res = { ok: true, body: { accounts } }
   if (!res.ok || !res.body) return openInfo('冷却中的账号', [])
   const now = Date.now()
   const hot = res.body.accounts.filter((a) => {
@@ -217,7 +229,8 @@ async function showCoolingDetail() {
  * 一个账号可以有多个模型各自限流。故这里按「账号 × 模型」展开成行。
  */
 async function showModelThrottleDetail() {
-  const res = await api('/admin/accounts?realm=cn')
+  const accounts = await fetchAccounts()
+  const res = { ok: true, body: { accounts } }
   if (!res.ok || !res.body) return openInfo('模型级限流', [])
   const now = Date.now()
   const rows = []
@@ -254,8 +267,65 @@ function shortUid(uid) {
   return s.length > 26 ? '…' + s.slice(-24) : s
 }
 
+/**
+ * 取**两个 realm** 的账号并合并。
+ *
+ * ## ⚠️ 为什么必须查两个 realm（实测踩到）
+ *
+ * 账号按凭据的 `realm` 分片存放：WorkBuddy 国际版在 `global`，其余在 `cn`。
+ * 面板原先一律只查 `?realm=cn` —— 于是**国际版登录成功后账号列表仍然是空的**，
+ * 用户看到「该供应商下还没有账号」，而账号其实好好地存在 global 里。
+ *
+ * ⚠️ 合并顺序：`cn` 在前、`global` 在后，保证列表顺序稳定
+ *（否则每次渲染顺序可能变，用户会以为列表在跳）。
+ */
+async function fetchAccounts() {
+  const realms = ['cn', 'global']
+  const all = []
+  for (const realm of realms) {
+    const res = await api(`/admin/accounts?realm=${realm}`)
+    if (res.ok && res.body && Array.isArray(res.body.accounts)) {
+      for (const a of res.body.accounts) all.push({ ...a, realm })
+    }
+  }
+  return all
+}
+
+/**
+ * 取两个 realm 的池计数并**相加**。
+ *
+ * 只报 `cn` 会让「总账号 9」而实际有 10 个（国际版那个不算），
+ * 用户会以为账号丢了。
+ */
+async function fetchPoolCounts() {
+  const total = { total: 0, healthy: 0, cooling: 0, modelExempt: 0, disabled: 0 }
+  for (const realm of ['cn', 'global']) {
+    const res = await api(`/admin/pool?realm=${realm}`)
+    if (!res.ok || !res.body || !res.body.counts) continue
+    for (const k of Object.keys(total)) total[k] += res.body.counts[k] || 0
+  }
+  return total
+}
+
+/**
+ * 取两个 realm 的积分快照并合并账号数组。
+ *
+ * ⚠️ 不在这里相加总额：面板是按**供应商卡片**汇总的，
+ * 相加会把不同供应商的积分混成一个数（静默算错）。
+ */
+async function fetchPackages() {
+  const accounts = []
+  for (const realm of ['cn', 'global']) {
+    const res = await api(`/admin/packages?realm=${realm}`)
+    if (res.ok && res.body && Array.isArray(res.body.accounts)) {
+      for (const a of res.body.accounts) accounts.push({ ...a, realm })
+    }
+  }
+  return accounts
+}
+
 async function loadAccounts() {
-  const res = await api('/admin/accounts?realm=cn')
+  const res = { ok: true, body: { accounts: await fetchAccounts() } }
   const box = $('accounts')
   clear(box)
   const select = $('task-uid')
@@ -403,9 +473,15 @@ async function doLogin() {
 
 // ─────────────────────────── 任务中心 ───────────────────────────
 
-/** 给「查进度」下拉填 buddy 账号（任务只跑国内版）。 */
+/**
+ * 给「查进度」下拉填 buddy 账号。
+ *
+ * ⚠️ 任务只对**声明了动作表**的供应商跑，当前实际只有国内版 buddy
+ * 有完整的自动任务链路，故这里筛出 buddy 的账号（两个 realm 都查，
+ * 万一将来国际版也接了任务表就不用再改这里）。
+ */
 async function loadTaskUids() {
-  const res = await api('/admin/accounts?realm=cn')
+  const res = { ok: true, body: { accounts: await fetchAccounts() } }
   const sel = $('task-uid')
   if (!sel) return
   clear(sel)
@@ -422,6 +498,23 @@ async function loadTaskUids() {
     o.value = ''; o.textContent = '（没有可用的 buddy 账号）'
     sel.appendChild(o)
   }
+}
+
+/**
+ * 积分缓存失效并立即重拉。
+ *
+ * ## ⚠️ 为什么必须做（用户报障「任务说完成了但积分没变化」）
+ *
+ * `loadProviderCredits` 只在**首次进视图**时拉一次（`creditsLoaded` 标记），
+ * 之后靠缓存 —— 这是为了省掉反复真打上游的开销。
+ * 但**签到与每日任务会真的改变积分**，跑完却still显示旧数字，
+ * 用户就会以为「任务白做了」。
+ *
+ * 故凡是**会改积分的操作**（签到、每日任务）跑完都要调这里。
+ */
+function invalidateCredits() {
+  creditsLoaded = false
+  void loadProviderCredits()
 }
 
 /** 卡片一：全部供应商一键签到。 */
@@ -445,6 +538,8 @@ async function runCheckinAll() {
   }
   show('task-result', lines.join('\n'))
   loadAccounts(); loadProviders()
+  // ⚠️ 签到会真的加积分，必须刷新缓存，否则卡片还显示旧数字
+  invalidateCredits()
 }
 
 /** 卡片二：buddy 每日任务（签到 + 零消耗成长任务 + 领奖，全部做一遍）。 */
@@ -467,6 +562,11 @@ async function runDailyAll() {
   lines.push('')
   lines.push('任务由 Durable Object 按 alarm 逐步执行（每步间隔 1s+），稍后点「查进度」看结果。')
   show('task-result', lines.join('\n'))
+  // ⚠️ 任务是**异步**跑的（DO 逐步执行），故这里先刷一次（可能还没加完），
+  // 再排一个延时刷新把最终数字带上 —— 否则用户看到的永远是跑之前的余额。
+  invalidateCredits()
+  setTimeout(invalidateCredits, 45_000)
+  setTimeout(invalidateCredits, 120_000)
   loadTaskUids()
 }
 
@@ -558,7 +658,8 @@ async function loadPackages() {
   p.textContent = '查询中（逐账号串行打上游）…'
   box.appendChild(p)
 
-  const res = await api('/admin/packages?realm=cn')
+  const accounts = await fetchPackages()
+  const res = { ok: true, body: { accounts } }
   clear(box)
   if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '查询失败'; box.appendChild(e); return }
 
@@ -640,7 +741,8 @@ let creditsLoaded = false
 let accountCounts = {}
 
 async function loadProviderCredits() {
-  const res = await api('/admin/packages?realm=cn')
+  const accounts = await fetchPackages()
+  const res = { ok: true, body: { accounts } }
   if (!res.ok || !res.body || !Array.isArray(res.body.accounts)) return
   const byProvider = {}
   for (const a of res.body.accounts) {
@@ -661,12 +763,11 @@ async function loadProviders() {
   loadPool()      // 计数渲染在视图顶部
   // 先取各供应商的账号数（决定是否自动关闭模型 + 卡片是否显示积分）
   accountCounts = {}
-  const accRes = await api('/admin/accounts?realm=cn')
-  if (accRes.ok && accRes.body) {
-    for (const a of accRes.body.accounts || []) {
-      const pid = a.provider || 'buddy'
-      accountCounts[pid] = (accountCounts[pid] || 0) + 1
-    }
+  // ⚠️ 必须合并两个 realm：国际版账号在 global，
+  // 只数 cn 会让卡片显示「0 个账号」，从而误判成「这家没登录」。
+  for (const a of await fetchAccounts()) {
+    const pid = a.provider || 'buddy'
+    accountCounts[pid] = (accountCounts[pid] || 0) + 1
   }
   // ⚠️ 首次进入视图时要自动拉一次积分，否则卡片右上角永远是空的
   //（之前只在点「刷新」时才拉 —— 用户看到的就是「有账号也不显示余额」）。
@@ -754,7 +855,8 @@ function switchModalTab(name) {
 async function loadModalAccounts() {
   const box = $('modal-accounts')
   clear(box)
-  const res = await api('/admin/accounts?realm=cn')
+  // ⚠️ 合并两个 realm —— 否则国际版（global）的账号弹窗永远显示「还没有账号」。
+  const res = { ok: true, body: { accounts: await fetchAccounts() } }
   if (!res.ok) { box.textContent = '加载失败'; return }
   const mine = (res.body.accounts || []).filter((a) => (a.provider || 'buddy') === modalProviderId)
   if (mine.length === 0) {
@@ -967,7 +1069,8 @@ async function loadConfig() {
   clear(box)
   const pairs = []
 
-  const pool = await api('/admin/pool?realm=cn')
+  const cfgCounts = await fetchPoolCounts()
+  const pool = { ok: true, body: { counts: cfgCounts } }
   if (pool.ok && pool.body.counts) {
     const c = pool.body.counts
     pairs.push(['账号总数', c.total], ['可用', c.healthy], ['冷却中', c.cooling],
@@ -1075,7 +1178,10 @@ $('do-import').onclick = doImport
 $('do-login').onclick = doLogin
 $('run-checkin-all').onclick = runCheckinAll
 $('run-daily-all').onclick = runDailyAll
-$('refresh-status').onclick = () => loadTaskStatus(false)
+// 「查进度」时**顺带刷新积分** —— 这是用户确认「到底加没加」的入口。
+// 只刷进度不刷积分的话，用户会看到「任务全 OK，但余额没动」，
+// 而真相只是余额没重新拉（缓存），非常容易误判成任务白做。
+$('refresh-status').onclick = () => { loadTaskStatus(false); invalidateCredits() }
 $('refresh-usage').onclick = loadUsage
 $('clear-usage').onclick = async () => {
   if (!confirm('清空用量记录？')) return
@@ -1122,6 +1228,8 @@ async function bootstrap() {
   }
 
   $('setup-hint').hidden = true
+  // ⚠️ 这里只为**验证密钥有效**，查 cn 即可（密钥对所有 realm 通用）；
+  // 真正的数据加载在 switchView 里，那里会查两个 realm。
   const res = await api('/admin/pool?realm=cn')
   if (!res.ok) {
     // 密钥失效 → 也回登录页（避免停在一个空面板上）
@@ -1131,13 +1239,20 @@ async function bootstrap() {
   }
 
   setAuth('密钥有效', true)
-  // ⚠️ 默认视图必须是**真实的导航项**（`providers`），不能是 `accounts`。
+  // ⚠️ **存下来的视图名也要校验**，不能只改默认值。
   //
   // 实测踩到：`accounts` 曾是独立视图名，后来账号池并入了「供应商与账号」，
-  // 导航里不再有 `accounts`，但这里的默认值没跟着改 —— 于是
-  // `VIEW_LOADERS['accounts']` 是 `undefined`，**加载器从不执行**，
-  // 刷新后页面一片空白；切到别的卡片再切回来才显示（那时用的是真实视图名）。
-  switchView(localStorage.getItem('wb_view') || 'providers')
+  // 导航里不再有它。我第一版只把**默认值**改成 `providers` —— 但用户的
+  // localStorage 里**早就存了 `'accounts'`**（旧版代码写进去的），
+  // 于是 `getItem` 仍然返回旧值，`VIEW_LOADERS['accounts']` 依旧是
+  // `undefined`，**加载器依然不执行**，刷新后照样空白。
+  //
+  // 修法：把存下来的值与**真实导航项**比对，不合法就丢弃并回到 `providers`。
+  // 顺带清掉这个陈旧键，避免它一直阴魂不散。
+  const VIEWS = Object.keys(VIEW_LOADERS)
+  const stored = localStorage.getItem('wb_view')
+  const initialView = stored !== null && VIEWS.includes(stored) ? stored : 'providers'
+  switchView(initialView)
   loadWaf()
   setInterval(loadWaf, 20000)
 }

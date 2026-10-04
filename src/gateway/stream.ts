@@ -102,7 +102,23 @@ export function detectErrorFrame(chunk: Record<string, unknown>): string | undef
     return msg
   }
 
-  // 形态 4：既没有 choices 也没有已知错误字段 —— 可疑但可能是 usage 帧
+  // 形态 4：华为云风格 `{error_code, error_msg}`（CodeArts 在用）。
+  //
+  // ⚠️ 实测踩到：CodeArts 模型名不对时上游回的是
+  // `{"text":"[DONE]","error_code":"InferHub.002002009.404",
+  //   "error_msg":"The model is not registered, please request other model"}`
+  // —— 这一帧**既没有 `error`、也没有 `code`**（它是 `error_code`），
+  // 于是被当成普通帧丢掉，最终给客户端一个 **`content:''` + `finish_reason:'stop'`
+  // 的空回答**。用户看到的是「模型返回了空」，完全看不出是模型名错了。
+  //
+  // 这类「静默空回答」比报错更糟：用户会以为模型不行，而不是自己选错了模型。
+  const errorCode = chunk.error_code
+  if (typeof errorCode === 'string' && errorCode !== '') {
+    const msg = typeof chunk.error_msg === 'string' ? chunk.error_msg : ''
+    return `上游错误 ${errorCode}${msg === '' ? '' : `：${msg}`}`
+  }
+
+  // 形态 5：既没有 choices 也没有已知错误字段 —— 可疑但可能是 usage 帧
   return undefined
 }
 
@@ -196,16 +212,25 @@ export function aggregateSse(
   const choice = result.choices[0]
   if (choice === undefined) return result
 
+  // ⚠️ **必须复用 `parseSseLine`**，不能自己写一套 `data: ` 前缀判断。
+  //
+  // 实测踩到（就是这条 bug 导致 CodeArts 非流式恒为空回答）：
+  // 我第一版写的是 `line.startsWith('data: ')`（**带空格**），
+  // 而部分上游发的是 `data:{...}`（**不带空格**）——
+  // 于是每一帧都被 `continue` 掉，聚合结果恒为 `content:''`，
+  // 客户端看到「模型返回空」，而流式路径（用的是 `parseSseLine`）却正常。
+  //
+  // 教训：同一件事只能有一个实现。两条路径共用 `parseSseLine` 后，
+  // 「带不带空格」「`[DONE]` 怎么判」「非 JSON 帧怎么办」都不会再分叉。
   for (const line of rawSse.split('\n')) {
-    if (!line.startsWith('data: ')) continue
-    const payload = line.slice(6).trim()
-    if (payload === '' || payload === '[DONE]') continue
+    const parsed = parseSseLine(line)
+    if (parsed.kind !== 'chunk' || parsed.data === undefined) continue
 
     let frame: Record<string, unknown>
     try {
-      frame = JSON.parse(payload) as Record<string, unknown>
+      frame = JSON.parse(parsed.data) as Record<string, unknown>
     } catch {
-      continue // 非 JSON 帧（心跳等）直接跳过
+      continue // parseSseLine 已校验过是 `{` 开头，走到这里说明 JSON 本身坏了
     }
 
     // 顶层 id / usage 取最后一次出现的值

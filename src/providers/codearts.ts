@@ -1360,7 +1360,27 @@ export const codeartsProvider: Provider = {
    * 被提前吊销或 AK 无权限时正是这两个状态码，另一个账号可能仍有效
    * （`llm-adapter.ts:435-447` 的 `isAuthError` 即按 401/403 识别鉴权失败）。
    */
-  shouldRotate(status: number): boolean {
-    return status === 429 || status === 402 || status === 401 || status === 403
+  /**
+   * 是否该换号重试。
+   *
+   * ⚠️ **`TM.00001041`（并发会话数已达上限）必须算进来**。
+   * 它是**账户级的瞬时并发限制**（HTTP **400**，不是 429），
+   * 与账号本身是否健康无关 —— 若当成普通失败，会把一个好账号
+   * 打进熔断冷却，而真实情况只是「同时开着的会话满了」。
+   *
+   * ⚠️ 参考实现的做法是**轮询排队状态端点**直到放行
+   *（`llm-adapter.ts:268-278` 的 `QUEUE_STATUS_BASE`，最多 30 分钟）。
+   * 本项目**不做**这个轮询：Workers 单次调用只有 10ms CPU，
+   * 在请求内空等 10 秒 × N 次既超预算又占着连接。
+   * 改为**换号**（其它账号可能还有余量）+ 如实把原因告诉调用方。
+   */
+  shouldRotate(status: number, detail?: string): boolean {
+    if (status === 429 || status === 402 || status === 401 || status === 403) return true
+    if (status === 400 && detail !== undefined) {
+      return /TM\.00001041|并发会话|peak\s+usage|try\s+again\s+after|high\s+demand|too\s+many\s+requests/i.test(
+        detail,
+      )
+    }
+    return false
   },
 }

@@ -535,3 +535,74 @@ test('⚠️ isAuthLikeFailure 不该把普通故障判成鉴权失败', () => {
   // ⚠️ 400 本身不是鉴权信号（只有配合具体文案才是）
   assert.equal(isAuthLikeFailure(400, 'invalid parameter: model'), false)
 })
+
+// ─────────────────── 静默空回答（比报错更糟） ───────────────────
+
+test('⚠️ detectErrorFrame 必须认出华为云 `error_code`/`error_msg` 形态', () => {
+  // 实测踩到：CodeArts 模型名不对时上游回
+  // {"text":"[DONE]","error_code":"InferHub.002002009.404",
+  //  "error_msg":"The model is not registered, please request other model"}
+  // —— 这一帧**既没有 `error` 也没有 `code`**（是 `error_code`），
+  // 于是被当普通帧丢掉，最终给客户端一个 content:'' + finish_reason:'stop'
+  // 的**空回答**。用户看到「模型返回空」，完全看不出是模型名错了。
+  const frame = {
+    text: '[DONE]',
+    error_code: 'InferHub.002002009.404',
+    error_msg: 'The model is not registered, please request other model',
+  }
+  const msg = detectErrorFrame(frame)
+  assert.notEqual(msg, undefined, '必须识别为错误帧')
+  assert.ok(msg?.includes('InferHub.002002009.404'), '错误码要带上')
+  assert.ok(msg?.includes('not registered'), '原始说明要带上')
+})
+
+test('detectErrorFrame：正常帧不能被误判成错误', () => {
+  // 正常的增量帧
+  assert.equal(detectErrorFrame({ choices: [{ index: 0, delta: { content: 'hi' } }] }), undefined)
+  // usage 帧（没有 choices 也没有错误字段）
+  assert.equal(detectErrorFrame({ usage: { prompt_tokens: 1 } }), undefined)
+  // 空 error_code 不算错误
+  assert.equal(detectErrorFrame({ error_code: '' }), undefined)
+})
+
+test('⚠️ 裸 JSON 错误体（无 data: 前缀）也必须被识别为错误', () => {
+  // 实测踩到：华为 APIG 在 HTTP 200 下直接回一个**裸 JSON 错误体**，
+  // 没有任何 `data: ` 前缀。此时：
+  // - aggregateSse 找不到 data: 行 ⇒ 产出空 completion；
+  // - 逐行扫描也要求 `data: ` 前缀 ⇒ 同样找不到错误。
+  // 结果客户端拿到 content:'' + finish_reason:'stop' 的**空回答**。
+  const bare = JSON.stringify({
+    error: { message: '供应商「CodeArts」请求失败：并发会话数已达上限(3个)' },
+  })
+  // aggregateSse 对这种输入只能产出空内容（它只认 SSE 帧）
+  const out = aggregateSse(bare, { model: 'm', now: 0 })
+  assert.equal(out.choices[0]?.message.content, '', 'aggregateSse 只认 SSE，故为空')
+
+  // 而 detectErrorFrame 对解析后的对象必须能认出错误 ——
+  // 这正是 nonStreamingResponse 里「先整体当 JSON 解析」那一步的依据。
+  const parsed = JSON.parse(bare) as Record<string, unknown>
+  assert.notEqual(detectErrorFrame(parsed), undefined, '裸 JSON 错误体必须被识别')
+})
+
+test('⚠️ aggregateSse 必须容忍 `data:` 不带空格（CodeArts 就是这个形态）', () => {
+  // 实测踩到（这条 bug 让 CodeArts 非流式恒为空回答）：
+  // 华为 APIG 发的是 `data:{...}`（**不带空格**），而我第一版用
+  // `line.startsWith('data: ')` 判断 —— 每一帧都被跳过，
+  // 聚合结果恒为 content:''，客户端看到「模型返回空」，
+  // 而流式路径（用 parseSseLine）却完全正常。
+  const noSpace = [
+    'data:{"choices":[{"index":0,"delta":{"content":"你"}}]}',
+    'data:{"choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}]}',
+    'data:[DONE]',
+  ].join('\n')
+  const out = aggregateSse(noSpace, { model: 'm', now: 0 })
+  assert.equal(out.choices[0]?.message.content, '你好', '不带空格的 data: 也必须被解析')
+
+  // 带空格的形态同样要支持（不同上游不一致，两条都要活）
+  const withSpace = [
+    'data: {"choices":[{"index":0,"delta":{"content":"A"}}]}',
+    'data: {"choices":[{"index":0,"delta":{"content":"B"},"finish_reason":"stop"}]}',
+    'data: [DONE]',
+  ].join('\n')
+  assert.equal(aggregateSse(withSpace, { model: 'm', now: 0 }).choices[0]?.message.content, 'AB')
+})

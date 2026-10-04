@@ -343,7 +343,19 @@ test('⚠️ 默认视图必须是真实导航项（否则刷新后空白）', (
     assert.ok(navs.has(l), `加载器「${l}」不是导航项（会永远不执行）`)
   }
   // ② 默认视图必须落在加载器里
-  const def = /switchView\(localStorage\.getItem\('wb_view'\)\s*\|\|\s*'(\w+)'\)/.exec(js)
-  assert.notEqual(def, null, '应能找到默认视图')
-  assert.ok(loaders.has(def?.[1] ?? ''), `默认视图「${def?.[1]}」没有加载器（会空白）`)
+  const def = /VIEWS\.includes\(stored\)\s*\?\s*stored\s*:\s*'(\w+)'/.exec(js)
+  assert.notEqual(def, null, '应能找到默认视图回退值')
+  assert.ok(loaders.has(def?.[1] ?? ''), `默认回退视图「${def?.[1]}」没有加载器（会空白）`)
+
+  // ③ ⚠️ **存下来的视图名也必须校验**。
+  // 我第一版只改默认值 —— 但用户 localStorage 里早就存了旧名 `accounts`，
+  // `getItem` 仍返回旧值，加载器依旧不执行，刷新照样空白。
+  assert.ok(/VIEWS\.includes\(stored\)/.test(js), '必须校验 localStorage 里的视图名')
+  assert.ok(/Object\.keys\(VIEW_LOADERS\)/.test(js), 'VIEWS 应从加载器派生（不是手写列表）')
+
+  // ④ switchView 自身也要有防线：非法名字回退，而不是静默不加载
+  assert.ok(
+    /function switchView\(name\)\s*\{[\s\S]{0,240}hasOwnProperty\.call\(VIEW_LOADERS, name\)/.test(js),
+    'switchView 应对非法视图名回退',
+  )
 })

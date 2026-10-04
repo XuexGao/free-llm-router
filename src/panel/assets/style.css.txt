@@ -97,15 +97,21 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .count b { display: block; font-size: 18px; font-weight: 600; }
 .count span { font-size: 11px; color: var(--dim); }
-/* 可点击的计数块（冷却中 / 模型限流）—— 要有明显的可点感，否则用户不会去点 */
-.count.clickable { cursor: pointer; border-color: var(--accent); }
-.count.clickable:hover { background: var(--hover, rgba(127,127,127,.12)); }
+/*
+ * 可点击的计数块（冷却中 / 模型限流）。
+ *
+ * ⚠️ **边框必须与其它计数块一致**（用户明确要求「不要蓝色描边」）——
+ * 用户不想要一个视觉上突兀的卡片。可点性靠三件更克制的事表达：
+ * hover 背景、手型光标、右上角的小箭头。
+ */
+.count { position: relative; }
+.count.clickable { cursor: pointer; }
+.count.clickable:hover { background: var(--hover, rgba(127, 127, 127, 0.12)); }
 .count.clickable::after {
   content: '▸';
   position: absolute; top: 6px; right: 8px;
-  font-size: 10px; color: var(--dim);
+  font-size: 10px; color: var(--dim); opacity: 0.65;
 }
-.count { position: relative; }
 
 .card {
   border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;

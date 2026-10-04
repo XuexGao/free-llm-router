@@ -909,8 +909,43 @@ async function nonStreamingResponse(
   const completion = aggregateSse(raw, { model, now: Date.now() })
   const choice = completion.choices[0]
 
-  // 上游错误以 SSE 帧形式返回（HTTP 200）：必须显式报错，不能假装成功
-  if (choice !== undefined && choice.message.content === '' && (completion.usage === undefined || completion.usage === null)) {
+  // 上游错误以 SSE 帧形式返回（HTTP 200）：必须显式报错，不能假装成功。
+  //
+  // ⚠️ 判据是「**没有正文也没有思考过程**」，不能只看 `usage`。
+  // 实测踩到：CodeArts 的模型名错误帧既没有 `usage` 也没有正文，
+  // 而某次判断只查了 usage —— 结果给客户端一个 `content:''` 的空回答，
+  // 用户以为是模型不行，其实是模型名写错了。
+  if (
+    choice !== undefined
+    && choice.message.content === ''
+    && (choice.message.reasoning_content ?? '') === ''
+    && (completion.usage === undefined || completion.usage === null)
+  ) {
+    // ⚠️ **先处理「整个响应体就是一个 JSON（不是 SSE）」的情况**。
+    //
+    // 实测踩到：某些上游（如 CodeArts 经华为 APIG）在 HTTP **200** 下直接
+    // 回一个**裸 JSON 错误体**，完全没有 `data: ` 前缀。此时：
+    // - `aggregateSse` 找不到任何 `data:` 行 ⇒ 产出空 completion；
+    // - 下面的逐行扫描也要求 `line.startsWith('data: ')` ⇒ 同样找不到错误。
+    // 结果客户端拿到 `content:'' + finish_reason:'stop'` 的**空回答**，
+    // 完全看不出上游其实报错了。
+    //
+    // 故这里先尝试把整个 body 当 JSON 解析，并用同一套 `detectErrorFrame`
+    // 判据识别错误。
+    const trimmedRaw = raw.trim()
+    if (trimmedRaw.startsWith('{') || trimmedRaw.startsWith('[')) {
+      try {
+        const whole = JSON.parse(trimmedRaw) as Record<string, unknown>
+        const wholeErr = detectErrorFrame(whole)
+        if (wholeErr !== undefined) {
+          hooks.onError(wholeErr)
+          return jsonError(502, wholeErr, 'upstream_error')
+        }
+      } catch {
+        // 不是合法 JSON：交给下面的逐帧扫描
+      }
+    }
+
     // 流里没有任何内容 —— 找一下是不是错误帧
     for (const line of raw.split('\n')) {
       if (!line.startsWith('data: ')) continue
