@@ -10,3 +10,6 @@ creds*.json
 real_cred*.json
 .env
 .env.*
+
+# ZCode 客户端本地生成的文件（不含敏感内容，但属本地状态）
+.zcodeignore

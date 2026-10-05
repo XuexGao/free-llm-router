@@ -128,11 +128,144 @@ export function detectErrorFrame(chunk: Record<string, unknown>): string | undef
  * @returns 要写给客户端的内容（含 `data:` 前缀与结尾空行），或空串表示不写
  */
 export function translateFrame(rawData: string): string {
-  // 原样转发：上游帧形状与 OpenAI 一致（`delta.content` / `reasoning_content` / `tool_calls`）。
-  // ⚠️ 刻意**不重新序列化**（不 JSON.parse 再 stringify）：
-  // 那会多一次全量解析 + 序列化的 CPU 开销，而 Free 计划只有 10ms。
-  // 只在需要**改写**时才解析（见 detectErrorFrame 的调用点）。
+  // ⚠️ **需要净化时必须解析**（见 `normalizeFrame` 的说明）。
+  // 判据先做**廉价字符串检查**：只有含非标准字段时才付解析代价。
+  if (needsNormalize(rawData)) {
+    try {
+      const frame = JSON.parse(rawData) as Record<string, unknown>
+      normalizeFrame(frame)
+      return `data: ${JSON.stringify(frame)}\n\n`
+    } catch {
+      // 解析失败：原样转发（不因为净化失败而丢帧）
+    }
+  }
   return `data: ${rawData}\n\n`
+}
+
+/**
+ * 这一帧**是否含非标准字段**（需要净化）。
+ *
+ * ⚠️ 廉价字符串预检，避免对每个正常帧都做 JSON.parse ——
+ * Free 计划只有 10ms CPU，正常帧原样转发是刻意的优化。
+ */
+export function needsNormalize(rawData: string): boolean {
+  return (
+    rawData.includes('"reasoning_content"')
+    || rawData.includes('"extra_fields"')
+    || rawData.includes('"refusal"')
+    || rawData.includes('"function_call"')
+    // ⚠️ `tool_calls` 同样要净化：上游后续片段的 `function.name` 是**空串**，
+    // 会把 agent 客户端的工具名覆盖掉（实测抓取，见 normalizeToolCalls）。
+    || rawData.includes('"tool_calls"')
+  )
+}
+
+/**
+ * 把上游帧**净化成严格 OpenAI 形状**（就地修改）。
+ *
+ * ## ⚠️ 为什么必须做（用户报障实测）
+ *
+ * 用户把本 API 接入 **ZCode 客户端**后：「buddy 的 v4.1-flash 一直显示
+ * 思考一段时间，每次思考只有 1 个单词」。根因是 buddy 上游**每帧都带**
+ * 这些**非标准字段**（即使是空值）：
+ *
+ * ```json
+ * {"delta":{"role":"assistant","content":"","reasoning_content":"",
+ *           "function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},
+ *  "finish_reason":""}
+ * ```
+ *
+ * 严格客户端看到 `delta` 里**存在** `reasoning_content` 键就认为「这是思考内容」，
+ * 于是把每帧那一个字的 `content` 当成思考显示 → **一直停在"思考中"**。
+ * 而 OpenAI 规范里：不需要的字段**应当省略**，不是给空值。
+ *
+ * ## 净化规则（逐条对应规范）
+ *
+ * | 字段 | 上游给的 | 规范要求 | 处理 |
+ * |---|---|---|---|
+ * | `reasoning_content` | `""` | 无此字段（非官方扩展） | 空串时**删除** |
+ * | `function_call` | `null` | 已废弃 | `null` 时删除 |
+ * | `refusal` | `""` | 只有真拒绝时才有 | 空串时删除 |
+ * | `tool_calls` | `[]` | 只在有工具调用时出现 | 空数组时删除 |
+ * | `extra_fields` | `null` | 非规范字段 | 一律删除 |
+ * | `finish_reason` | `""` | `null` 或具体值 | 空串 → `null` |
+ *
+ * ⚠️ **只删「空值」，不删有内容的字段** —— 真在思考的模型（`reasoning_content`
+ * 非空）必须原样保留，那是有效信息。
+ */
+export function normalizeFrame(frame: Record<string, unknown>): void {
+  const choices = frame['choices']
+  if (!Array.isArray(choices)) return
+  for (const choice of choices) {
+    if (choice === null || typeof choice !== 'object') continue
+    const c = choice as Record<string, unknown>
+
+    // `finish_reason: ""` → `null`（规范里只有 null 或具体值）
+    if (c['finish_reason'] === '') c['finish_reason'] = null
+
+    const delta = c['delta']
+    if (delta === null || typeof delta !== 'object') continue
+    const d = delta as Record<string, unknown>
+
+    // ⚠️ 空串/空数组/null 一律**删除**，而不是保留空值 ——
+    // 「字段存在」本身就是客户端判断的依据（这正是本次缺陷的根源）。
+    if (d['reasoning_content'] === '') delete d['reasoning_content']
+    if (d['refusal'] === '') delete d['refusal']
+    if (d['function_call'] === null) delete d['function_call']
+    delete d['extra_fields']
+
+    if (Array.isArray(d['tool_calls'])) {
+      if (d['tool_calls'].length === 0) {
+        delete d['tool_calls']
+      } else {
+        normalizeToolCalls(d['tool_calls'])
+      }
+    }
+
+    // 空的 `role` 也没什么用，但它只在首帧出现且规范里合法 —— 保留。
+  }
+}
+
+/**
+ * 净化流式 `tool_calls` 片段（**agent 工具能否工作就看这里**）。
+ *
+ * ## ⚠️ 实测缺陷：后续片段的 `function.name` 是**空串**
+ *
+ * 上游流式工具调用的真实形状（实测抓取）：
+ *
+ * ```jsonc
+ * // 首帧：id / type / name 齐全
+ * {"id":"call_00_bkAcI…","type":"function",
+ *  "function":{"name":"get_weather","arguments":""},"index":0}
+ * // 后续帧：name 是**空串**，只有 arguments 在增量
+ * {"function":{"name":"","arguments":"{"},"index":0}
+ * {"function":{"name":"","arguments":"\""},"index":0}
+ * ```
+ *
+ * OpenAI 规范要求后续片段**省略** `name`，而不是给空串。
+ * 严格客户端（ZCode 这类 agent 工具）在累加片段时若用**赋值**
+ *（`call.function.name = frag.function.name`）而不是「非空才覆盖」，
+ * 工具名会被空串**覆盖掉** → 调用失败，而报错完全不指向真正原因。
+ *
+ * ## 处理
+ *
+ * - `function.name === ''` → 删除该键（保留 `arguments` 增量）；
+ * - `function.arguments === ''` → 删除（首帧那个空串同样有害）；
+ * - 其余片段原样保留。
+ *
+ * ⚠️ **不能因为 `name` 为空就丢弃整个片段** —— 那些片段承载着
+ * `arguments` 的增量，丢了参数就拼不完整。
+ */
+export function normalizeToolCalls(toolCalls: unknown[]): void {
+  for (const item of toolCalls) {
+    if (item === null || typeof item !== 'object') continue
+    const call = item as Record<string, unknown>
+    const fn = call['function']
+    if (fn === null || typeof fn !== 'object') continue
+    const f = fn as Record<string, unknown>
+    if (f['name'] === '') delete f['name']
+    if (f['arguments'] === '') delete f['arguments']
+  }
 }
 
 /** 生成一个错误帧（OpenAI 兼容形状），让客户端能看到失败原因。 */

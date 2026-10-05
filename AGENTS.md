@@ -1197,6 +1197,84 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 | **会话粘性** | — | ✅ **已修**，见下方更新记录 |
 | **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
 
+#### 本节更新记录（2026-10-05）：严格客户端兼容（ZCode 等 agent 工具）
+
+**背景**：用户把本服务接入 **ZCode 客户端**（一个 agent 工具）后报三个现象。
+实测后确认其中**两个是真缺陷**，第三个是上游账号状态。
+
+**① buddy 的 v4.1-flash「一直显示思考中，每次思考只有 1 个单词」**
+
+根因：buddy 上游**每帧**都带一批**非标准字段**（即使是空值）：
+
+```json
+{"delta":{"role":"assistant","content":"","reasoning_content":"",
+          "function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},
+ "finish_reason":""}
+```
+
+两条都会让严格客户端误判：
+
+1. `reasoning_content: ""` —— 客户端看到**字段存在**就认为「这是思考内容」，
+   于是把每帧那一个字的 `content` 当成思考碎片显示 ⇒「一直思考，每次 1 个单词」；
+2. **`finish_reason: ""`**（最隐蔽）—— 客户端普遍写
+   `if (finish_reason !== null) 流结束`，而 `"" !== null` 为**真**
+   ⇒ **每一帧**都被当成结束帧。规范里中间帧必须是 `null`。
+
+修法：`translateFrame` 增加**帧净化**（`normalizeFrame`）——
+空串/空数组/null 的非规范字段一律**删除**（不是保留空值），
+`finish_reason: ""` → `null`。判据先做**廉价字符串预检**（`needsNormalize`），
+只有含非规范字段时才付 `JSON.parse` 代价，保住 10ms CPU 纪律。
+
+**② 工具调用的后续片段 `function.name` 是空串（agent 工具的关键缺陷）**
+
+实测抓取的真实形状：
+
+```jsonc
+// 首帧：id / type / name 齐全
+{"id":"call_00_bkAcI…","type":"function",
+ "function":{"name":"get_weather","arguments":""},"index":0}
+// 后续帧：name 是**空串**，只有 arguments 增量
+{"function":{"name":"","arguments":"{"},"index":0}
+```
+
+OpenAI 规范要求后续片段**省略** `name`。严格客户端在累加片段时若用**赋值**
+（`call.function.name = frag.function.name`）而不是「非空才覆盖」，
+工具名会被空串**覆盖掉** → 调用失败，而报错完全不指向真正原因。
+已加 `normalizeToolCalls` 删除空的 `name`/`arguments`。
+
+⚠️ **不能因为 `name` 为空就丢弃整个片段** —— 那些片段承载 `arguments` 增量，
+丢了参数就拼不完整。实测验证：净化后只有 1 帧带 `name`，
+拼出的参数仍是完整的 `{"city": "北京"}`。
+
+**③ workbuddy 国际版「一会能用一会不能用」**
+
+根因：**同一条 429 有两种维度，而 provider 路径把它们混为一谈**。
+
+上游 6004 的原话是：
+> usage exceeds frequency limit … your usage will reset at 2026-10-05 14:47:23 UTC+8,
+> **alternatively, you can switch to the other** models
+
+「可以换用**其它模型**」= **模型级**限流。但 `handleProviderChat` 里硬编码
+`429 → soft`（**账号级**冷却）⇒ 而 global 只有 **1 个** workbuddy 账号
+⇒ 冷却期内**完全不可用**，真实情况却是「换个模型立刻就能用」。
+
+⚠️ 这个缺陷的形状值得记：**buddy 路径早已有 `refineModelScoped` 细分，
+provider 路径没有** —— 同一个 bug 只修了一半，而 report 走的是没修的那半。
+
+修法：provider 路径复用同一判据；并新增 `parseResetAt` 解析上游给的重置时刻
+（`reset at … UTC+8`），**按文案里的偏移换算**而不是用运行时本地时区
+（Worker 跑在 UTC，直接 `new Date(str)` 会差 8 小时）。
+
+**④ 不是缺陷的一项**：zcode 供应商的 405 `code 3012`「unusual activity」
+是他的账号/IP 被上游风控，与请求形状无关（实测：去掉 `Authorization` 回 401，
+带上任何 Authorization 都回 405；且官方身份块加不加都一样）。
+
+⚠️ **一条操作纪律（我违反了，记录备查）**：zcode 的代码注释**明确警告**
+「3012 有账号冷却惩罚（30 分钟；24h 内第 3 次起 24h；5 次停用）⇒
+**不要为了调试反复触发**」，而我为了定位问题对上游打了十几次真请求。
+**正确做法**：先读该供应商的错误分类注释，再决定探测策略 ——
+对「有惩罚性风控」的上游，探测必须**极其吝啬**，优先靠代码与日志推理。
+
 #### 本节更新记录（2026-10-04）
 
 **1. 图片入站 —— 从来就是通的，旧文档写错了**

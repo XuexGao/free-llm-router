@@ -85,14 +85,63 @@ export function mapErrorToPunishment(kind: ErrorKind): {
   }
 }
 
-/** 从业务码里再细分 6004（模型级）与 14017（账号级）。 */
-function refineModelScoped(kind: ErrorKind, bodyText: string): { dimension: 'soft' | 'model'; code: number | undefined } {
-  if (kind !== 'rate_limited') return { dimension: 'soft', code: undefined }
+/**
+ * 从业务码里再细分限流维度：6004 是**模型级**，14017 是**账号级**。
+ *
+ * ## ⚠️ 为什么必须细分（实测缺陷）
+ *
+ * 上游 6004 的原话是：
+ * > usage exceeds frequency limit, but don't worry, your usage will reset at
+ * > 2026-10-05 14:47:23 UTC+8, **alternatively, you can switch to the other** …
+ *
+ * 「你可以换用**其它模型**」—— 这明确是**模型级**限流。若把它当成账号级
+ * 冷却，后果是：**单个账号的供应商**（如只有 1 个 global 账号的 workbuddy）
+ * 会在冷却期内**完全不可用**，而真实情况是「换个模型立刻就能用」。
+ * 用户看到的现象正是「一会能用一会不能用」。
+ */
+export function refineModelScoped(
+  kind: ErrorKind,
+  bodyText: string,
+): { dimension: 'soft' | 'model'; code: number | undefined; resetAt: number | undefined } {
+  const code = parseBusinessCode(bodyText)
+  const resetAt = parseResetAt(bodyText)
+  if (kind !== 'rate_limited') return { dimension: 'soft', code, resetAt }
   // 6004 = 模型级限流（切模型即可用，不该罚整个账号）
+  if (code === 6004) return { dimension: 'model', code, resetAt }
+  return { dimension: 'soft', code, resetAt }
+}
+
+/** 从响应体里读业务码（`{"code":6004,...}`）。 */
+export function parseBusinessCode(bodyText: string): number | undefined {
   const m = /"code"\s*:\s*(\d+)/.exec(bodyText)
-  const code = m === null ? undefined : Number.parseInt(m[1] ?? '', 10)
-  if (code === 6004) return { dimension: 'model', code }
-  return { dimension: 'soft', code }
+  return m === null ? undefined : Number.parseInt(m[1] ?? '', 10)
+}
+
+/**
+ * 解析上游在限流文案里给出的**重置时刻**。
+ *
+ * 上游会明说何时恢复：`your usage will reset at 2026-10-05 14:47:23 UTC+8`。
+ * ⚠️ 用它而不是我们自己的退避估算 —— 上游知道真实的重置墙钟，
+ * 我们猜的（6h 起指数退避）要么过早（继续撞限流）要么过晚（白白少用几小时）。
+ *
+ * ⚠️ 时区必须按文案里的 `UTC+8` 偏移换算（**不能**用运行时本地时区：
+ * Worker 跑在 UTC，直接 `new Date(str)` 会差 8 小时）。
+ * 只认这一种实测到的格式；认不出就返回 undefined（回落到本地退避）。
+ */
+export function parseResetAt(bodyText: string): number | undefined {
+  const m = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText)
+  if (m === null) return undefined
+  const [, y, mo, d, h, mi, sec, sign, offRaw] = m
+  const offsetHours = Number.parseInt(offRaw ?? '0', 10) * (sign === '-' ? -1 : 1)
+  const utcMs = Date.UTC(
+    Number.parseInt(y ?? '0', 10),
+    Number.parseInt(mo ?? '1', 10) - 1,
+    Number.parseInt(d ?? '1', 10),
+    Number.parseInt(h ?? '0', 10),
+    Number.parseInt(mi ?? '0', 10),
+    Number.parseInt(sec ?? '0', 10),
+  ) - offsetHours * 60 * 60 * 1000
+  return Number.isFinite(utcMs) ? utcMs : undefined
 }
 
 /** 选号 + 取凭据。 */
@@ -351,7 +400,7 @@ export async function handleChatCompletions(
       const text = await upstream.text().catch(() => '')
       const { kind, msg } = classify(upstream.status, text)
       const mapped = mapErrorToPunishment(kind)
-      const { dimension } = refineModelScoped(kind, text)
+      const { dimension, resetAt } = refineModelScoped(kind, text)
 
       // ⚠️ WAF 403 需要**双记账**：
       // ① 账号级软冷却（下方 applyFailure）—— 让这个号暂时别用；
@@ -377,6 +426,10 @@ export async function handleChatCompletions(
             kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
             now: Date.now(),
             ...(model !== '' ? { model } : {}),
+            // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`）。
+            // 模型级冷却据此对齐上游墙钟，而不是我们自己猜 6 小时指数退避 ——
+            // 猜早了会继续撞限流，猜晚了白白少用几小时。
+            ...(resetAt !== undefined ? { resetAt } : {}),
             ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
           })
           .catch(() => {
@@ -823,12 +876,32 @@ async function handleProviderChat(input: {
       }
 
       const rotate = provider.shouldRotate?.(upstream.status, text) ?? (upstream.status === 429 || upstream.status === 402)
+
+      // ⚠️ **429 不能一律当账号级冷却**（实测缺陷，用户报「一会能用一会不能用」）。
+      //
+      // 上游 6004 说的是「usage exceeds frequency limit … alternatively, you can
+      // switch to the other models」= **模型级**限流。而这条 provider 路径原先
+      // 硬编码 `429 → soft`（账号级），于是**单个账号的供应商**
+      //（如只有 1 个 global 账号的 workbuddy）在冷却期**完全不可用**。
+      //
+      // 复用与 buddy 路径相同的细分判据，避免两条路径口径分叉
+      //（此前 buddy 路径已细分、这里没有 —— 同一个 bug 修了一半）。
+      const refined = refineModelScoped(upstream.status === 429 ? 'rate_limited' : 'unknown', text)
+      const failureKind: 'soft' | 'hard' | 'model' | 'breaker' =
+        upstream.status === 402
+          ? 'hard'
+          : upstream.status === 429
+            ? refined.dimension
+            : 'breaker'
       await pool
         .applyFailure({
           uid: picked.uid,
-          kind: upstream.status === 429 ? 'soft' : upstream.status === 402 ? 'hard' : 'breaker',
+          kind: failureKind,
           now: Date.now(),
           ...(model !== '' ? { model } : {}),
+          // ⚠️ 带上上游给的重置时刻（文案里有 `reset at … UTC+8`）：
+          // 模型级冷却据此对齐上游墙钟，而不是我们自己猜 6 小时。
+          ...(refined.resetAt !== undefined ? { resetAt: refined.resetAt } : {}),
           reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
         })
         .catch(() => {})

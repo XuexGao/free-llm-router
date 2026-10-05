@@ -26,17 +26,9 @@ import {
   sanitizeChatBody,
   translateMaxCompletionTokens,
 } from '../src/gateway/payload.ts'
-import {
-  detectErrorFrame,
-  doneFrame,
-  errorFrame,
-  parseSseLine,
-  sseHeaders,
-  translateFrame,
-  aggregateSse,
-} from '../src/gateway/stream.ts'
+import { aggregateSse, detectErrorFrame, doneFrame, errorFrame, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
 import { extractModels } from '../src/gateway/models.ts'
-import { isAuthLikeFailure, mapErrorToPunishment } from '../src/gateway/server.ts'
+import { isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, refineModelScoped } from '../src/gateway/server.ts'
 
 // ─────────────────────── max_completion_tokens 翻译 ───────────────────────
 
@@ -654,4 +646,142 @@ test('⚠️ 绑定会话必须在成功后（首帧到达）才做，且用 wai
       `bindSession 必须包在 waitUntil 里（否则流一结束就被取消）：${line.trim().slice(0, 80)}`,
     )
   }
+})
+
+// ─────────────── 帧净化（严格客户端兼容：ZCode 等 agent 工具） ───────────────
+
+test('⚠️ 空串的 reasoning_content 必须删除（否则客户端一直显示"思考中"）', () => {
+  // 实测（用户报障）：buddy 的 v4.1-flash 每帧都带 `reasoning_content: ""`，
+  // 严格客户端看到「字段存在」就当成思考内容 ⇒ 每帧一个字的 content
+  // 被显示成思考碎片 = 「一直思考，每次只有 1 个单词」。
+  const frame = {
+    choices: [{ index: 0, delta: { role: 'assistant', content: '你好', reasoning_content: '' }, finish_reason: '' }],
+  }
+  normalizeFrame(frame)
+  const d = (frame.choices[0] as { delta: Record<string, unknown> }).delta
+  assert.equal('reasoning_content' in d, false, '空串 reasoning_content 必须删除')
+  assert.equal(d['content'], '你好', '正文必须保留')
+})
+
+test('⚠️ 有内容的 reasoning_content 必须保留（那是有效信息）', () => {
+  // ⚠️ 只删「空值」。真在推理的模型必须原样透传，否则用户看不到思考过程。
+  const frame = { choices: [{ delta: { reasoning_content: '让我想想…' } }] }
+  normalizeFrame(frame)
+  const d = (frame.choices[0] as { delta: Record<string, unknown> }).delta
+  assert.equal(d['reasoning_content'], '让我想想…')
+})
+
+test('⚠️ 中间帧的 finish_reason 必须从空串改成 null（否则第一帧就被判流结束）', () => {
+  // ⚠️ 这是最隐蔽的一条：客户端普遍写 `if (finish_reason !== null) 流结束`。
+  // `"" !== null` 为**真** ⇒ **每一帧**都被当成结束帧，客户端立刻停止读取，
+  // 表现为「一直显示思考中 / 没有输出」。规范里中间帧必须是 `null`。
+  const frame = { choices: [{ delta: { content: 'a' }, finish_reason: '' }] }
+  normalizeFrame(frame)
+  assert.equal(frame.choices[0]!.finish_reason, null, '空串必须改成 null')
+
+  // 真实的结束原因必须**原样保留**
+  const end = { choices: [{ delta: {}, finish_reason: 'stop' }] }
+  normalizeFrame(end)
+  assert.equal(end.choices[0]!.finish_reason, 'stop')
+})
+
+test('⚠️ 工具调用后续片段的空 function.name 必须删除（否则工具名被覆盖）', () => {
+  // 实测抓取：上游首帧给 id/name，后续帧 `name: ""` 只有 arguments 增量。
+  // 规范要求后续片段**省略** name。agent 客户端若用赋值累加，
+  // 工具名会被空串覆盖 → 调用失败，且报错完全不指向真正原因。
+  const frame = {
+    choices: [{
+      delta: {
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '' }, index: 0 },
+          { function: { name: '', arguments: '{"city"' }, index: 0 },
+        ],
+      },
+    }],
+  }
+  normalizeFrame(frame)
+  const calls = (frame.choices[0] as { delta: { tool_calls: Array<{ function: Record<string, unknown> }> } }).delta.tool_calls
+  assert.equal('name' in calls[0]!.function, true, '首帧的 name 必须保留')
+  assert.equal(calls[0]!.function['name'], 'get_weather')
+  assert.equal('arguments' in calls[0]!.function, false, '首帧的空 arguments 应删除')
+  assert.equal('name' in calls[1]!.function, false, '后续帧的空 name 必须删除')
+  assert.equal(calls[1]!.function['arguments'], '{"city"', '⚠️ arguments 增量必须保留（丢了参数就拼不完整）')
+})
+
+test('⚠️ 空的 tool_calls 数组必须删除（但非空的不可丢）', () => {
+  const empty = { choices: [{ delta: { tool_calls: [] } }] }
+  normalizeFrame(empty)
+  assert.equal('tool_calls' in (empty.choices[0] as { delta: Record<string, unknown> }).delta, false)
+
+  const nonEmpty = { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'x' } }] } }] }
+  normalizeFrame(nonEmpty)
+  assert.equal(
+    (nonEmpty.choices[0] as { delta: { tool_calls: unknown[] } }).delta.tool_calls.length, 1,
+  )
+})
+
+test('⚠️ needsNormalize 必须覆盖 tool_calls（否则工具帧不被净化）', () => {
+  // ⚠️ 漏掉 tool_calls 会让「空 name 覆盖工具名」的缺陷**只在工具调用时**出现，
+  // 而普通对话测试完全发现不了 —— 这正是它危险的地方。
+  assert.equal(needsNormalize('{"choices":[{"delta":{"tool_calls":[{"id":"x"}]}}]}'), true)
+  assert.equal(needsNormalize('{"choices":[{"delta":{"reasoning_content":""}}]}'), true)
+  assert.equal(needsNormalize('{"choices":[{"delta":{"content":"普通帧"}}]}'), false,
+    '普通帧不该走解析路径（省 CPU）')
+})
+
+test('⚠️ translateFrame 端到端：净化后的帧是严格 OpenAI 形状', () => {
+  const raw = JSON.stringify({
+    id: 'x', object: 'chat.completion.chunk',
+    choices: [{
+      index: 0,
+      delta: { role: 'assistant', content: 'hi', reasoning_content: '', function_call: null, refusal: '', tool_calls: [], extra_fields: null },
+      finish_reason: '',
+    }],
+  })
+  const out = translateFrame(raw)
+  assert.ok(out.startsWith('data: '), 'SSE 前缀')
+  assert.ok(out.endsWith('\n\n'), 'SSE 结尾')
+  const parsed = JSON.parse(out.slice(6).trim())
+  assert.deepEqual(Object.keys(parsed.choices[0].delta).sort(), ['content', 'role'],
+    '只剩规范字段')
+  assert.equal(parsed.choices[0].finish_reason, null, '空串已改成 null')
+})
+
+// ─────────── 6004 模型级限流：不能罚整个账号（用户报「一会能用一会不能用」） ───────────
+
+test('⚠️ 6004 必须判为**模型级**限流，不是账号级', () => {
+  // 实测（用户报障）：workbuddy 国际版「一会能用一会不能用」。
+  // 上游原文：`{"code":6004,"msg":"usage exceeds frequency limit, but don't worry,
+  // your usage will reset at 2026-10-05 14:47:23 UTC+8, alternatively, you can
+  // switch to the other models"}` —— 「**可以换用其它模型**」= 模型级限流。
+  //
+  // ⚠️ 若判成账号级：**单账号的供应商**（global 只有 1 个 workbuddy 账号）
+  // 会在冷却期内**完全不可用**，而真实情况是「换个模型立刻就能用」。
+  const body = '{"code":6004,"msg":"usage exceeds frequency limit, alternatively, you can switch to the other models"}'
+  const got = refineModelScoped('rate_limited', body)
+  assert.equal(got.dimension, 'model', '6004 必须罚模型维度')
+  assert.equal(got.code, 6004)
+})
+
+test('⚠️ 14017 等其它限流码仍是账号级（不能一律都罚模型）', () => {
+  // ⚠️ 配对的**反向**用例：若把「凡 rate_limited 都判 model」写进去，
+  // 账号级限流就永远不会冷却账号 —— 那会让坏号被反复使用。
+  const got = refineModelScoped('rate_limited', '{"code":14017,"msg":"too many requests"}')
+  assert.equal(got.dimension, 'soft', '14017 是账号级软冷却')
+})
+
+test('⚠️ 必须解析上游给的重置时刻（UTC+8 要正确换算）', () => {
+  // 上游会明说何时恢复。用自己的退避估算要么过早（继续撞限流）
+  // 要么过晚（白白少用几小时）—— 上游知道真实的重置墙钟。
+  const ms = parseResetAt('your usage will reset at 2026-10-05 14:47:23 UTC+8')
+  assert.notEqual(ms, undefined, '应能解析')
+  // 14:47:23 UTC+8 == 06:47:23 UTC
+  assert.equal(new Date(ms!).toISOString(), '2026-10-05T06:47:23.000Z',
+    '⚠️ 必须按文案里的 UTC+8 换算，不能按运行时本地时区（Worker 跑在 UTC，会差 8 小时）')
+})
+
+test('⚠️ 认不出的重置时刻必须返回 undefined（回落本地退避，不编造）', () => {
+  assert.equal(parseResetAt('no time here'), undefined)
+  assert.equal(parseResetAt('{"code":6004,"msg":"limit"}'), undefined)
+  // ⚠️ 编造一个时间会让账号在错误的时刻被解锁，比不解析更糟。
 })
