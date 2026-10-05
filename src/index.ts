@@ -58,6 +58,7 @@ const CLINE_DEVICE_MIN_INTERVAL_MS = 1_000
  */
 const CLINE_LOGIN_SESSION_GRACE_MS = 60_000
 import type { AccountState } from './pool/state.js'
+import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleChatCompletions } from './gateway/server.js'
@@ -1891,31 +1892,66 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     // 账号按凭据里的 realm 分片存（如 WorkBuddy 国际版的凭据 realm 就是 global），
     // 只查 cn 会让国际版账号「看起来不存在」—— 实测踩到：
     // 面板显示「没有该供应商的账号」，而账号其实好好地存在 global 里。
-    let account: AccountState | undefined
     let pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    // ⚠️ **逐个账号尝试，而不是取第一个**（实测缺陷，用户报「商汤账号又不行了」）。
+    //
+    // 原实现是 `accounts.find(...)` —— 拿**第一个**该供应商的账号就去拉目录。
+    // 但池里可能有多个账号（实测商汤有 2 个），**第一个恰好是坏号**
+    //（refresh_token 已失效）时，整个目录请求就失败了 —— 而另一个好号
+    // 明明能正常拉取、也正是 `chat`（走 `pick()`，会自动跳过坏号）在用的那个。
+    //
+    // 表现极具误导性：**同一个账号 chat 完全正常，模型列表却报
+    // 「登录态已过期」** —— 用户会以为整个账号废了，实际只是选号策略不一致。
+    //
+    // ⇒ 与 chat 对齐：**健康的账号优先，坏的跳过**。
+    // 只有全部账号都失败时，才回报（并带上最后一个错误供排查）。
+    const candidates: Array<{ pool: DurableObjectStub<AccountPoolDO>; uid: string }> = []
     for (const realm of ['cn', 'global']) {
       const candidatePool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
       const accounts = await candidatePool.listAccounts(realm, Date.now())
-      const hit = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId)
-      if (hit !== undefined) {
-        account = hit
-        pool = candidatePool
-        break
+      for (const a of accounts) {
+        if ((a.provider ?? DEFAULT_PROVIDER) !== providerId) continue
+        // ⚠️ 跳过明确不可用的账号：它们大概率还是失败，白打上游一次
+        //（也避免在 refresh_token 已失效时反复尝试续期 —— 那是**终态**，
+        // 重试只会浪费一次请求）。判据与 `pick()` 的健康检查保持一致。
+        if (a.disabled === true) continue
+        if (a.until > Date.now() || a.breakerUntil > Date.now()) continue
+        candidates.push({ pool: candidatePool, uid: a.uid })
       }
     }
-    if (account === undefined) {
-      return json({ provider: providerId, models: [], note: '没有该供应商的账号，无法拉取模型目录' })
+    if (candidates.length === 0) {
+      return json({ provider: providerId, models: [], note: '没有该供应商的可用账号，无法拉取模型目录' })
     }
-    const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
-    if (credential === undefined) return jsonError(404, '该账号无凭据', 'no_credential')
     // ⚠️ 只有国内版（buddy）需要绑定 env —— 它允许用 env 覆盖域名便于调试；
     // 国际版恒用官方域名。
     const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
-    try {
-      // ⚠️ 走续期重试：过期令牌不该让用户看到「凭据坏了」
-      const { value: models } = await withRefreshRetry(env, pool, providerId, credential, (c) =>
-        bound.listModels(c, AbortSignal.timeout(20_000)),
+    let models: ProviderModel[] | undefined
+    let lastError: unknown
+    for (const cand of candidates) {
+      const credential = (await cand.pool.getCredential(cand.uid)) as ProviderCredential | undefined
+      if (credential === undefined) continue
+      try {
+        // ⚠️ 走续期重试：过期令牌不该让用户看到「凭据坏了」
+        const got = await withRefreshRetry(env, cand.pool, providerId, credential, (c) =>
+          bound.listModels(c, AbortSignal.timeout(20_000)),
+        )
+        models = got.value
+        pool = cand.pool
+        break
+      } catch (error) {
+        // ⚠️ **单个账号失败不终止**：换下一个继续试。
+        // 全部失败时把**最后一个**错误如实回报（不静默、不编造）。
+        lastError = error
+      }
+    }
+    if (models === undefined) {
+      return jsonError(
+        502,
+        lastError instanceof Error ? lastError.message : String(lastError ?? '模型目录拉取失败'),
+        'list_models_failed',
       )
+    }
+    {
       // 带上「是否被用户停用」标记，供面板渲染开关
       // ⚠️ 合并**两个分片**的停用列表：停用记录是按供应商存在各自分片里的，
       // 只看当前分片会让「在另一个分片关掉的模型」重新显示为启用。
@@ -1929,8 +1965,6 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         models: models.map((m) => ({ ...m, disabled: set.has(m.id) })),
         disabledCount: set.size,
       })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'list_models_failed')
     }
   }
 

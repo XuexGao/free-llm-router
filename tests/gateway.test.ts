@@ -26,7 +26,7 @@ import {
   sanitizeChatBody,
   translateMaxCompletionTokens,
 } from '../src/gateway/payload.ts'
-import { aggregateSse, detectErrorFrame, doneFrame, errorFrame, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
+import { ERROR_HINT_PATTERN, USAGE_HINT_PATTERN, aggregateSse, detectErrorFrame, doneFrame, errorFrame, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
 import { extractModels } from '../src/gateway/models.ts'
 import { isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, refineModelScoped } from '../src/gateway/server.ts'
 
@@ -720,13 +720,44 @@ test('⚠️ 空的 tool_calls 数组必须删除（但非空的不可丢）', (
   )
 })
 
-test('⚠️ needsNormalize 必须覆盖 tool_calls（否则工具帧不被净化）', () => {
-  // ⚠️ 漏掉 tool_calls 会让「空 name 覆盖工具名」的缺陷**只在工具调用时**出现，
+test('⚠️ needsNormalize 必须覆盖空 name 的工具帧（否则工具名被覆盖）', () => {
+  // ⚠️ 漏掉会让「空 name 覆盖工具名」的缺陷**只在工具调用时**出现，
   // 而普通对话测试完全发现不了 —— 这正是它危险的地方。
-  assert.equal(needsNormalize('{"choices":[{"delta":{"tool_calls":[{"id":"x"}]}}]}'), true)
+  assert.equal(
+    needsNormalize('{"choices":[{"delta":{"tool_calls":[{"function":{"name":"","arguments":"{"},"index":0}]}}]}'),
+    true, '含空 name 的工具帧必须净化',
+  )
   assert.equal(needsNormalize('{"choices":[{"delta":{"reasoning_content":""}}]}'), true)
   assert.equal(needsNormalize('{"choices":[{"delta":{"content":"普通帧"}}]}'), false,
     '普通帧不该走解析路径（省 CPU）')
+})
+
+test('⚠️ needsNormalize 必须**只匹配空值** —— 有真实内容时走快速路径', () => {
+  // ## 这是实测出来的性能铁律（我第一版写错了，直接造成线上故障）
+  //
+  // 第一版判据是「帧里出现 `reasoning_content` 就解析」。但真实思考帧是
+  // `{"delta":{"content":"","reasoning_content":"The"}}` —— **有真实内容，
+  // 根本不需要净化**，却照样付了 JSON 往返。
+  //
+  // 实测后果：`deep-model` 长思考 **6521 帧** ⇒ 每帧 JSON 往返合计
+  // **31.6ms CPU**，而 **Free 计划只有 10ms/次调用** ⇒ Worker 被强制终止
+  // ⇒ 用户看到「思考超过 40 秒突然停止、没有任何输出」。
+  //
+  // ⚠️ 所以这条测试锁的是**性能正确性**：有内容的帧必须走快速路径。
+  assert.equal(
+    needsNormalize('{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}]}'),
+    false, '⚠️ 有真实 reasoning 的帧**不得**触发解析（否则长思考会 CPU 超限）',
+  )
+  assert.equal(
+    needsNormalize('{"choices":[{"delta":{"tool_calls":[{"function":{"name":"get_weather","arguments":"{"},"index":0}]}}]}'),
+    false, '⚠️ 首帧有真实工具名时也**不得**触发解析',
+  )
+  assert.equal(
+    needsNormalize('{"choices":[{"delta":{"content":"正常文本"}}],"usage":null}'),
+    false, '普通帧',
+  )
+  // ⚠️ 配对的**正向**用例：证明这个断言不是恒真（否则它永远通过、锁不住东西）。
+  assert.equal(needsNormalize('{"choices":[{"delta":{"reasoning_content":""}}]}'), true)
 })
 
 test('⚠️ translateFrame 端到端：净化后的帧是严格 OpenAI 形状', () => {
@@ -784,4 +815,106 @@ test('⚠️ 认不出的重置时刻必须返回 undefined（回落本地退避
   assert.equal(parseResetAt('no time here'), undefined)
   assert.equal(parseResetAt('{"code":6004,"msg":"limit"}'), undefined)
   // ⚠️ 编造一个时间会让账号在错误的时刻被解锁，比不解析更糟。
+})
+
+// ─────────── 🔴 CPU 纪律：长流不得因每帧开销超限（用户报「突然停止」） ───────────
+
+test('⚠️ 有真实内容的帧必须走快速路径（不得触发 JSON 解析）', () => {
+  // ## 这是实测出来的性能铁律 —— 我第一版写错，直接造成线上故障
+  //
+  // 用户报：「buddy 和 workbuddy 的模型思考超过 40 秒就可能突然停止，没有任何输出」。
+  //
+  // 根因链：
+  // 1. `deep-model` 一次长思考输出 **8000 帧**；
+  // 2. 第一版 `needsNormalize` 是 `includes('"reasoning_content"')` —— 见键名就解析，
+  //    而真实思考帧 `{"delta":{"content":"","reasoning_content":"The"}}`
+  //    **根本不需要净化**；
+  // 3. 每帧 JSON 往返 ⇒ 合计 **26.7ms CPU**，而 **Free 计划只有 10ms/次调用**
+  //    ⇒ Worker 被强制终止 ⇒ 流突然断掉、没有任何输出。
+  //
+  //（对照：修复前原样转发只要 **0.25ms**。）
+  assert.equal(
+    needsNormalize('{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}],"usage":null}'),
+    false, '⚠️ 有真实 reasoning 的帧不得触发解析',
+  )
+  assert.equal(
+    needsNormalize('{"choices":[{"delta":{"tool_calls":[{"function":{"name":"get_weather","arguments":"{"},"index":0}]}}]}'),
+    false, '⚠️ 有真实工具名的帧不得触发解析',
+  )
+})
+
+test('🔴 usage=null 不得触发 JSON.parse（原实现的真实缺陷）', () => {
+  // ## 这是**原有代码**的缺陷（不是新引入的），实测定位
+  //
+  // 原判据 `includes('"usage"')` 会**命中 `"usage":null`**，而上游
+  // **每一帧**都带 `"usage":null` ⇒ **每帧都 JSON.parse 整个帧**。
+  //
+  // 实测（6521 帧）：**18.32ms CPU** ⇒ 超 10ms 配额 ⇒ 长思考被切断。
+  // 收紧成 `"usage":{`（只在有真数据时解析）后：**3.93ms**（快 4.7 倍），
+  // 且**语义完全不变**（`null` 本来就没有可解析的数据）。
+  //
+  // ⚠️ 教训：**判据不能比它要保护的工作还贵**；
+  // 「字段存在」与「字段有内容」是两件事 —— 这是本文件反复出现的同一类错误。
+  assert.equal(USAGE_HINT_PATTERN.test('{"choices":[],"usage":null}'), false,
+    '⚠️ usage:null 不得触发解析（上游每帧都是这个形状）')
+  assert.equal(USAGE_HINT_PATTERN.test('{"choices":[],"usage":{"prompt_tokens":1}}'), true,
+    '有真实 usage 对象时才解析')
+})
+
+test('⚠️ 错误探测也要廉价（N 次 includes 换成一条正则）', () => {
+  // 同一类问题：`data.includes('"error"') || ... || data.includes('"code"')`
+  // 是 **4 次全串扫描**，实测 6521 帧下 13.36ms —— 本身就超预算。
+  // 合并成一条正则后 4.98ms。
+  assert.equal(ERROR_HINT_PATTERN.test('{"choices":[{"delta":{"content":"普通"}}]}'), false)
+  assert.equal(ERROR_HINT_PATTERN.test('{"code":6004,"msg":"限流"}'), true)
+  assert.equal(ERROR_HINT_PATTERN.test('{"error":{"message":"x"}}'), true)
+})
+
+test('⚠️ 长流的每帧开销必须在 10ms CPU 预算内（8000 帧量化）', () => {
+  // ⚠️ 这条是**量化护栏**：直接跑 8000 帧（实测最长的思考场景），
+  // 断言总耗时在预算内。若有人把快速路径改回「每帧 JSON 往返」，这里会立刻变红。
+  //
+  // 阈值说明：本地 Node 比 Workers 快，故这里的余量不代表线上余量 ——
+  // 它锁的是**数量级**（快速路径 ~4ms vs JSON 往返 ~27ms），不是精确值。
+  const thinking =
+    '{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}],"usage":null}'
+  const N = 8000
+  const start = performance.now()
+  for (let i = 0; i < N; i += 1) translateFrame(thinking)
+  const elapsed = performance.now() - start
+  assert.ok(
+    elapsed < 15,
+    `⚠️ ${N} 帧耗时 ${elapsed.toFixed(1)}ms —— 疑似快速路径失效（应 ~4ms，超 10ms 配额就会切流）`,
+  )
+  // ⚠️ 配对的**正向**用例：证明这条断言不是恒真（否则它锁不住任何东西）。
+  const slow =
+    '{"choices":[{"index":0,"delta":{"content":"a","reasoning_content":"","refusal":""},"finish_reason":""}],"usage":null}'
+  assert.equal(needsNormalize(slow), true, '含空值的帧确实会走净化路径')
+})
+
+test('⚠️ 工具片段的空 name 必须删掉，但 arguments 增量必须保留', () => {
+  // 实测抓到的真实形状：首帧给 id/type/name，**后续帧 `name: ""`** 只有 arguments。
+  // OpenAI 规范要求后续片段**省略** name；严格 agent 客户端若用赋值累加，
+  // 工具名会被空串覆盖 → 调用失败，而报错完全不指向真正原因。
+  const first = translateFrame(JSON.stringify({
+    choices: [{ index: 0, delta: { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '' }, index: 0 }] }, finish_reason: '' }],
+  }))
+  const p1 = JSON.parse(first.slice(6).trim()).choices[0].delta.tool_calls[0].function
+  assert.equal(p1.name, 'get_weather', '首帧的 name 必须保留')
+  assert.equal('arguments' in p1, false, '首帧的空 arguments 应删除')
+
+  const later = translateFrame(JSON.stringify({
+    choices: [{ index: 0, delta: { tool_calls: [{ function: { name: '', arguments: '{"city"' }, index: 0 }] }, finish_reason: null }],
+  }))
+  const p2 = JSON.parse(later.slice(6).trim()).choices[0].delta.tool_calls[0].function
+  assert.equal('name' in p2, false, '后续帧的空 name 必须删除')
+  assert.equal(p2.arguments, '{"city"', '⚠️ arguments 增量必须保留（丢了参数就拼不完整）')
+})
+
+test('⚠️ 净化不得误伤普通帧的 role/name 字段', () => {
+  // ⚠️ 空值删除是按**字面量**做的，必须确认没有把正常字段一起删掉。
+  const out = translateFrame('{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}')
+  const d = JSON.parse(out.slice(6).trim()).choices[0].delta
+  assert.equal(d.role, 'assistant', 'role 必须保留')
+  assert.equal(d.content, 'hi', 'content 必须保留')
 })

@@ -28,7 +28,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
-import { aggregateSse, detectErrorFrame, doneFrame, errorFrame, parseSseLine, sseHeaders, translateFrame } from './stream.js'
+import { ERROR_HINT_PATTERN, USAGE_HINT_PATTERN, aggregateSse, detectErrorFrame, doneFrame, errorFrame, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
@@ -569,7 +569,7 @@ function streamResponse(
                 hooks.onFirstChunk()
               }
               // 只在**可能**是错误帧时才解析（正常帧原样转发，省 CPU）
-              if (frame.data.includes('"error"') || frame.data.includes('"statusCodeValue"') || frame.data.includes('"stackTrace"') || frame.data.includes('"code"')) {
+              if (ERROR_HINT_PATTERN.test(frame.data)) {
                 const errMsg = tryDetectError(frame.data)
                 if (errMsg !== undefined) {
                   hooks.onError(errMsg)
@@ -580,7 +580,7 @@ function streamResponse(
               }
               sawChunk = true
               // 只在字面量含 usage 时才解析（省 CPU）
-              if (frame.data.includes('"usage"')) {
+              if (USAGE_HINT_PATTERN.test(frame.data)) {
                 try {
                   const parsed = JSON.parse(frame.data) as { usage?: { prompt_tokens?: number; completion_tokens?: number } }
                   const u = parsed.usage

@@ -12,6 +12,16 @@
  */
 
 import { test } from 'node:test'
+
+/**
+ * 剥掉 `//` 行注释与 `/* *\/` 块注释后再做源码断言。
+ *
+ * ⚠️ 必需：本仓库的注释里会**大量引用反例**（如「原实现是 `accounts.find(...)`」），
+ * 朴素的字符串搜索会把注释当成代码 ⇒ **误报**。实测踩到过一次。
+ */
+function stripComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { splitModelName } from '../src/providers/types.ts'
@@ -686,4 +696,48 @@ test('⚠️ 登录卡片必须留页面内边距（否则手机上顶到屏幕�
   const rule = /\.login-body\s*\{([^}]*)\}/.exec(cssCode)
   assert.notEqual(rule, null, '应有 .login-body 规则')
   assert.ok(/padding:/.test(rule?.[1] ?? ''), '登录页容器必须有内边距')
+})
+
+test('⚠️ 模型目录必须逐个账号尝试，不能只取第一个（商汤报障的根因）', () => {
+  // ## 实测缺陷（用户报「商汤账号怎么又不行了，明明是用微信扫码登录的」）
+  //
+  // 原实现是 `accounts.find(...)` —— 拿**第一个**该供应商的账号就去拉目录。
+  // 而池里可能有多个账号（实测商汤有 2 个），**第一个恰好是坏号**
+  //（refresh_token 已失效）时，整个目录请求就失败；另一个好号明明能拉，
+  // 而且正是 `chat`（走 `pick()`，会自动跳过坏号）在用的那个。
+  //
+  // ## 为什么这个缺陷极具误导性
+  //
+  // 表现为「**同一个账号 chat 完全正常，模型列表却报登录态已过期**」——
+  // 用户会以为整个账号废了，实际只是两条路径的**选号策略不一致**。
+  //
+  // ⚠️ 这类缺陷的形状：**同一份数据、两条路径、两种选号方式**。
+  // 修一处不够，必须让两条路径的判据一致。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("if (path === '/admin/providers/models'")
+  assert.ok(i > 0, '应能找到模型目录端点')
+  // ⚠️ **必须先剥掉注释再断言** —— 修缺陷时我会在注释里写下「原实现是
+  // `accounts.find(...)`」作为反例，而那会让朴素的源码搜索**误报**。
+  //（本仓库其它测试也踩过同一个坑：注释里提到禁用字符会误伤。）
+  const block = stripComments(src.slice(i, i + 6000))
+
+  // 不得再用 find 取第一个
+  assert.ok(
+    !/accounts\.find\(/.test(block),
+    '⚠️ 不得用 `accounts.find()` 只取第一个账号 —— 坏号会拖垮整个目录请求',
+  )
+  // 必须是收集候选 + 逐个尝试
+  assert.ok(/candidates\.push\(/.test(block), '应收集全部候选账号')
+  assert.ok(/for \(const cand of candidates\)/.test(block), '应逐个尝试候选账号')
+})
+
+test('⚠️ 模型目录的候选筛选必须与 chat 的健康判据一致', () => {
+  // ⚠️ 只遍历而不筛健康状态，等于把坏号也算进重试 —— 白打上游，
+  // 且在 refresh_token 已失效（**终态**）时反复触发续期请求。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("if (path === '/admin/providers/models'")
+  const block = src.slice(i, i + 6000)
+  assert.ok(/a\.disabled === true/.test(block), '应跳过 disabled 账号')
+  assert.ok(/a\.until > Date\.now\(\)/.test(block), '应跳过冷却中的账号')
+  assert.ok(/a\.breakerUntil > Date\.now\(\)/.test(block), '应跳过熔断的账号')
 })
