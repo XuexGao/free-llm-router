@@ -70,6 +70,23 @@ const MODEL_COST_TTL_MS = 6 * 60 * 60 * 1000
 export const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000
 
 /**
+ * 防惊群的「冷却窗口」：{@link SPREAD_WINDOW_MS} 内刚被选中过的账号，
+ * 下次选号会被**优先排除**（除非排除后一个不剩）。
+ *
+ * ## 为什么需要（实测缺陷）
+ *
+ * 上游对**同一账号的并发流**不友好：后来者会把先前的流**踢掉** ⇒
+ * 用户看到「长回答中途突然停止、没有任何输出」。
+ * 纯加权随机每次都独立掷骰，完全可能连中同一账号。
+ *
+ * 值取 3 秒：足够把「并发几秒内到达的请求」摊开，
+ * 又不至于让账号在半天内被闲置（长回答动辄几十秒，
+ * 窗口太长会让后续单发请求也被迫换号，反而丢 prompt cache）。
+ */
+export const SPREAD_WINDOW_MS = 3_000
+
+
+/**
  * IP 级 WAF 拦截的判定窗口与阈值。
  *
  * ## 为什么需要「IP 级」这一层（Go 侧 `internal/server/wafip.go` 的教训）
@@ -285,23 +302,75 @@ export class AccountPoolDO extends DurableObject<Env> {
     const preferred = request.preferred ?? ''
     if (preferred !== '') {
       const hit = candidates.find((s) => s.uid === preferred)
-      if (hit !== undefined) return { uid: hit.uid, state: hit }
+      if (hit !== undefined) {
+        this.notePicked(hit.uid, now)
+        return { uid: hit.uid, state: hit }
+      }
     }
 
-    const weights = candidates.map((s) => 1 + Math.max(0, s.credits) / 100)
+    // ⚠️ **防惊群：并发请求要摊到不同账号**（实测踩到的严重缺陷）。
+    //
+    // ## 为什么必须做（用户报「思考 78 秒又断了」）
+    //
+    // 上游对**同一账号的并发流**不友好：后来者会把先前的流**踢掉**，
+    // 表现为「长回答中途突然停止、没有任何输出」。
+    //
+    // 实测对照（3 个相同 prompt 并发）：
+    // - 加粘性前/未摊开 ⇒ **1 个被切断**；
+    // - 强制落到不同账号 ⇒ **3/3 全部完整**。
+    //
+    // ⇒ 纯加权随机不够：它**每次都独立掷骰**，完全可能连中同一个账号。
+    //
+    // ## 做法：优先选「最近没被选中」的账号
+    //
+    // 在 `pick()` 时给账号打一个时间戳，下次选号**优先排除**
+    // 「{@link SPREAD_WINDOW_MS} 内刚被选中过」的账号。
+    // 若排除后一个都不剩，**就回落到全部候选**（绝不因此报「无可用账号」）。
+    //
+    // ⚠️ **刻意放在 `preferred` 之后**：显式声明了会话的客户端
+    //（`user` / `conversation_id`）**优先保 prompt cache**，不参与摊开。
+    // 只有「没声明会话」的请求才摊 —— 它们本来就没有缓存可命中。
+    const fresh = candidates.filter((s) => now - this.notePickedAt(s.uid) >= SPREAD_WINDOW_MS)
+    const pool = fresh.length > 0 ? fresh : candidates
+
+    const weights = pool.map((s) => 1 + Math.max(0, s.credits) / 100)
     const total = weights.reduce((a, b) => a + b, 0)
     let roll = Math.random() * total
-    for (let i = 0; i < candidates.length; i += 1) {
+    for (let i = 0; i < pool.length; i += 1) {
       roll -= weights[i] ?? 0
       if (roll <= 0) {
-        const chosen = candidates[i]
-        if (chosen !== undefined) return { uid: chosen.uid, state: chosen }
+        const chosen = pool[i]
+        if (chosen !== undefined) {
+          this.notePicked(chosen.uid, now)
+          return { uid: chosen.uid, state: chosen }
+        }
       }
     }
 
     // 浮点误差兜底：取最后一个候选（而不是返回 undefined —— 那会被上层误判为「无可用账号」）。
-    const last = candidates[candidates.length - 1]
-    return last === undefined ? undefined : { uid: last.uid, state: last }
+    const last = pool[pool.length - 1]
+    if (last === undefined) return undefined
+    this.notePicked(last.uid, now)
+    return { uid: last.uid, state: last }
+  }
+
+  /**
+   * 最近一次选中该账号的时刻（**进程内**，不落存储）。
+   *
+   * ⚠️ 刻意只在内存里：① 每个 pick 都写存储会白烧 Free 计划的 DO 行写入配额；
+   * ② DO 实例被回收后重置「只是少摊开一次」，不是正确性问题
+   *（最坏情形退化成原来的加权随机）。
+   */
+  private recentlyPicked = new Map<string, number>()
+
+  /** 读某账号最近被选中的时刻（从未选中过返回 0 ⇒ 视为「很久没用」）。 */
+  private notePickedAt(uid: string): number {
+    return this.recentlyPicked.get(uid) ?? 0
+  }
+
+  /** 记录该账号刚被选中。 */
+  private notePicked(uid: string, now: number): void {
+    this.recentlyPicked.set(uid, now)
   }
 
   /** 账号池计数摘要（供 `/healthz` 与面板）。 */

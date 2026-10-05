@@ -28,7 +28,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
-import { ERROR_HINT_PATTERN, USAGE_HINT_PATTERN, aggregateSse, detectErrorFrame, doneFrame, errorFrame, parseSseLine, sseHeaders, translateFrame } from './stream.js'
+import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
@@ -152,51 +152,57 @@ interface Candidate {
 
 /** 走账号池选号（**排除已试过的**，跨重试保留）。 */
 /**
- * 派生**会话粘性 key**（用于把同一会话固定到同一账号，命中上游 prompt cache）。
+ * 派生**会话粘性 key**（把同一会话固定到同一账号，命中上游 prompt cache）。
  *
- * ## key 的选取（按可靠性排序）
+ * ## 🔴 只用客户端**显式**给的会话标识，绝不从内容推断（实测踩过严重缺陷）
  *
- * 1. **客户端显式给的 `user` 字段** —— OpenAI 规范里它就是这个用途
- *    （「代表最终用户的稳定标识符」）。最可靠，且跨轮次稳定。
- * 2. **首条消息的指纹** —— 客户端没给 `user` 时的回落。
- *    取首条 `role+content` 的短哈希：同一会话的后续轮次首条消息**不变**，
- *    故指纹稳定；不同会话几乎必然不同。
+ * ### 我第一版写错了：用「首条消息指纹」当会话 key
  *
- * ⚠️ 刻意**不**用「全部消息的哈希」：那样每加一轮消息 key 就变，
- * 粘性等于没有（每轮都当新会话）。这是最容易写错的地方。
+ * 当时的想法是「同一会话的后续轮次，首条消息不变，故指纹稳定」。
+ * **这个推断是错的**，实测后果（用户报「思考 78 秒又断了」）：
  *
- * ⚠️ 返回空串 = 「无法判定会话」，此时**不做粘性**（回落到常规加权随机）。
- * 编造一个 key 会让不同会话互相干扰，比不做更糟。
+ * - 「首条消息相同」**不等于**「同一会话」—— 任何两个用户发出相同 prompt
+ *   （或同一用户重发一次）都会得到**同一个 key**；
+ * - 于是这些**互相独立的请求**被当成一个会话，**全部粘到同一个账号**；
+ * - 并发时该账号被压垮，**上游把先前的流踢掉** ⇒ 表现为「长回答中途突然停止」；
+ * - 实测对照：3 个**相同 prompt** 并发 ⇒ 1 个被切断；
+ *   3 个**不同 user 字段**并发 ⇒ **3/3 全部完整**。这是决定性证据。
+ *
+ * ### 正确做法
+ *
+ * 只认客户端**显式**声明的会话标识：
+ * 1. `user` 字段（OpenAI 规范里它就是「最终用户的稳定标识符」）；
+ * 2. `conversation_id` / `conversationId`（部分客户端会带）。
+ *
+ * ⚠️ **都没有就返回空串 = 不做粘性**，回落到常规加权随机（自然摊到多个账号）。
+ * 「不粘」只是少了 prompt cache 命中率；而「错误地粘」会**弄断用户的流**。
+ * 两害相权，必须选前者。
+ *
+ * ⚠️ 顺带纠正一个性能认知：原先那段「只取前 512 字符」的注释是为了省 CPU，
+ * 但真正的 CPU 杀手是**每帧**的净化（见 `stream.ts`），不是这个
+ * 每请求只跑一次的函数。
  */
 async function deriveSessionKey(rawBody: unknown): Promise<string> {
   if (rawBody === null || typeof rawBody !== 'object') return ''
   const body = rawBody as Record<string, unknown>
 
-  // ① 客户端显式的 user 字段（最可靠）
+  // ① `user` 字段（最可靠，规范里就是干这个的）
   const user = body.user
   if (typeof user === 'string' && user.trim() !== '') {
     return `u:${(await sha256Hex(user.trim())).slice(0, 32)}`
   }
 
-  // ② 首条消息的指纹
-  const messages = body.messages
-  if (!Array.isArray(messages) || messages.length === 0) return ''
-  const first = messages[0]
-  if (first === null || typeof first !== 'object') return ''
-  const f = first as Record<string, unknown>
-  const role = typeof f.role === 'string' ? f.role : ''
-  // content 可能是字符串或多模态数组 —— 两种都序列化进来
-  const content = f.content
-  const material =
-    typeof content === 'string'
-      ? content
-      : content === undefined || content === null
-        ? ''
-        : JSON.stringify(content)
-  if (role === '' && material === '') return ''
-  // ⚠️ 只取前 512 字符：超长首条（如带图的多模态）没必要全哈希，
-  // 且能避免在大请求上多花 CPU（Free 计划 10ms 铁律）。
-  return `m:${(await sha256Hex(`${role}\n${material.slice(0, 512)}`)).slice(0, 32)}`
+  // ② 部分客户端显式带的会话 id（snake_case 与 camelCase 都认）
+  for (const key of ['conversation_id', 'conversationId']) {
+    const v = body[key]
+    if (typeof v === 'string' && v.trim() !== '') {
+      return `c:${(await sha256Hex(v.trim())).slice(0, 32)}`
+    }
+  }
+
+  // ⚠️ **没有显式会话标识 ⇒ 不做粘性**。
+  // 绝不回落到「内容指纹」—— 那会把独立请求误判成同一会话（见上方说明）。
+  return ''
 }
 
 /** SHA-256 → 小写 hex（WebCrypto）。 */
@@ -520,6 +526,14 @@ function streamResponse(
     onError: (message: string) => void
     /** 流结束时回调，带上从流里解析到的 usage（用于面板用量统计）。 */
     onFinish?: (usage: { input: number; output: number } | undefined) => void
+    /**
+     * ⚠️ **诊断用**：客户端是否已断开（`request.signal.aborted`）。
+     *
+     * 这是「Worker 掐断」与「客户端断开」的**唯一分界** ——
+     * 排查「长回答突然停止」时必须能区分，否则会在错误方向优化
+     *（我为此连续几轮改错地方，见 AGENTS.md）。
+     */
+    clientGone?: () => boolean
   },
   /**
    * 客户端要**非流式**时传 true：内部仍按流式读上游，但最后聚合成一个
@@ -544,6 +558,17 @@ function streamResponse(
       let buffer = ''
       let sawChunk = false
       let sawDone = false
+      // ⚠️ 错误帧**只在前几帧查**（见 `ERROR_CHECK_FRAMES`）：
+      // 上游要拒绝请求必然在开头，不可能先正常输出几万字再报错。
+      // 而每帧全串扫描要 9.6ms/2 万帧 —— 直接超 10ms 配额。
+      let frameSeq = 0
+      // ⚠️ **有状态**转换器：首帧判断一次，之后全程沿用该决定。
+      //
+      // 逐帧扫描整帧字符串**必然超预算**（实测 8000 帧的单次 `includes`
+      // 就要 7.4ms，而 Free 计划只有 10ms/次调用）⇒ 长回答会被切断。
+      // 详见 `createFrameTranslator` 的说明。
+      const translator = createFrameTranslator()
+      const streamStartedAt = Date.now()
       // 从流里抓 usage（末帧带 include_usage=true 时会有）
       let usage: { input: number; output: number } | undefined
 
@@ -569,7 +594,8 @@ function streamResponse(
                 hooks.onFirstChunk()
               }
               // 只在**可能**是错误帧时才解析（正常帧原样转发，省 CPU）
-              if (ERROR_HINT_PATTERN.test(frame.data)) {
+              frameSeq += 1
+              if (frameSeq <= ERROR_CHECK_FRAMES && ERROR_HINT_PATTERN.test(frame.data)) {
                 const errMsg = tryDetectError(frame.data)
                 if (errMsg !== undefined) {
                   hooks.onError(errMsg)
@@ -580,7 +606,7 @@ function streamResponse(
               }
               sawChunk = true
               // 只在字面量含 usage 时才解析（省 CPU）
-              if (USAGE_HINT_PATTERN.test(frame.data)) {
+              if (mayHaveUsage(frame.data)) {
                 try {
                   const parsed = JSON.parse(frame.data) as { usage?: { prompt_tokens?: number; completion_tokens?: number } }
                   const u = parsed.usage
@@ -591,7 +617,7 @@ function streamResponse(
                   // usage 解析失败不影响转发
                 }
               }
-              controller.enqueue(encoder.encode(translateFrame(frame.data)))
+              controller.enqueue(encoder.encode(translator.translate(frame.data)))
             } else if (frame.kind === 'error') {
               // ⚠️ 非预期形状必须让客户端看到（不静默丢）
               controller.enqueue(encoder.encode(errorFrame(frame.error ?? '非预期帧')))
@@ -607,9 +633,25 @@ function streamResponse(
           controller.enqueue(encoder.encode(errorFrame(msg)))
         }
         if (!sawDone) controller.enqueue(encoder.encode(doneFrame()))
+        // ⚠️ **诊断日志**（排查「长回答突然停止」用）：
+        // 记录本次流**为什么结束**、收了多少帧、用了多久。
+        // 之前只靠外部 curl 观察，无法区分「Worker 掐断」与「客户端断开」，
+        // 导致我连续几轮都在错误的方向上优化（详见 AGENTS.md）。
+        console.log(
+          `[stream] end reason=${sawDone ? 'done' : 'upstream-eof'} frames=${frameSeq}` +
+            ` bytes=${sawChunk ? 'has-content' : 'empty'} ms=${Date.now() - streamStartedAt}`,
+        )
         hooks.onFinish?.(usage)
       } catch (error) {
         const msg = `流传输中断：${error instanceof Error ? error.message : String(error)}`
+        // ⚠️ 关键诊断：**这里是「客户端断开」与「上游中断」的分界**。
+        // `request.signal.aborted` 为真 ⇒ **客户端**断了（我们的流被取消）；
+        // 否则是**上游**的连接掉了。两者的处置完全不同，此前无法区分。
+        const clientGone = hooks.clientGone?.() === true
+        console.log(
+          `[stream] aborted clientGone=${clientGone} frames=${frameSeq}` +
+            ` ms=${Date.now() - streamStartedAt} err=${msg.slice(0, 160)}`,
+        )
         hooks.onError(msg)
         hooks.onFinish?.(undefined)
         controller.enqueue(encoder.encode(errorFrame(msg)))
@@ -846,6 +888,8 @@ async function handleProviderChat(input: {
                     ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
                   }
                 },
+                // ⚠️ 诊断用：区分「客户端断开」与「上游中断」
+                clientGone: () => request.signal.aborted,
                 onError: (message) => {
                   const t = pool
                     .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })

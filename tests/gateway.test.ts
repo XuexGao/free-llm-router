@@ -15,6 +15,16 @@
  */
 
 import { test } from 'node:test'
+
+/**
+ * 剥掉注释后再做源码断言。
+ *
+ * ⚠️ 必需：本仓库的注释里会**大量引用反例**（如「原实现用首条消息指纹」），
+ * 朴素的字符串搜索会把注释当成代码 ⇒ 误报。实测踩到过。
+ */
+function stripComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
@@ -26,7 +36,7 @@ import {
   sanitizeChatBody,
   translateMaxCompletionTokens,
 } from '../src/gateway/payload.ts'
-import { ERROR_HINT_PATTERN, USAGE_HINT_PATTERN, aggregateSse, detectErrorFrame, doneFrame, errorFrame, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
+import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
 import { extractModels } from '../src/gateway/models.ts'
 import { isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, refineModelScoped } from '../src/gateway/server.ts'
 
@@ -614,19 +624,35 @@ test('⚠️ pick 的 preferred 必须只「排到最前」，不可绕过健康
   assert.ok(block.includes('candidates.find'), '必须从**候选集**里找（保证健康检查已通过）')
 })
 
-test('⚠️ 会话粘性 key 不得用「全部消息」的哈希（那样每轮都变）', () => {
-  // 最容易写错的地方：用全部 messages 哈希 ⇒ 每加一轮消息 key 就变，
-  // 粘性等于没有（每轮都当新会话）。必须只用首条消息 + user 字段。
+test('🔴 会话粘性 key 只能来自**客户端显式标识**，绝不从内容推断', () => {
+  // ## 实测缺陷（用户报「思考 78 秒又断了」）
+  //
+  // 我第一版用「首条消息指纹」当会话 key，想法是「同一会话的后续轮次
+  // 首条消息不变，故指纹稳定」。**这个推断是错的**：
+  //
+  // - 「首条消息相同」**不等于**「同一会话」—— 任何两个用户发出相同 prompt
+  //   （或同一用户重发）都会得到**同一个 key**；
+  // - 于是这些**互相独立的请求**被当成一个会话，**全部粘到同一账号**；
+  // - 并发时该账号被压垮，**上游把先前的流踢掉** ⇒「长回答中途突然停止」。
+  //
+  // **决定性对照实验**：
+  // - 3 个**相同 prompt** 并发 ⇒ 1 个被切断；
+  // - 3 个**不同 user 字段**并发 ⇒ **3/3 全部完整**。
   const src = readFileSync('src/gateway/server.ts', 'utf8')
   const i = src.indexOf('async function deriveSessionKey')
-  const block = src.slice(i, i + 1800)
-  assert.ok(block.includes('messages[0]'), '应只取**首条**消息做指纹')
-  assert.ok(block.includes("body.user"), '应优先用客户端给的 user 字段')
-  // 不得出现对整个 messages 数组做序列化/哈希
-  assert.ok(!/JSON\.stringify\(messages\)/.test(block), '不得序列化整个 messages 数组')
-  assert.ok(!/messages\.map\(/.test(block), '不得对全部 messages 做映射后哈希')
-})
+  const block = stripComments(src.slice(i, i + 2600))
 
+  // 必须认显式标识
+  assert.ok(block.includes('body.user'), '必须认 `user` 字段')
+  assert.ok(/conversation_id|conversationId/.test(block), '必须认显式会话 id')
+
+  // ⚠️ **绝不能**从 messages 内容推断
+  assert.ok(!block.includes('messages'), '⚠️ 不得读取 messages —— 内容相同不等于同一会话')
+  assert.ok(!/sha256Hex\(`\$\{role\}/.test(block), '不得对消息内容做哈希')
+
+  // 都没有时必须返回空串（不做粘性），而不是编造
+  assert.ok(/return ''/.test(block), '无显式标识时必须返回空串（回落常规随机）')
+})
 test('⚠️ 会话粘性只在首轮生效（换号后还粘回去会死循环）', () => {
   const src = readFileSync('src/gateway/server.ts', 'utf8')
   // 两条路径都必须是「tried 为空才用粘性」
@@ -843,24 +869,34 @@ test('⚠️ 有真实内容的帧必须走快速路径（不得触发 JSON 解�
   )
 })
 
-test('🔴 usage=null 不得触发 JSON.parse（原实现的真实缺陷）', () => {
-  // ## 这是**原有代码**的缺陷（不是新引入的），实测定位
+test('🔴 usage 判据必须是 O(1) 尾判，且不误判（原实现的真实缺陷）', () => {
+  // ## 原实现的真实缺陷（实测定位）
   //
-  // 原判据 `includes('"usage"')` 会**命中 `"usage":null`**，而上游
-  // **每一帧**都带 `"usage":null` ⇒ **每帧都 JSON.parse 整个帧**。
+  // 原判据 `includes('"usage"')` **每帧都命中** —— 上游**每一帧**都带
+  // `"usage":null`，只有末帧才是真对象 ⇒ 每帧都 `JSON.parse` 整个帧。
+  // 实测 6521 帧 **18.32ms CPU** ⇒ 超 10ms 配额 ⇒ 长思考被切断。
   //
-  // 实测（6521 帧）：**18.32ms CPU** ⇒ 超 10ms 配额 ⇒ 长思考被切断。
-  // 收紧成 `"usage":{`（只在有真数据时解析）后：**3.93ms**（快 4.7 倍），
-  // 且**语义完全不变**（`null` 本来就没有可解析的数据）。
+  // 改成 `"usage":{` 后 3.93ms，但 2 万帧时**仍要 8.1ms**（还是全串扫描）。
+  // ⇒ 最终用 **`endsWith` 尾判**（O(1)）：2 万帧 **8.1ms → 2.2ms**。
   //
-  // ⚠️ 教训：**判据不能比它要保护的工作还贵**；
-  // 「字段存在」与「字段有内容」是两件事 —— 这是本文件反复出现的同一类错误。
-  assert.equal(USAGE_HINT_PATTERN.test('{"choices":[],"usage":null}'), false,
-    '⚠️ usage:null 不得触发解析（上游每帧都是这个形状）')
-  assert.equal(USAGE_HINT_PATTERN.test('{"choices":[],"usage":{"prompt_tokens":1}}'), true,
-    '有真实 usage 对象时才解析')
-})
+  // ⚠️ 该上游的帧必然以 `"usage":null}` 结尾（usage 是最后一个键）。
+  assert.equal(
+    mayHaveUsage('{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}],"usage":null}'),
+    false, '⚠️ usage:null 的普通帧必须跳过解析（上游每帧都是这个形状）',
+  )
+  assert.equal(
+    mayHaveUsage('{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":33}}'),
+    true, '末帧（usage 是对象）必须解析',
+  )
 
+  // ⚠️ **判错方向必须是安全的**：若上游改了字段顺序（不再以 usage 结尾），
+  // 判据会对所有帧返回 true ⇒ 退化成原来的行为（能拿到 usage，只是慢），
+  // **不会丢数据**。这是刻意选的失败方向「宁慢不丢」。
+  assert.equal(
+    mayHaveUsage('{"usage":{"prompt_tokens":1},"choices":[]}'),
+    true, '⚠️ 顺序变了也要返回 true（宁可多解析，不可漏 usage）',
+  )
+})
 test('⚠️ 错误探测也要廉价（N 次 includes 换成一条正则）', () => {
   // 同一类问题：`data.includes('"error"') || ... || data.includes('"code"')`
   // 是 **4 次全串扫描**，实测 6521 帧下 13.36ms —— 本身就超预算。
@@ -870,21 +906,20 @@ test('⚠️ 错误探测也要廉价（N 次 includes 换成一条正则）', (
   assert.equal(ERROR_HINT_PATTERN.test('{"error":{"message":"x"}}'), true)
 })
 
-test('⚠️ 长流的每帧开销必须在 10ms CPU 预算内（8000 帧量化）', () => {
-  // ⚠️ 这条是**量化护栏**：直接跑 8000 帧（实测最长的思考场景），
-  // 断言总耗时在预算内。若有人把快速路径改回「每帧 JSON 往返」，这里会立刻变红。
-  //
-  // 阈值说明：本地 Node 比 Workers 快，故这里的余量不代表线上余量 ——
-  // 它锁的是**数量级**（快速路径 ~4ms vs JSON 往返 ~27ms），不是精确值。
+test('⚠️ 有内容/干净帧在生产路径（有状态转换器）上的开销可忽略', () => {
+  // ⚠️ 量化护栏用**生产路径**（`createFrameTranslator`），不是单帧版
+  // `translateFrame` —— 后者刻意保留逐帧语义（供测试与非流式用），
+  // 拿它做性能断言会误报（实测会 20ms+，但那不是线上路径）。
   const thinking =
     '{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}],"usage":null}'
+  const t = createFrameTranslator()
   const N = 8000
   const start = performance.now()
-  for (let i = 0; i < N; i += 1) translateFrame(thinking)
+  for (let i = 0; i < N; i += 1) t.translate(thinking)
   const elapsed = performance.now() - start
   assert.ok(
     elapsed < 15,
-    `⚠️ ${N} 帧耗时 ${elapsed.toFixed(1)}ms —— 疑似快速路径失效（应 ~4ms，超 10ms 配额就会切流）`,
+    `⚠️ ${N} 帧耗时 ${elapsed.toFixed(1)}ms —— 疑似快速路径失效（超 10ms 配额就会切流）`,
   )
   // ⚠️ 配对的**正向**用例：证明这条断言不是恒真（否则它锁不住任何东西）。
   const slow =
@@ -917,4 +952,96 @@ test('⚠️ 净化不得误伤普通帧的 role/name 字段', () => {
   const d = JSON.parse(out.slice(6).trim()).choices[0].delta
   assert.equal(d.role, 'assistant', 'role 必须保留')
   assert.equal(d.content, 'hi', 'content 必须保留')
+})
+
+// ───────── 🔴 长回答被切断：逐帧开销 + 并发挤同号（两条真实缺陷） ─────────
+
+test('🔴 帧翻译必须是**有状态**的：首帧判断一次，不得逐帧扫描', () => {
+  // ## 实测缺陷（用户报「思考 78 秒又断了」）
+  //
+  // 8000 帧 / 10ms 配额 ⇒ **每帧只有 1.25 微秒**，而实测：
+  // - 单次 `String.includes` 扫描整帧：**7.4ms**
+  // - 单次正则判断：**7.4ms**
+  // - 正则替换：**35.7ms**
+  //
+  // ⇒ 任何「每帧扫描整帧字符串」的做法都超预算。一条 20 分钟的长回答有
+  // **2 万帧**，逐帧开销乘上去必然爆 ⇒ 流被切断。
+  //
+  // 修法：`createFrameTranslator()` 首帧判断**一次**，之后全程沿用该决定。
+  const t = createFrameTranslator()
+  // 首帧带空值 ⇒ 整条流都按「需净化」处理
+  const flash = '{"choices":[{"delta":{"content":"a","reasoning_content":"","refusal":""},"finish_reason":""}],"usage":null}'
+  assert.equal(t.translate(flash).includes('reasoning_content'), false, '首帧被净化')
+  assert.equal(t.translate(flash).includes('reasoning_content'), false, '后续帧同样被净化')
+
+  // 首帧干净 ⇒ 整条流原样透传（不付任何扫描代价）
+  const t2 = createFrameTranslator()
+  const clean = '{"choices":[{"delta":{"content":"x"},"finish_reason":null}],"usage":null}'
+  assert.equal(t2.translate(clean).includes('"content":"x"'), true, '干净帧原样输出')
+})
+
+test('🔴 帧翻译不得退化成二次方（该路径实测已休眠，但不能是性能地雷）', () => {
+  // ## 重要事实：这条路径（含空值字段的**老格式**）实测**已不再触发**
+  //
+  // 44 万帧抓取里只有 31 帧含空值，全部来自 2026-10-05 上午，
+  // **之后上游再没发过这些字段**。故这里**不锁绝对耗时**（那是给死代码定 SLA），
+  // 只锁「不得退化成二次方」—— 真触发时说明上游又改了形状，届时按实测重做。
+  //
+  // ⚠️ **历史教训**：我为这条路径连续优化了三轮，每轮都以为找到了
+  // 「长回答被切断」的根因，但都没命中 —— 因为它对用户场景根本不触发。
+  // **正确顺序是先确认路径会不会走到，再决定要不要优化。**
+  const legacy =
+    '{"id":"x","choices":[{"index":0,"delta":{"role":"a","content":"a","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"finish_reason":""}],"usage":null}'
+
+  // 1 万帧与 2 万帧的耗时应当**近似线性**（比值 < 4 表示没有退化成二次方）
+  const run = (n: number): number => {
+    const t = createFrameTranslator()
+    const start = performance.now()
+    for (let i = 0; i < n; i += 1) t.translate(legacy)
+    return performance.now() - start
+  }
+  run(2000) // 预热
+  const t1 = run(10_000)
+  const t2 = run(20_000)
+  const ratio = t2 / Math.max(t1, 0.01)
+  assert.ok(ratio < 4, `⚠️ 2 万帧/1 万帧 耗时比 ${ratio.toFixed(2)} —— 疑似退化成二次方`)
+
+  // ⚠️ 配对的**正向**用例：证明这条路径确实会被走到（断言不是恒真）。
+  assert.ok(needsNormalize(legacy), '该帧确实含空值（会走净化路径）')
+  // 且净化必须**有效**
+  const t = createFrameTranslator()
+  assert.equal(t.translate(legacy).includes('reasoning_content'), false, '空值字段必须被删掉')
+})
+test('🔴 同号并发必须摊开（否则上游踢掉先前的流）', () => {
+  // ## 实测缺陷（用户报「思考 78 秒又断了」）
+  //
+  // 上游对**同一账号的并发流**不友好：后来者会把先前的流**踢掉** ⇒
+  // 「长回答中途突然停止、没有任何输出」。
+  //
+  // **决定性对照实验**：
+  // - 3 个**相同 prompt** 并发 ⇒ 1 个被切断；
+  // - 3 个**不同 user 字段**并发 ⇒ **3/3 全部完整**。
+  //
+  // ⚠️ 纯加权随机不够：它每次都独立掷骰，完全可能连中同一个账号。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const i = src.indexOf('async pick(request: PickRequest)')
+  const block = stripComments(src.slice(i, i + 4000))
+  assert.ok(/SPREAD_WINDOW_MS/.test(block), '必须按时间窗摊开刚被选中的账号')
+  assert.ok(/notePickedAt\(/.test(block), '必须记录/查询最近选中的时刻')
+  assert.ok(
+    /fresh\.length > 0 \? fresh : candidates/.test(block),
+    '⚠️ 摊开失败时必须**回落到全部候选** —— 绝不因此报「无可用账号」',
+  )
+})
+
+test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 cache）', () => {
+  // ⚠️ 顺序即语义：`preferred` 命中要**直接返回**，不参与摊开 ——
+  // 否则「同一会话命中 prompt cache」这个收益就没了。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const i = src.indexOf('async pick(request: PickRequest)')
+  const block = stripComments(src.slice(i, i + 4000))
+  const prefIdx = block.indexOf('preferred !== ')
+  const spreadIdx = block.indexOf('SPREAD_WINDOW_MS')
+  assert.ok(prefIdx > 0 && spreadIdx > 0, '两段逻辑都应存在')
+  assert.ok(prefIdx < spreadIdx, '⚠️ 粘性判断必须在摊开**之前**')
 })
