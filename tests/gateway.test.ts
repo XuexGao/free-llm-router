@@ -15,6 +15,7 @@
  */
 
 import { test } from 'node:test'
+import { referenceChatHeaders } from '../src/upstream/headers.ts'
 import { classify } from '../src/upstream/client.ts'
 
 /**
@@ -1247,4 +1248,56 @@ test("⚠️ 国际版的「首条必须是 system」判据必须把 developer �
   const block = stripComments(src.slice(i, i + 1200))
   assert.ok(/firstRole === 'system'/.test(block), '应认 system')
   assert.ok(/firstRole === 'developer'/.test(block), '⚠️ developer 也必须视同 system')
+})
+
+test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（不能套用）', () => {
+  // ## 实测缺陷：我一度把国际版的值套到国内版上
+  //
+  // 参考实现（`deepseek-harness-codearts/src/product.ts`）里两个产品是
+  // **完全不同的客户端形态**，不是同一个模板换段：
+  //
+  // | 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
+  // |---|---|---|
+  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+  // | `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
+  // | `clientVersion` | **`1.106.1`** | `5.5.2` |
+  // | `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
+  // | `productCode` | `codebuddy` | `workbuddy` |
+  const dom = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'buddy' })
+  const intl = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'workbuddy' })
+
+  // ⚠️ UA 是完全不同的格式（国内版不含 `WorkBuddy`）
+  assert.equal(dom['User-Agent'], 'CodeBuddyIDE/1.106.1', '国内版 UA 必须是 IDE 形态')
+  // ⚠️ 国际版 UA 逐字对齐参考实现（三段**同值** 5.5.2）
+  assert.equal(
+    intl['User-Agent'], 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2',
+    '国际版 UA 三段都应是 5.5.2（我一度混了国内版段，导致与 X-IDE-Version 自相矛盾）',
+  )
+  // ⚠️ UA 里的版本号必须与 X-IDE-Version 一致 —— 同一请求里两个版本号
+  // 正是「渠道指纹」最容易露馅的地方。
+  assert.equal(intl['X-IDE-Version'], '5.5.2')
+  assert.ok(intl['User-Agent']?.includes('5.5.2'), 'UA 与 X-IDE-Version 必须同版本')
+
+  // ⚠️ 归属三头在国内版是 `CodeBuddy`
+  assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
+  assert.equal(dom['X-IDE-Type'], 'CodeBuddy')
+  assert.equal(dom['X-Product'], 'CodeBuddy')
+  assert.equal(intl['X-IDE-Name'], 'WorkBuddy', '国际版归属名是 WorkBuddy')
+
+  // ⚠️ 版本号不同
+  assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
+  assert.equal(intl['X-IDE-Version'], '5.5.2', '国际版版本是 5.5.2')
+
+  // X-Domain 必须与端点一致
+  assert.equal(dom['X-Domain'], 'copilot.tencent.com')
+  assert.equal(intl['X-Domain'], 'www.workbuddy.ai')
+  assert.equal(dom['X-Product-Code'], 'codebuddy')
+  assert.equal(intl['X-Product-Code'], 'workbuddy')
+
+  // ⚠️ 参考实现只发这 11 个（多发的头是 Go 侧口径，国际版端点不认）
+  assert.equal(dom['Accept'], 'text/event-stream', 'Accept 必须精确（不能带 json 偏好）')
+  assert.ok(!('Origin' in dom), '⚠️ 不得发 Origin（Go 侧口径，参考实现不发）')
+  assert.ok(!('X-Machine-ID' in dom), '⚠️ 不得发 X-Machine-ID')
+  assert.ok(!('X-Conversation-Request-ID' in dom), '⚠️ 不得发 X-Conversation-Request-ID')
+  assert.equal(dom['Authorization'], 'Bearer tok', '只保留 Authorization')
 })

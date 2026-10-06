@@ -67,8 +67,39 @@ export function cliUserAgent(): string {
  *（`deepseek-harness-codearts`）。
  */
 export function cliUserAgentIntl(): string {
-  return `WorkBuddy/${CLIENT_VERSION} WorkBuddy AI/${CLIENT_VERSION} CLI/${CLI_VERSION}`
+  // ⚠️ **三段都用国际版自己的版本号 5.5.2**（与 `X-IDE-Version` 一致）。
+  //
+  // 参考实现逐字是 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`
+  //（`product.ts:70`），三段**同值**。
+  // 我一度写成 `WorkBuddy/5.5.6 … CLI/2.137.1`（混了国内版段），
+  // 那与 `X-IDE-Version: 5.5.2` **自相矛盾** —— 同一请求里两个版本号，
+  // 正是「渠道指纹」最容易露馅的地方。
+  return `WorkBuddy/${CLIENT_VERSION_INTL} WorkBuddy AI/${CLIENT_VERSION_INTL} CLI/${CLIENT_VERSION_INTL}`
 }
+
+/**
+ * **国内版**（CodeBuddy，`copilot.tencent.com`）的 UA。
+ *
+ * ## 🔴 与国际版是**完全不同的格式**（实测缺陷：我一度把国际版的值套到国内版）
+ *
+ * ```
+ * 国内版: CodeBuddyIDE/1.106.1
+ * 国际版: WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2
+ * ```
+ *
+ * ⚠️ 国内版**不是**三段式、也**不含 `WorkBuddy`** —— 它是 IDE 客户端的形态。
+ * 依据：参考实现 `src/product.ts:309` / `src/buddy.ts:89` 的
+ * `userAgent: 'CodeBuddyIDE/1.106.1'`。
+ *
+ * ⚠️ 三个归属头（`X-IDE-Name` / `X-IDE-Type` / `X-Product`）在国内版也要发
+ * **`CodeBuddy`**（`product.ts:311` 的 `attributionName`），不是 `WorkBuddy`。
+ * 发错会让后台「使用端」归因错误（参考实现对此有专门注释：
+ * 早年误发 `SaaS` 导致后台归因不到产品）。
+ */
+export const CODEBUDDY_USER_AGENT = 'CodeBuddyIDE/1.106.1'
+
+/** 国内版的客户端版本号（`X-IDE-Version`）。 */
+export const CODEBUDDY_CLIENT_VERSION = '1.106.1'
 
 /**
  * 国际版的客户端版本号。
@@ -214,12 +245,16 @@ export function referenceChatHeaders(input: {
     'X-Domain': intl ? 'www.workbuddy.ai' : 'copilot.tencent.com',
     'X-Product-Code': intl ? 'workbuddy' : 'codebuddy',
     'X-Agent-Purpose': 'conversation',
-    'X-IDE-Name': 'WorkBuddy',
-    'X-IDE-Type': 'WorkBuddy',
-    'X-IDE-Version': intl ? CLIENT_VERSION_INTL : CLIENT_VERSION,
-    'X-Product': 'WorkBuddy',
-    // ⚠️ UA 按变体切换（国际版中段是 `WorkBuddy AI`）
-    'User-Agent': intl ? cliUserAgentIntl() : cliUserAgent(),
+    // ⚠️ **归属名按变体切换**：国内版是 `CodeBuddy`，国际版是 `WorkBuddy`
+    //（参考实现 `product.ts:311` 的 `attributionName`）。
+    // 发错会让后台「使用端」归因错误。
+    'X-IDE-Name': intl ? 'WorkBuddy' : 'CodeBuddy',
+    'X-IDE-Type': intl ? 'WorkBuddy' : 'CodeBuddy',
+    'X-IDE-Version': intl ? CLIENT_VERSION_INTL : CODEBUDDY_CLIENT_VERSION,
+    'X-Product': intl ? 'WorkBuddy' : 'CodeBuddy',
+    // ⚠️ UA 是**完全不同的格式**（不是同一个模板换段）：
+    // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… WorkBuddy AI/…`。
+    'User-Agent': intl ? cliUserAgentIntl() : CODEBUDDY_USER_AGENT,
   }
   if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
   return headers

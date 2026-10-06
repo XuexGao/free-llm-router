@@ -1197,6 +1197,33 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 | **会话粘性** | — | ✅ **已修**，见下方更新记录 |
 | **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
 
+#### 本节更新记录（2026-10-06 四）：国内版是**另一套取值**（我上一轮只修了国际版）
+
+**用户追问**：「国内版修了吗」—— 问得对。我上一轮把**国际版的值套到了国内版上**。
+
+参考实现里两个产品是**完全不同的客户端形态**，不是同一个模板换段：
+
+| 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
+|---|---|---|
+| `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+| `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
+| `clientVersion` | **`1.106.1`** | `5.5.2` |
+| `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
+| `productCode` | `codebuddy` | `workbuddy` |
+
+⚠️ 国内版 UA **不是三段式、也不含 `WorkBuddy`** —— 它是 IDE 客户端形态
+（`CodeBuddyIDE/1.106.1`，依据 `product.ts:309` / `buddy.ts:89`）。
+
+**同时修掉一处自相矛盾**：国际版 UA 我一度写成
+`WorkBuddy/5.5.6 … CLI/2.137.1`（混了国内版段），而 `X-IDE-Version` 是 `5.5.2`
+—— **同一请求里两个版本号**，正是「渠道指纹」最容易露馅的地方。
+参考实现逐字是三段同值：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`。
+
+**验证**：pi agent 测两个版本 —— 国内版与**国际版都正常返回**。
+
+⚠️ **教训**：「两个变体」不等于「同一个模板换段」。改一个变体时必须
+**逐个变体核对参考实现的取值**，不能假定另一个只是参数不同。
+
 #### 本节更新记录（2026-10-06 三）：11128 的真正根因 —— 与参考实现逐行对比后定位
 
 **用户报**：`502 channel_blocked: Illegal API invocation from an unapproved channel`
