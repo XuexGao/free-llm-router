@@ -55,9 +55,32 @@ export function mapErrorToPunishment(kind: ErrorKind): {
     // 余额耗尽：硬冷却到次日 04:00，换号有用
     case 'credit_exhausted':
       return { punish: true, dimension: 'hard', rotate: true }
-    // WAF：账号级软冷却；但可能是 IP 级（详见 AGENTS.md §2.6），换号**无用**
+    // WAF（HTTP 403 无信封）：账号级软冷却；但可能是 IP 级（详见 AGENTS.md §2.6），换号无用
     case 'waf_blocked':
       return { punish: true, dimension: 'soft', rotate: false }
+    // ⚠️ 渠道指纹被拒（业务码 11128）：**不罚账号、不换号、不触发 IP 判定**。
+    //
+    // ## 为什么连软冷却都不该做（实测缺陷，用户报两处 503）
+    //
+    // `11128 "unapproved channel"` 说的是**这个请求的渠道指纹**不被认可。
+    // 它有两种可能来源：
+    //   A. 我们的指纹本身有问题（版本 / 头部不对）⇒ **所有账号都会命中**，
+    //      罚任何一个账号都毫无意义（换个号还是同样指纹）；
+    //   B. 上游对某个账号的风控升级 ⇒ 那才该罚该账号。
+    //
+    // ⚠️ A 是最可能的情形，而旧实现（把它当 `waf_blocked` / `request_illegal`）
+    // 会**惩罚本来健康的账号**，制造两个假故障：
+    //   ① 账号逐个进软冷却 ⇒ 客户端看到「1 个账号都在冷却中，约 30 分钟后恢复」；
+    //   ② 每次命中都被记成「IP 级 403」⇒ 凑够 `WAF_IP_THRESHOLD = 2`
+    //      就**误报「出口 IP 被 WAF 拦截」并全局停服**
+    //      （用户报「两个都是正常的，但显示 IP 被拦」）。
+    //
+    // ⇒ 正确处置：**如实把错误返回给客户端**，同时**不再轮转**
+    //（换号无用，只会把同样的渠道判定打给更多账号）。
+    // 这也解释了用户说的「有的软件能用、有的不能」——
+    // 差别在**请求指纹**，不在账号。
+    case 'channel_blocked':
+      return { punish: false, dimension: 'soft', rotate: false }
     // 请求非法：强信号，直接禁用；换号无用（同样的非法请求）
     case 'request_illegal':
       return { punish: true, dimension: 'breaker', rotate: false }

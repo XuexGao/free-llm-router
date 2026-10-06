@@ -38,7 +38,21 @@ export type ErrorKind =
   | 'rate_limited' // 429 / 6004 —— 换号 + 冷却；6004 是**模型级**
   | 'model_unavailable' // 11102：该后端无此模型 —— (账号,模型) 负缓存
   | 'credit_exhausted' // 402 / 14018 —— 硬冷却至次日 04:00
-  | 'waf_blocked' // 403 且无业务信封 —— 账号软冷却；可能是 **IP 级**
+  | 'waf_blocked' // HTTP 403 且无业务信封 —— **可能是 IP 级**（会触发 IP 级判定）
+  /**
+   * **渠道指纹**被上游拒绝（业务码 `11128`，`unapproved channel`）。
+   *
+   * ⚠️ 与 `waf_blocked` 的**关键区别**（实测缺陷：我一度把两者混为一类）：
+   * - `waf_blocked` 是 **HTTP 403 + 无业务信封** —— 典型的 WAF 拦截形态，
+   *   有可能是**出口 IP 级**（多个账号会同时命中）⇒ 需要 IP 级判定；
+   * - `channel_blocked` 是**正常的业务码响应**（`{"code":11128,...}`），
+   *   只说明**这个请求的指纹**不被认可 —— **与出口 IP、与账号都无关**。
+   *
+   * ⇒ 混为一类会导致：每个账号的 11128 都被记成「IP 级 403 命中」，
+   * 很快凑够阈值 ⇒ **误报「出口 IP 被 WAF 拦截」并全局停服**。
+   *（`WAF_IP_THRESHOLD = 2`，而用户有 3 个账号，极易触发。）
+   */
+  | 'channel_blocked'
   | 'request_illegal' // 11140 —— 强信号，直接禁用账号
   | 'session_dead' // 12153 —— **连续 3 次**才禁用
   | 'context_exceeded' // 11115 —— 不罚号、不轮转
@@ -94,10 +108,11 @@ const CODE_KIND: Record<number, ErrorKind> = {
   // ⚠️ 而且 11128 还是上游**反探测机制自身的错误码**（AGENTS.md §6.6）：
   // 请求体里出现裸 `11128` 就会触发它。也就是说这个码**既表示拦截、又是拦截条件**。
   //
-  // 归类为 `waf_blocked`（渠道/风控层拦截）⇒ 走**账号级软冷却**而非熔断，
-  // 且**不换号**（换号撞的是同一套渠道判定，只会放大风控）。
-  // 见 `mapErrorToPunishment` 对 `waf_blocked` 的处置。
-  11128: 'waf_blocked',
+  // ⚠️ 归类为 **`channel_blocked`（不是 `waf_blocked`）**：
+  // 两者都要「软冷却 + 不换号」，但 `waf_blocked` 还会触发**IP 级判定**
+  //（`noteWaf`）—— 而 11128 与出口 IP **无关**，用它触发 IP 判定会**误报全局封锁**。
+  // 这正是「有的软件能用、有的不能」的原因：凑够 2 个账号就整体停服 60 秒。
+  11128: 'channel_blocked',
   // 幂等命中：签到已领（视为成功）
   10001: 'already_done',
   1001: 'already_done',
@@ -216,6 +231,8 @@ export function shouldRotate(kind: ErrorKind): boolean {
     case 'context_exceeded':
     case 'image_invalid':
     case 'request_illegal':
+    // ⚠️ 渠道指纹被拒 ⇒ **不换号**：换号撞的是同一套渠道判定，只会放大风控。
+    case 'channel_blocked':
     case 'network':
     case 'not_found':
     case 'already_done':
@@ -235,6 +252,8 @@ export function shouldPunish(kind: ErrorKind): boolean {
     case 'session_dead':
     case 'request_illegal':
     case 'server':
+    // ⚠️ 渠道拦截：**软冷却**（短退避），不是熔断 —— 它不说明账号坏了。
+    case 'channel_blocked':
       return true
     case 'network':
     case 'auth_error':

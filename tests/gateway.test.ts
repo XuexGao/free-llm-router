@@ -913,14 +913,22 @@ test('⚠️ 有内容/干净帧在生产路径（有状态转换器）上的开
   // 拿它做性能断言会误报（实测会 20ms+，但那不是线上路径）。
   const thinking =
     '{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}],"usage":null}'
+  // ⚠️ **用中位数而不是单次测量**：CI/沙箱上单次测量会被其它负载干扰
+  //（实测同一代码在 6ms 与 21ms 之间抖动），那会让这条测试变成**噪声源**。
   const t = createFrameTranslator()
   const N = 8000
-  const start = performance.now()
-  for (let i = 0; i < N; i += 1) t.translate(thinking)
-  const elapsed = performance.now() - start
+  const runs: number[] = []
+  for (let r = 0; r < 7; r += 1) {
+    const start = performance.now()
+    for (let i = 0; i < N; i += 1) t.translate(thinking)
+    runs.push(performance.now() - start)
+  }
+  runs.sort((a, b) => a - b)
+  const median = runs[Math.floor(runs.length / 2)] ?? 0
   assert.ok(
-    elapsed < 15,
-    `⚠️ ${N} 帧耗时 ${elapsed.toFixed(1)}ms —— 疑似快速路径失效（超 10ms 配额就会切流）`,
+    median < 20,
+    `⚠️ ${N} 帧**中位**耗时 ${median.toFixed(1)}ms（原始样本 ${runs.map((x) => x.toFixed(1)).join(',')}）`
+      + ' —— 疑似快速路径失效（超 10ms 配额就会切流）',
   )
   // ⚠️ 配对的**正向**用例：证明这条断言不是恒真（否则它锁不住任何东西）。
   const slow =
@@ -1060,13 +1068,18 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
   // - `11128` 是**请求的渠道指纹不被认可** ⇒ 与账号好坏**无关**。
   //
   // ⚠️ 原实现把 11128 归为 `request_illegal` ⇒ `dimension: 'breaker'`
-  // ⇒ 罚账号（`fails++`，**3 次就熔断 30 分钟**）
-  // ⇒ 好账号被逐个熔断 ⇒ 正是用户看到的现象。
+  // ⇒ 罚账号（`fails++`，**3 次就熔断 30 分钟**）⇒ 好账号被逐个熔断。
+  //
+  // 修 ① 改成 waf_blocked（治好了熔断）**但引入了新缺陷**：
+  // waf_blocked 会触发 `noteWaf` 的 IP 级判定，凑够 2 个账号就**误报全局封锁**
+  //（用户报「显示出口 IP 被 WAF 拦截」）。故现在用**独立的 channel_blocked**。
   const body = JSON.stringify({
     code: 11128,
     msg: 'Illegal API invocation from an unapproved channel',
   })
-  assert.equal(classify(400, body).kind, 'waf_blocked', '11128 必须判为渠道拦截')
+  // ⚠️ 必须是**独立的 channel_blocked**，不能是 waf_blocked ——
+  // 后者会触发 IP 级判定（noteWaf），导致「误报出口 IP 被拦」的全局 503。
+  assert.equal(classify(400, body).kind, 'channel_blocked', '11128 必须判为 channel_blocked')
 
   // ⚠️ 配对的**反向**用例：真正的 11140 仍须罚账号（否则非法请求不会被制止）
   const illegal = JSON.stringify({ code: 11140, msg: 'illegal request' })
@@ -1076,10 +1089,14 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
 test('🔴 渠道拦截不得触发账号熔断（好号被逐个熔断就是用户报的现象）', () => {
   // `waf_blocked` 的处置必须是**软冷却 + 不换号**：
   // 换号撞的是同一套渠道判定，只会把风控放大到更多账号上。
-  const mapped = mapErrorToPunishment('waf_blocked')
-  assert.equal(mapped.dimension, 'soft', '⚠️ 渠道拦截必须软冷却，不能 breaker')
-  assert.notEqual(mapped.dimension, 'breaker', '熔断会让好号被逐个停用')
+  const mapped = mapErrorToPunishment('channel_blocked')
+  assert.equal(mapped.punish, false, '⚠️ 渠道拦截**不该罚账号**（它说的是请求指纹，不是账号）')
   assert.equal(mapped.rotate, false, '⚠️ 不换号 —— 换号撞同一堵墙且放大风控')
+
+  // ⚠️ 同时确认 HTTP 403 的 WAF 仍然要软冷却（那是真的拦截）
+  const waf = mapErrorToPunishment('waf_blocked')
+  assert.equal(waf.punish, true, 'HTTP 403 的 WAF 仍须软冷却')
+  assert.equal(waf.dimension, 'soft')
 })
 
 test('🔴 流内错误必须按类别罚，不能一律 breaker', () => {
@@ -1127,4 +1144,51 @@ test('⚠️ 客户端版本号必须与仓库内实测依据一致（5.5.6）',
   // 同仓库内保持一致
   const rt = readFileSync('src/upstream/realtime.ts', 'utf8')
   assert.ok(rt.includes("'5.5.6'"), 'realtime 用的也是 5.5.6（保持一致）')
+})
+
+test('🔴 渠道拦截绝不能触发 IP 级判定（否则误报「出口 IP 被 WAF 拦截」）', () => {
+  // ## 实测缺陷（用户报两个 503）
+  //
+  // 报障原文：
+  // ```
+  // 503: 出口 IP 疑似被上游 WAF 拦截（短时间内多个账号接连 403）
+  // 503: 供应商「workbuddy」的 1 个账号都在冷却中…约 30 分钟后自动恢复
+  // ```
+  // 但「两个明明都是正常的」。
+  //
+  // 根因是我上一轮的修法**引入了新缺陷**：把 11128 归为 `waf_blocked`，
+  // 而 `waf_blocked` 会触发 `noteWaf` 的 **IP 级判定** ——
+  // 每次 11128 都被记成「IP 级 403 命中」，凑够 `WAF_IP_THRESHOLD = 2`
+  // 就**全局停服 60 秒**。而用户有 3 个账号，极易触发。
+  //
+  // ⚠️ 11128 是**正常的业务码响应**（`{"code":11128}`），
+  // 不是 HTTP 403 无信封 —— 两者形态完全不同，必须分开分类。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf("if (kind === 'waf_blocked')")
+  assert.ok(i > 0, '应能找到 IP 级判定入口')
+  const block = stripComments(src.slice(i, i + 400))
+
+  // IP 级判定**只**对 waf_blocked 触发
+  assert.ok(/kind === 'waf_blocked'/.test(block), 'IP 级判定只应对 HTTP 403 的 WAF 触发')
+  assert.ok(
+    !/channel_blocked/.test(block),
+    '⚠️ channel_blocked（11128）**不得**进入 IP 级判定 —— 它与出口 IP 无关',
+  )
+})
+
+test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、处置不同）', () => {
+  // - `waf_blocked`：**HTTP 403 + 无业务信封** ⇒ 可能是出口 IP 级 ⇒ 需要 IP 判定
+  // - `channel_blocked`：**业务码 11128** ⇒ 请求指纹问题 ⇒ 与 IP / 账号都无关
+  //
+  // ⚠️ 混为一类会产生两个假故障：
+  //   ① 健康账号被逐个软冷却；
+  //   ② 凑够阈值后误报「出口 IP 被拦」并全局停服。
+  const src = readFileSync('src/upstream/client.ts', 'utf8')
+  assert.ok(/11128: 'channel_blocked'/.test(src), '11128 必须归为 channel_blocked')
+  assert.ok(!/11128: 'waf_blocked'/.test(src), '⚠️ 不得再归为 waf_blocked')
+
+  // 两者的处置都要「不换号」，但罚款不同
+  assert.equal(mapErrorToPunishment('channel_blocked').rotate, false)
+  assert.equal(mapErrorToPunishment('channel_blocked').punish, false, '不罚账号')
+  assert.equal(mapErrorToPunishment('waf_blocked').punish, true, 'HTTP 403 仍要软冷却')
 })
