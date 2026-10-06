@@ -48,6 +48,37 @@ export function cliUserAgent(): string {
   return `WorkBuddy/${CLIENT_VERSION} WorkBuddy/${CLIENT_VERSION} CLI/${CLI_VERSION}`
 }
 
+/**
+ * **国际版**（workbuddy.ai）的三段式 UA。
+ *
+ * ## 🔴 与国内版的差别只在中间那段：`WorkBuddy AI`
+ *
+ * ```
+ * 国内版: WorkBuddy/5.5.2 WorkBuddy/5.5.2    CLI/5.5.2
+ * 国际版: WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2
+ *                         ^^^^^^^^^^^ 多了 " AI"
+ * ```
+ *
+ * ⚠️ 这不是装饰：**上游据此判定「渠道是否被认可」**，用错形态会回
+ * `11128 Illegal API invocation from an unapproved channel`
+ *（而 `displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
+ *
+ * 依据：参考实现 `src/product.ts:70` 的 `WORKBUDDY_UA_INTL`
+ *（`deepseek-harness-codearts`）。
+ */
+export function cliUserAgentIntl(): string {
+  return `WorkBuddy/${CLIENT_VERSION} WorkBuddy AI/${CLIENT_VERSION} CLI/${CLI_VERSION}`
+}
+
+/**
+ * 国际版的客户端版本号。
+ *
+ * ⚠️ 参考实现国际版用 **5.5.2**（`src/product.ts:484`），而国内版 CodeBuddy 用
+ * `clientVersion: '1.106.1'` / `cliVersion: '2.137.1'`。
+ * 我们此前对两个变体都用同一组国内版版本号 —— 那也是渠道指纹不匹配的来源之一。
+ */
+export const CLIENT_VERSION_INTL = '5.5.2'
+
 /** 桌面端 UA（`desktop.go:43`）。 */
 export function desktopUserAgent(): string {
   return `WorkBuddy/${DESKTOP_VERSION} WorkBuddy/${DESKTOP_VERSION} CLI/${DESKTOP_CLI_VERSION}`
@@ -97,19 +128,101 @@ export type HeaderMap = Record<string, string>
  * ⚠️ `X-CodeBuddy-Request: 1` 是**官方客户端风控闸门头，所有 API 请求必带**
  * （Go 侧记为 D1）。少了它上游可能判定为非官方客户端。
  */
-export function cliCommonHeaders(input: { uid: string; machineId: string; sessionId: string }): HeaderMap {
+export function cliCommonHeaders(input: {
+  uid: string
+  machineId: string
+  sessionId: string
+  /**
+   * 该请求属于哪个变体（默认国内版 buddy）。
+   *
+   * ⚠️ **必须按变体切换**（实测缺陷）：国际版端点
+   *（`www.workbuddy.ai`）与国内版（`copilot.tencent.com`）**要求不同的渠道指纹**。
+   * 用国内版指纹打国际版端点会回
+   * `11128 unapproved channel`（伪装成「安全策略拦截」）。
+   *
+   * ## 参考实现的对照（`deepseek-harness-codearts/src/product.ts`）
+   *
+   * | 项 | 国内版 CodeBuddy | 国际版 WorkBuddy |
+   * |---|---|---|
+   * | `apiDomain`/`X-Domain` | `copilot.tencent.com` | `www.workbuddy.ai` |
+   * | `productCode`/`X-Product-Code` | `codebuddy` | `workbuddy` |
+   * | UA 中段 | `WorkBuddy` | **`WorkBuddy AI`** |
+   * | `clientVersion` | `1.106.1` | `5.5.2` |
+   */
+  variant?: 'buddy' | 'workbuddy'
+}): HeaderMap {
+  const intl = input.variant === 'workbuddy'
+  // ⚠️ `X-Domain` 必须与**实际请求的端点**一致，否则身份与目的地址自相矛盾 ——
+  // 参考实现对此有明确注释（`buddy-adapter.ts:1958-1966`）。
+  const domain = intl ? 'www.workbuddy.ai' : 'copilot.tencent.com'
+  const webOrigin = intl ? 'https://www.workbuddy.ai' : 'https://www.codebuddy.cn'
   return {
     'Content-Type': 'application/json',
     Accept: 'application/json',
     'X-Requested-With': 'XMLHttpRequest',
-    Origin: 'https://www.codebuddy.cn',
-    Referer: 'https://www.codebuddy.cn/',
-    'User-Agent': cliUserAgent(),
+    Origin: webOrigin,
+    Referer: `${webOrigin}/`,
+    // ⚠️ UA 按变体切换（中段 `WorkBuddy AI` 只在国际版出现）
+    'User-Agent': intl ? cliUserAgentIntl() : cliUserAgent(),
     'X-CodeBuddy-Request': '1',
     'Accept-Language': 'zh-CN',
     'X-Machine-ID': input.machineId,
     'X-Session-ID': input.sessionId,
+    // ⚠️ 以下三个头**原先完全缺失**（实测缺陷），而参考实现必发：
+    // 它们共同构成「渠道归属」指纹。
+    'X-Domain': domain,
+    'X-Product-Code': intl ? 'workbuddy' : 'codebuddy',
   }
+}
+
+/**
+ * **参考实现口径**的 chat 出站头（`deepseek-harness-codearts`）。
+ *
+ * ## ⚠️ 为什么需要它与 `cliChatHeaders` 并存（实测对比的结论）
+ *
+ * 用户报「在 DSH 用参考插件几乎没失败过，而你这里问题一堆」。
+ * 逐行对比后发现**两套头的差异很大**：
+ *
+ * | 头 | 参考实现（不失败） | 我们原先（11128） |
+ * |---|---|---|
+ * | `Accept` | **`text/event-stream`** | `application/json, text/event-stream` |
+ * | `X-Domain` | ✅ `www.workbuddy.ai` | ❌ 缺失 |
+ * | `X-Product-Code` | ✅ `workbuddy` | ❌ 缺失 |
+ * | `Origin`/`Referer` | ❌ **不发** | ✅ 发（国内域名） |
+ * | `X-Requested-With` / `X-CodeBuddy-Request` | ❌ 不发 | ✅ 发 |
+ * | `X-Machine-ID` / `X-Session-ID` | ❌ 不发 | ✅ 发 |
+ * | `X-Conversation-Request-ID` 等 4 个 | ❌ 不发 | ✅ 发 |
+ *
+ * 参考实现只发 **11 个**头（`buddy-adapter.ts:1950-1982`）。
+ * 我们那批多余的头来自 **Go 侧的实现**（`internal/upstream/headers.go`），
+ * 而那套口径在国际版端点上**不被认可** ⇒ `11128 unapproved channel`。
+ *
+ * ⇒ 这里按**参考实现逐字对齐**：只发它发的那些。
+ *
+ * @param input 与 `cliChatHeaders` 相同的输入（保留形参以便将来切换）
+ */
+export function referenceChatHeaders(input: {
+  uid: string
+  accessToken: string
+  variant?: 'buddy' | 'workbuddy'
+}): HeaderMap {
+  const intl = input.variant === 'workbuddy'
+  const headers: HeaderMap = {
+    Accept: 'text/event-stream',
+    'Content-Type': 'application/json',
+    // ⚠️ 与端点一致（参考实现 `buddy-adapter.ts:1969`）
+    'X-Domain': intl ? 'www.workbuddy.ai' : 'copilot.tencent.com',
+    'X-Product-Code': intl ? 'workbuddy' : 'codebuddy',
+    'X-Agent-Purpose': 'conversation',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Version': intl ? CLIENT_VERSION_INTL : CLIENT_VERSION,
+    'X-Product': 'WorkBuddy',
+    // ⚠️ UA 按变体切换（国际版中段是 `WorkBuddy AI`）
+    'User-Agent': intl ? cliUserAgentIntl() : cliUserAgent(),
+  }
+  if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
+  return headers
 }
 
 /** chat 出站头：在 common 之上加鉴权与会话头族（`headers.go:198-268`）。 */
@@ -122,14 +235,25 @@ export function cliChatHeaders(input: {
   conversationRequestId: string
   /** `X-Conversation-ID`：入站透传值，空则不发（不伪造）。 */
   conversationId?: string
+  /** 变体（见 `cliCommonHeaders` 的说明）。默认国内版。 */
+  variant?: 'buddy' | 'workbuddy'
 }): HeaderMap {
   const headers: HeaderMap = {
     ...cliCommonHeaders(input),
-    Accept: 'application/json, text/event-stream',
+    // ⚠️ **必须精确是 `text/event-stream`**（实测缺陷）。
+    //
+    // 我们此前发的是 `application/json, text/event-stream`（多一个 json 偏好），
+    // 而参考实现逐字发 `text/event-stream`（`buddy-adapter.ts:1954`）。
+    //
+    // ⚠️ 上游会把它当作**渠道指纹**的一部分 —— 对不上就回
+    // `11128 Illegal API invocation from an unapproved channel`
+    //（伪装成「安全策略拦截」）。这类「多一个字符就不认」的判据在本项目里
+    // 出现过多次（如 UA 中段的 ` AI`），故**逐字对齐参考实现**。
+    Accept: 'text/event-stream',
     'X-Agent-Purpose': 'conversation',
     'X-IDE-Name': 'WorkBuddy',
     'X-IDE-Type': 'WorkBuddy',
-    'X-IDE-Version': CLIENT_VERSION,
+    'X-IDE-Version': input.variant === 'workbuddy' ? CLIENT_VERSION_INTL : CLIENT_VERSION,
     // ⚠️ `X-Product` 发的是**产品归属名**，不是部署类型 `SaaS`。
     // Go 侧 `product.ts:113-118` 记录过：早年误发 `SaaS` 导致后台归因不到产品。
     'X-Product': 'WorkBuddy',

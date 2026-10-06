@@ -26,7 +26,7 @@
 
 import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
-import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
+import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError } from './http.js'
@@ -460,12 +460,12 @@ export async function handleChatCompletions(
     try {
       upstream = await fetch(`${bases.chat}/v2/chat/completions`, {
         method: 'POST',
-        headers: cliChatHeaders({
+        // ⚠️ 与 provider 路径用**同一套**参考实现口径的头（见 referenceChatHeaders）。
+        // 两条 chat 路径的口径必须一致，否则国内版与国际版会表现不同。
+        headers: referenceChatHeaders({
           uid: candidate.uid,
-          machineId,
-          sessionId,
           accessToken: candidate.credential.accessToken,
-          conversationRequestId,
+          variant: DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
         }),
         body: prepared,
         signal: request.signal,

@@ -1192,3 +1192,59 @@ test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、�
   assert.equal(mapErrorToPunishment('channel_blocked').punish, false, '不罚账号')
   assert.equal(mapErrorToPunishment('waf_blocked').punish, true, 'HTTP 403 仍要软冷却')
 })
+
+// ───── `role: 'developer'` 导致 11128（用户报两处 502 的根因） ─────
+
+test("🔴 `role:'developer'` 必须被降级为 system（否则上游判「首条不是 system」→ 11128）", () => {
+  // ## 实测根因（用户报「错误 502 … unapproved channel」）
+  //
+  // 用本地日志代理抓到 pi（`pi-coding-agent`）的**真实请求体**：
+  // ```json
+  // {"model":"workbuddy/deepseek-v4.1-flash",
+  //  "messages":[{"role":"developer","content":"You are an expert coding assistant…"}, …]}
+  // ```
+  // ⚠️ 它用的是 **`developer`** 角色（OpenAI **新**规范），而**上游只认**
+  // `system` / `user` / `assistant` / `tool`。
+  //
+  // 我们原样转发 ⇒ 上游判定「首条不是 system」⇒ 国际版回
+  // `11128 Illegal API invocation from an unapproved channel`
+  //（`displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
+  //
+  // 参考实现的做法是**丢弃** `developer`（`message-shape.ts:99,125`，
+  // 理由：它只承载工具增删元数据）。但 pi 那条**确实承载系统提示词**，
+  // 丢掉会让模型失去行为约束 ⇒ 我们**多做一步**：有内容就降级为 `system`。
+  const msgs = [
+    { role: 'developer', content: 'You are an expert coding assistant.' },
+    { role: 'user', content: 'hi' },
+  ]
+  const out = cleanupToolPairing(msgs) as Array<Record<string, unknown>>
+  assert.equal(out.length, 2, '两条都应保留')
+  assert.equal(out[0]!.role, 'system', '⚠️ developer 必须降级为 system（保住提示词语义）')
+  assert.equal(out[0]!.content, 'You are an expert coding assistant.')
+
+  // ⚠️ 配对的**反向**用例：空的 developer（纯元数据）应当**丢弃**，
+  // 否则会给上游造出一条空 system。
+  const meta = cleanupToolPairing([
+    { role: 'developer', content: '' },
+    { role: 'user', content: 'hi' },
+  ]) as Array<Record<string, unknown>>
+  assert.equal(meta.length, 1, '空 developer 应被丢弃')
+  assert.equal(meta[0]!.role, 'user')
+
+  // 无 developer 时**不得**改动（零成本透传，且保持数组引用不变）
+  const plain = [{ role: 'user', content: 'hi' }]
+  assert.equal(cleanupToolPairing(plain), plain, '无改动时应返回原数组引用')
+})
+
+test("⚠️ 国际版的「首条必须是 system」判据必须把 developer 视同 system", () => {
+  // ⚠️ 若只认 `role === 'system'`，`withSystemFirst` 会**多补一条**
+  // 「You are a helpful assistant.」并排在真正的提示词**前面** ——
+  // 那会稀释（甚至覆盖）客户端自己的行为约束。
+  //
+  // 而 pi 的 developer 是首条 ⇒ 必须被视同「已有 system」，不补。
+  const src = readFileSync('src/providers/buddy.ts', 'utf8')
+  const i = src.indexOf('function withSystemFirst')
+  const block = stripComments(src.slice(i, i + 1200))
+  assert.ok(/firstRole === 'system'/.test(block), '应认 system')
+  assert.ok(/firstRole === 'developer'/.test(block), '⚠️ developer 也必须视同 system')
+})

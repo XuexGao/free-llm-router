@@ -31,7 +31,7 @@
  */
 
 import { type Env } from '../env.js'
-import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
+import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
@@ -125,7 +125,17 @@ function withSystemFirst(input: unknown, required: boolean): unknown {
   const messages = body.messages
   if (!Array.isArray(messages)) return input
   const first = messages.length > 0 ? (messages[0] as Record<string, unknown> | undefined) : undefined
-  if (first !== undefined && first.role === 'system') return input
+  // ⚠️ **`developer` 也要算「已有 system」**（实测缺陷）。
+  //
+  // pi 这类客户端把系统提示词放在 `{role:'developer'}` 里（OpenAI 新规范），
+  // 而它在 `prepareChatBody` 里会被**降级为 `system`**（见 payload.ts）。
+  // 若这里只认 `role === 'system'`，就会**多补一条**无用的
+  // 「You are a helpful assistant.」并排在真正的提示词**前面** ——
+  // 那会稀释（甚至覆盖）客户端自己的行为约束。
+  const roleOf = (m: Record<string, unknown> | undefined): string =>
+    m === undefined ? '' : typeof m.role === 'string' ? m.role : ''
+  const firstRole = roleOf(first)
+  if (firstRole === 'system' || firstRole === 'developer') return input
   return {
     ...body,
     messages: [{ role: 'system', content: 'You are a helpful assistant.' }, ...messages],
@@ -238,6 +248,9 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
         sessionId,
         accessToken: credential.accessToken,
         conversationRequestId: crypto.randomUUID().replaceAll('-', ''),
+        // ⚠️ **必须传变体**：国际版与国内版要求不同的渠道指纹，
+        // 用错会回 `11128 unapproved channel`（伪装成「安全策略拦截」）。
+        variant: config.id,
       }),
       signal: AbortSignal.timeout(20_000),
     })
@@ -279,12 +292,18 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
 
     return await fetch(`${bases.chat}/v2/chat/completions`, {
       method: 'POST',
-      headers: cliChatHeaders({
+      // ⚠️ **chat 用参考实现口径的头**（11 个），不是 Go 侧那套。
+      //
+      // 实测对比：用户「在 DSH 用参考插件几乎没失败过」，而我们一直回 11128。
+      // 逐行对比后确认两套头差异很大（见 `referenceChatHeaders` 的对照表）——
+      // 我们多发了一批 Go 侧口径的头（Origin/Referer/X-Machine-ID/
+      // X-Conversation-Request-ID…），**在国际版端点上不被认可**。
+      //
+      // 唯一保留的额外头是 `Authorization`（参考实现也发）。
+      headers: referenceChatHeaders({
         uid: credential.uid,
-        machineId,
-        sessionId,
         accessToken: credential.accessToken,
-        conversationRequestId: crypto.randomUUID().replaceAll('-', ''),
+        variant: config.id,
       }),
       body,
       signal: request.signal,

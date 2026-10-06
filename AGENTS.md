@@ -1197,6 +1197,77 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 | **会话粘性** | — | ✅ **已修**，见下方更新记录 |
 | **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
 
+#### 本节更新记录（2026-10-06 三）：11128 的真正根因 —— 与参考实现逐行对比后定位
+
+**用户报**：`502 channel_blocked: Illegal API invocation from an unapproved channel`
+（国际版与国内版都报），并指出关键线索：
+
+> 「我在 dsh 用 https://gitee.com/iJetLi/deepseek-harness-codearts 这个插件**几乎没失败过**」
+
+**⇒ 同一批账号、同一上游，参考实现不失败而我们失败，差异只可能在请求构造上。**
+把该仓库 clone 下来逐行对比后，找到**两个真正的根因**（都不是账号问题）。
+
+##### 根因一：`role: 'developer'` 被原样转发（决定性）
+
+用**本地日志代理**截获 pi（`pi-coding-agent`）发给我们的真实请求体：
+
+```json
+{"model":"workbuddy/deepseek-v4.1-flash",
+ "messages":[{"role":"developer","content":"You are an expert coding assistant…"}, …]}
+```
+
+⚠️ pi 用的是 **`developer`** 角色（OpenAI **新**规范），而**上游只认**
+`system` / `user` / `assistant` / `tool`。
+我们原样转发 ⇒ 上游判定「**首条不是 system**」⇒ 回
+`11128 unapproved channel`，并用 `displayMsg` **伪装成「安全策略拦截」**
+（"The request was blocked by security policy"），极易误判成账号被封。
+
+**参考实现的做法**（`src/message-shape.ts:99,125`）：**丢弃** `developer`
+（理由：它只承载工具增删元数据 `tool-addition` / `tool-removal`，不是对话内容）。
+
+⚠️ 但 pi 那条 **确实承载系统提示词** —— 直接丢弃会让模型失去行为约束。
+故本项目**多做一步**：**有内容就降级为 `system`**，只有空内容（纯元数据）才丢弃。
+
+同时修正 `withSystemFirst`（`buddy.ts`）：它原判据只认 `role === 'system'`，
+遇到 `developer` 会**多补一条**「You are a helpful assistant.」并排在
+**真正的提示词前面** —— 那会稀释甚至覆盖客户端自己的行为约束。
+现在 `developer` 也视同「已有 system」，不补。
+
+##### 根因二：chat 出站头的口径与参考实现不同
+
+逐行对比 `buddy-adapter.ts:1950-1982` 与我们原先的头：
+
+| 头 | 参考实现（不失败） | 我们原先（11128） |
+|---|---|---|
+| `Accept` | **`text/event-stream`** | `application/json, text/event-stream` |
+| `X-Domain` | ✅ `www.workbuddy.ai` | ❌ 缺失 |
+| `X-Product-Code` | ✅ `workbuddy` | ❌ 缺失 |
+| `Origin` / `Referer` | ❌ 不发 | ✅ 发（**国内**域名打国际版端点） |
+| `X-Requested-With` / `X-CodeBuddy-Request` | ❌ 不发 | ✅ 发 |
+| `X-Machine-ID` / `X-Session-ID` | ❌ 不发 | ✅ 发 |
+| `X-Conversation-Request-ID` 等 4 个 | ❌ 不发 | ✅ 发 |
+| UA 中段 | `WorkBuddy **AI**`（国际版） | `WorkBuddy` |
+
+参考实现只发 **11 个**头；我们那批多余的头来自 **Go 侧实现**
+（`internal/upstream/headers.go`），而那套口径**在国际版端点上不被认可**。
+
+**修法**：新增 `referenceChatHeaders()` —— 按参考实现**逐字对齐**只发那 11 个，
+两条 chat 路径（gateway 的 buddy 路径 + provider 路径）统一使用它。
+同时给 `cliChatHeaders` 补上按变体切换的 `X-Domain` / `X-Product-Code` / UA
+（中段 ` AI` 只在国际版出现）、`X-IDE-Version`（国际版 `5.5.2`）。
+
+##### 验证
+
+- 直连 curl：国际版 **5/5 通过**（修复前 8/8 全 11128）；
+- **pi agent**：国际版与国内版**都正常返回**（修复前两者都失败）。
+
+##### ⚠️ 方法论教训
+
+**「同一批账号，别人的实现能用」是最强的定位线索** ——
+它把问题**排除在账号/上游之外**，直接指向请求构造。
+我前面几轮一直在账号、冷却、CPU、IP 级 WAF 上打转，
+**早就该去读那个"能用"的实现**。
+
 #### 本节更新记录（2026-10-06 二）：我上一轮的修法引入的两个假故障
 
 **用户报**（就在上一轮修复之后）：

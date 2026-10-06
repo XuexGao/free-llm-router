@@ -108,6 +108,45 @@ export function cleanupToolPairing(messages: unknown[]): unknown[] {
     }
     const msg = raw as Record<string, unknown>
 
+    // ⚠️ **丢弃 `role: 'developer'` 消息**（实测缺陷，用户报两处 11128）。
+    //
+    // ## 为什么必须丢
+    //
+    // OpenAI 的**新**规范引入了 `developer` 角色，而**上游只认**
+    // `system` / `user` / `assistant` / `tool`。
+    // 实测：pi（`pi-coding-agent`）把系统提示词放在
+    // `{role:'developer', content:'You are an expert coding assistant…'}` 里，
+    // 我们原样转发 ⇒ 上游判定「首条不是 system」⇒ 国际版回
+    // `11128 Illegal API invocation from an unapproved channel`
+    //（而 `displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
+    //
+    // ## 为什么是「丢弃」而不是「改名为 system」
+    //
+    // 参考实现（`deepseek-harness-codearts/src/message-shape.ts:99,125`）的做法
+    // 就是**丢弃**，理由写得明确：
+    // > `role:'developer'` 只承载工具增删元数据（`tool-addition` / `tool-removal`），
+    // > 不是对话内容。
+    //
+    // ⚠️ 而 pi 那条 developer **确实承载了系统提示词**，丢掉会让模型失去行为约束。
+    // 故这里比参考实现**多做一步**：内容非空时**降级为 `system`**（保住语义），
+    // 只有空内容才真正丢弃。这样两种来源（元数据 / 真提示词）都得到正确处理。
+    if (msg.role === 'developer') {
+      const content = msg.content
+      const text = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+          ? content.map((b) => {
+              const o = b as Record<string, unknown> | null
+              return o !== null && typeof o === 'object' && typeof o.text === 'string' ? o.text : ''
+            }).join('')
+          : ''
+      changed = true
+      if (text.trim() === '') continue // 纯元数据 ⇒ 丢弃
+      // 有真实内容 ⇒ 降级为 system（保住提示词语义）
+      out.push({ role: 'system', content: msg.content })
+      continue
+    }
+
     // 剔除孤儿 tool 消息（tool_call_id 未被子集声明）
     if (msg.role === 'tool') {
       const id = msg.tool_call_id
