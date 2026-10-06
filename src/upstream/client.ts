@@ -82,7 +82,22 @@ const CODE_KIND: Record<number, ErrorKind> = {
   12153: 'session_dead',
   11115: 'context_exceeded',
   11135: 'image_invalid',
-  11128: 'request_illegal',
+  // ⚠️ **11128 不是 `request_illegal`**（实测缺陷，用户报「账号是好的但就是用不了」）。
+  //
+  // 上游原文：`Illegal API invocation from an unapproved channel` /
+  // `The request was blocked by security policy.`
+  //
+  // 关键区别：
+  // - `11140`（真正的 request_illegal）是**这个账号发了非法请求** ⇒ 该罚账号；
+  // - `11128` 是**请求的渠道指纹不被认可** ⇒ 与账号无关，罚账号是错的。
+  //
+  // ⚠️ 而且 11128 还是上游**反探测机制自身的错误码**（AGENTS.md §6.6）：
+  // 请求体里出现裸 `11128` 就会触发它。也就是说这个码**既表示拦截、又是拦截条件**。
+  //
+  // 归类为 `waf_blocked`（渠道/风控层拦截）⇒ 走**账号级软冷却**而非熔断，
+  // 且**不换号**（换号撞的是同一套渠道判定，只会放大风控）。
+  // 见 `mapErrorToPunishment` 对 `waf_blocked` 的处置。
+  11128: 'waf_blocked',
   // 幂等命中：签到已领（视为成功）
   10001: 'already_done',
   1001: 'already_done',

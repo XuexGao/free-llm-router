@@ -18,8 +18,26 @@
  * | mp | `www.codebuddy.cn` | `ideType:"WorkBuddy_MP"`, `platform:"mini_program"` |
  */
 
-/** 版本号：与 Go 侧默认值对齐（`headers.go:61-67`）。 */
-export const CLIENT_VERSION = '5.5.4'
+/**
+ * 客户端版本号（写进 UA 与 `X-IDE-Version`）。
+ *
+ * ## ⚠️ 为什么从 `5.5.4` 改成 `5.5.6`（实测依据）
+ *
+ * 原值 5.5.4 是照抄 Go 侧 `headers.go:61-67` 的**默认值**，而那个默认值是**旧的**：
+ *
+ * 1. AGENTS.md §6.1 记录的**桌面端实测 UA** 是 `WorkBuddy/5.5.6`；
+ * 2. 本仓库自己的 `realtime.ts:222` 在**同一个端点**
+ *    （`/v2/chat/completions`）上写的是 `'X-IDE-Version': '5.5.6'`
+ *    —— 同一个仓库里两个版本号本身就是不一致。
+ *
+ * ⚠️ 版本号是上游判定**渠道是否被认可**的输入之一（`11128
+ * "Illegal API invocation from an unapproved channel"`）。
+ * 旧版本可能被划入「不认可的渠道」，而这与账号本身是否有效**无关**。
+ *
+ * ⚠️ 这里**不编造**更新的版本号：只对齐到**本仓库内已有依据**的那个值
+ * （桌面端实测 + realtime 一致）。若上游继续升版，应重新实测后再改。
+ */
+export const CLIENT_VERSION = '5.5.6'
 export const CLI_VERSION = '2.137.1'
 /** 桌面端实测 UA（`desktop.go:43`）。 */
 export const DESKTOP_VERSION = '5.5.6'

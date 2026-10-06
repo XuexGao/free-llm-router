@@ -1197,6 +1197,75 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 | **会话粘性** | — | ✅ **已修**，见下方更新记录 |
 | **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
 
+#### 本节更新记录（2026-10-06）：11128 渠道拦截被误判为账号故障
+
+**用户报**：「buddy 和 workbuddy 明明账号是好的，但就是用不了」，报错两类：
+
+```
+400: {"message":"所有账号均失败，最后一次：request_illegal: Illegal API invocation from an unapproved channel"}
+400: {"message":"供应商「WorkBuddy（国际版）」请求失败：{"code":11128,
+      "msg":"Illegal API invocation from an unapproved channel",
+      "displayMsg":{"zh":"请求被安全策略拦截，请稍后重试或联系支持。"}}"}
+```
+
+**三个独立缺陷叠加**，共同造成「账号好的却用不了」：
+
+**① `11128` 被归为 `request_illegal` ⇒ 罚账号（最严重）**
+
+上游原文是 `Illegal API invocation from an **unapproved channel**` ——
+这是**请求的渠道指纹不被认可**，与账号好坏**无关**。
+
+但代码把它归成 `request_illegal`，而 `mapErrorToPunishment` 对它的处置是
+`dimension: 'breaker'` ⇒ `fails++`，**3 次就熔断账号 30 分钟**。
+
+⇒ **好账号被逐个熔断** —— 这正是用户看到的现象。
+实测清除前的状态：两个 buddy 账号 `fails=1` / `fails=2`，**正在往熔断阈值累积**。
+
+⚠️ 与真正该罚账号的 `11140` 的区别：`11140` 是「这个账号发了非法请求」；
+`11128` 是「**这个请求的渠道**不被认可」。两者的处置必须不同。
+
+**修法**：`11128 → waf_blocked`（渠道/风控层）⇒ **软冷却 + 不换号**
+（换号撞的是同一套渠道判定，只会把风控放大到更多账号上）。
+
+**② 流内错误一律按 `breaker` 记账**
+
+`onError` 回调里拿到流内错误后，**原先一律** `kind: 'breaker'` ⇒ 同样熔断好号。
+已改为 `punishmentForStreamError(message)`：文案含
+`unapproved channel` / `security policy` / `11128` / `安全策略` ⇒ `soft`；其余仍是 `breaker`。
+
+⚠️ 这里按**文案**判定而非 `kind`：流内错误在回调里只有一句字符串，没有结构化类别。
+
+**③ 上游 400 被原样透传给客户端 ⇒ 伪装成「客户端请求有错」**
+
+用户看到的 `Request failed: **400**` 是**上游的状态码被原样透传**。
+而轮转完**所有**账号仍失败时，故障点在**我们与上游之间** ⇒ 正确语义是 **502**。
+
+⚠️ 400 让客户端以为「是我请求写错了」，于是去改请求 —— 而真实原因是上游渠道判定。
+
+**修法**：新增 `clientStatusFor(upstreamStatus, kind)`：
+- 上游 5xx / 渠道拦截 / 限流 / 鉴权 ⇒ **502**；
+- **例外**：`context_exceeded` / `image_invalid` 是**请求内容**的问题
+  ⇒ 如实回 **400**（否则客户端会一直重试必然失败的请求）。
+
+**④ 顺带修掉一个内部不一致：客户端版本号**
+
+`headers.ts` 发 `5.5.4`（抄自 Go 侧**旧**默认值），而本仓库 `realtime.ts:222`
+在**同一个端点**（`/v2/chat/completions`）上写的是 `5.5.6`，
+且 AGENTS.md §6.1 记录的桌面端实测也是 `5.5.6`。
+
+⚠️ 版本号是上游判定**渠道是否被认可**的输入之一（11128）。
+已对齐为 `5.5.6` —— **只对齐到本仓库内已有依据的值，不编造更新的版本**。
+
+### 处置
+
+部署后**清除了被 11128 误累积的熔断计数**（`/admin/cooldowns/clear`，
+cn 清 4 条、global 清 1 条）。清后 4 个账号均
+`fails=0 breakerUntil=0 disabled=false`。
+
+⚠️ 排查中观察到 `http=000`（连接层）现象 —— 但**对照实验**证明它是
+**客户端本机网络抖动**：纯 Worker 的 `/healthz`（完全不碰上游）也出现同样现象，
+而 cloudflare.com 5/5 正常。故与本服务无关，不要误判成服务故障。
+
 #### 本节更新记录（2026-10-05 三）：ZCode 长回答被切断 —— 根因与两次误判
 
 **用户报**：「思考 78 秒又断了」（ZCode 客户端）。

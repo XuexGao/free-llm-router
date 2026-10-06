@@ -86,6 +86,61 @@ export function mapErrorToPunishment(kind: ErrorKind): {
 }
 
 /**
+ * 上游错误 → **返回给客户端的** HTTP 状态码。
+ *
+ * ## ⚠️ 为什么不能原样透传上游状态码（实测缺陷）
+ *
+ * 用户报的错是 `Request failed: 400: {"message":"所有账号均失败，最后一次：
+ * request_illegal: Illegal API invocation from an unapproved channel"}`
+ * —— **400 让客户端以为「是我自己请求写错了」**，而真实原因是
+ * **上游的渠道/风控判定**，与客户端的请求内容毫无关系。
+ *
+ * 轮转完**所有**账号仍失败时，故障点在**我们与上游之间**，
+ * 正确的语义是 **502 Bad Gateway**。
+ *
+ * ## 例外：确实是客户端请求问题的，保留 400
+ *
+ * `context_exceeded`（上下文超限）与 `image_invalid`（图片无效）是
+ * **请求内容**的问题 —— 换账号也不会好，客户端改请求才有用。
+ * 这两类如实回 400，否则客户端会一直重试同一个必然失败的请求。
+ */
+/**
+ * **流内错误**（HTTP 头已发出、错误出现在 SSE 帧里）该罚哪个维度。
+ *
+ * ## ⚠️ 为什么不能一律 `breaker`（实测缺陷，用户报「账号是好的但用不了」）
+ *
+ * 流内错误的文本里带着上游的业务码/文案。原实现**一律**按 `breaker` 记账 ⇒
+ * `fails++`，**3 次就熔断账号 30 分钟**。
+ *
+ * 但其中的**渠道拦截**（`11128 "unapproved channel"`）与账号好坏**无关** ——
+ * 它是**请求指纹**被判不认可。于是好账号会被逐个熔断，
+ * 表现为「账号明明都是好的，却越来越用不了」。
+ *
+ * ## 判据
+ *
+ * - 文案含渠道/风控关键词（`unapproved channel` / `security policy` / `11128`）
+ *   ⇒ `soft`（账号级软冷却，短期退避，不是熔断）；
+ * - 其余（真的流中断、未知错误）⇒ 维持 `breaker`。
+ *
+ * ⚠️ 这里按**文案**判定而不是按 `kind`：流内错误在 `onError` 回调里
+ * 拿到的只有一句 `message`，没有结构化的错误类别。
+ */
+export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
+  return /unapproved channel|security policy|11128|安全策略/i.test(message) ? 'soft' : 'breaker'
+}
+
+export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string): number {
+  // 上游 5xx ⇒ 网关上必然是 502
+  if (upstreamStatus >= 500) return 502
+  // 确实是「请求内容」的问题 ⇒ 如实回 400（客户端改请求才有用）
+  if (kind === 'context_exceeded' || kind === 'image_invalid') return 400
+  // 鉴权类：上游凭据问题，不是客户端的错
+  if (kind === 'auth_error') return 502
+  // 其余（渠道拦截 / 限流 / 模型不可用 / 未知）都归为网关侧故障
+  return 502
+}
+
+/**
  * 从业务码里再细分限流维度：6004 是**模型级**，14017 是**账号级**。
  *
  * ## ⚠️ 为什么必须细分（实测缺陷）
@@ -444,7 +499,8 @@ export async function handleChatCompletions(
       }
 
       lastError = {
-        status: upstream.status >= 500 ? 502 : upstream.status,
+        // ⚠️ 不原样透传上游状态码：400 会让客户端误以为「是我请求写错了」。
+        status: clientStatusFor(upstream.status, kind),
         message: `${kind}: ${msg || text.slice(0, 160)}`,
         kind,
       }
@@ -496,7 +552,18 @@ export async function handleChatCompletions(
         onError: (message) => {
           // 流**内**错误：无法改 HTTP 状态码了，但要记账
           void pool
-            .applyFailure({ uid: candidate.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })
+            // ⚠️ 按**错误类别**罚正确的维度，不能一律 breaker。
+            //
+            // 实测缺陷：渠道拦截（11128，被分类为 `waf_blocked`）原本会走到
+            // `kind: 'breaker'` ⇒ 3 次就**熔断账号 30 分钟**。
+            // 而渠道问题是**请求指纹**的事，与账号好坏无关 ——
+            // 结果是「账号明明好的，却越来越用不了」（好号被逐个熔断）。
+            .applyFailure({
+              uid: candidate.uid,
+              kind: punishmentForStreamError(message),
+              now: Date.now(),
+              reason: message.slice(0, 200),
+            })
             .catch(() => {})
         },
       }, wantsStream ? undefined : { model }),
@@ -892,7 +959,12 @@ async function handleProviderChat(input: {
                 clientGone: () => request.signal.aborted,
                 onError: (message) => {
                   const t = pool
-                    .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })
+                    .applyFailure({
+                      uid: picked.uid,
+                      kind: punishmentForStreamError(message),
+                      now: Date.now(),
+                      reason: message.slice(0, 200),
+                    })
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
                 },
@@ -949,7 +1021,11 @@ async function handleProviderChat(input: {
           reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
         })
         .catch(() => {})
-      lastError = { status: upstream.status >= 500 ? 502 : upstream.status, message: text.slice(0, 300) || `http=${upstream.status}` }
+      // ⚠️ 同上：不原样透传上游状态码（避免把网关故障伪装成客户端的 400）
+      lastError = {
+        status: clientStatusFor(upstream.status, 'unknown'),
+        message: text.slice(0, 300) || `http=${upstream.status}`,
+      }
       if (!rotate) break
       continue
     }
@@ -967,7 +1043,12 @@ async function handleProviderChat(input: {
         },
         onError: (message) => {
           const t = pool
-            .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: message.slice(0, 200) })
+            .applyFailure({
+              uid: picked.uid,
+              kind: punishmentForStreamError(message),
+              now: Date.now(),
+              reason: message.slice(0, 200),
+            })
             .catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
         },

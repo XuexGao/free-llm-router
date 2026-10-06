@@ -15,6 +15,7 @@
  */
 
 import { test } from 'node:test'
+import { classify } from '../src/upstream/client.ts'
 
 /**
  * 剥掉注释后再做源码断言。
@@ -38,7 +39,7 @@ import {
 } from '../src/gateway/payload.ts'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
 import { extractModels } from '../src/gateway/models.ts'
-import { isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, refineModelScoped } from '../src/gateway/server.ts'
+import { clientStatusFor, isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, punishmentForStreamError, refineModelScoped } from '../src/gateway/server.ts'
 
 // ─────────────────────── max_completion_tokens 翻译 ───────────────────────
 
@@ -1044,4 +1045,86 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
   const spreadIdx = block.indexOf('SPREAD_WINDOW_MS')
   assert.ok(prefIdx > 0 && spreadIdx > 0, '两段逻辑都应存在')
   assert.ok(prefIdx < spreadIdx, '⚠️ 粘性判断必须在摊开**之前**')
+})
+
+// ───── 「账号是好的但就是用不了」：11128 渠道拦截被误判为账号故障 ─────
+
+test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_illegal', () => {
+  // ## 实测缺陷（用户报「账号明明都是好的，但就是用不了」）
+  //
+  // 上游原文：`Illegal API invocation from an unapproved channel` /
+  // `The request was blocked by security policy.`
+  //
+  // 关键区别：
+  // - `11140`（真正的 request_illegal）是**这个账号发了非法请求** ⇒ 该罚账号；
+  // - `11128` 是**请求的渠道指纹不被认可** ⇒ 与账号好坏**无关**。
+  //
+  // ⚠️ 原实现把 11128 归为 `request_illegal` ⇒ `dimension: 'breaker'`
+  // ⇒ 罚账号（`fails++`，**3 次就熔断 30 分钟**）
+  // ⇒ 好账号被逐个熔断 ⇒ 正是用户看到的现象。
+  const body = JSON.stringify({
+    code: 11128,
+    msg: 'Illegal API invocation from an unapproved channel',
+  })
+  assert.equal(classify(400, body).kind, 'waf_blocked', '11128 必须判为渠道拦截')
+
+  // ⚠️ 配对的**反向**用例：真正的 11140 仍须罚账号（否则非法请求不会被制止）
+  const illegal = JSON.stringify({ code: 11140, msg: 'illegal request' })
+  assert.equal(classify(400, illegal).kind, 'request_illegal', '11140 仍是 request_illegal')
+})
+
+test('🔴 渠道拦截不得触发账号熔断（好号被逐个熔断就是用户报的现象）', () => {
+  // `waf_blocked` 的处置必须是**软冷却 + 不换号**：
+  // 换号撞的是同一套渠道判定，只会把风控放大到更多账号上。
+  const mapped = mapErrorToPunishment('waf_blocked')
+  assert.equal(mapped.dimension, 'soft', '⚠️ 渠道拦截必须软冷却，不能 breaker')
+  assert.notEqual(mapped.dimension, 'breaker', '熔断会让好号被逐个停用')
+  assert.equal(mapped.rotate, false, '⚠️ 不换号 —— 换号撞同一堵墙且放大风控')
+})
+
+test('🔴 流内错误必须按类别罚，不能一律 breaker', () => {
+  // ⚠️ 流内错误（HTTP 头已发出、错误在 SSE 帧里）原先**一律** `breaker`：
+  // `fails++`，3 次熔断 30 分钟。渠道拦截的文案走到这里就会误伤好号。
+  assert.equal(
+    punishmentForStreamError('upstream_error: Illegal API invocation from an unapproved channel'),
+    'soft', '⚠️ 渠道拦截必须软冷却',
+  )
+  assert.equal(punishmentForStreamError('The request was blocked by security policy.'), 'soft')
+  assert.equal(punishmentForStreamError('code 11128'), 'soft')
+  // ⚠️ 配对的**反向**用例：真正的流中断仍须熔断（否则坏号不会被剔除）
+  assert.equal(punishmentForStreamError('流传输中断：connection reset'), 'breaker')
+  assert.equal(punishmentForStreamError('upstream returned invalid json'), 'breaker')
+})
+
+test('🔴 不是客户端的错就不要回 400（否则客户端以为是自己请求写错了）', () => {
+  // ## 实测缺陷（用户报的正是这个）
+  //
+  // `Request failed: 400: {"message":"所有账号均失败，最后一次：request_illegal:
+  //  Illegal API invocation from an unapproved channel"}`
+  //
+  // ⚠️ 400 让客户端以为「是我自己请求写错了」，而真实原因是**上游渠道判定**。
+  // 轮转完所有账号仍失败时，故障点在**我们与上游之间** ⇒ 正确语义是 502。
+  assert.equal(clientStatusFor(400, 'waf_blocked'), 502, '⚠️ 渠道拦截不是客户端的错')
+  assert.equal(clientStatusFor(400, 'request_illegal'), 502, '账号侧非法请求也不是客户端的错')
+  assert.equal(clientStatusFor(429, 'rate_limited'), 502)
+  assert.equal(clientStatusFor(500, 'server'), 502)
+  assert.equal(clientStatusFor(401, 'auth_error'), 502, '凭据失效是网关侧问题')
+
+  // ⚠️ **例外必须保留**：确实是「请求内容」的问题 ⇒ 如实回 400，
+  // 否则客户端会一直重试一个必然失败的请求。
+  assert.equal(clientStatusFor(400, 'context_exceeded'), 400, '上下文超限是客户端该改的')
+  assert.equal(clientStatusFor(400, 'image_invalid'), 400, '图片无效是客户端该改的')
+})
+
+test('⚠️ 客户端版本号必须与仓库内实测依据一致（5.5.6）', () => {
+  // ⚠️ 原值 5.5.4 抄自 Go 侧默认值（旧值），而本仓库 `realtime.ts:222`
+  // 在**同一个端点**上写的是 5.5.6 —— 同一仓库两个版本号本身就不一致。
+  //
+  // 版本号是上游判定**渠道是否被认可**的输入之一（11128）。
+  const src = readFileSync('src/upstream/headers.ts', 'utf8')
+  assert.ok(/export const CLIENT_VERSION = '5\.5\.6'/.test(src), 'CLIENT_VERSION 应为 5.5.6')
+  assert.ok(!/CLIENT_VERSION = '5\.5\.4'/.test(src), '不得残留旧的 5.5.4')
+  // 同仓库内保持一致
+  const rt = readFileSync('src/upstream/realtime.ts', 'utf8')
+  assert.ok(rt.includes("'5.5.6'"), 'realtime 用的也是 5.5.6（保持一致）')
 })
