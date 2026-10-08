@@ -875,3 +875,57 @@ test('⚠️ 供应商排序不得改变默认供应商（避免悄悄改路由�
   const block = index.slice(i, i + 900)
   assert.ok(!/defaultProvider/.test(block), '设置端点不该改默认供应商')
 })
+
+test('🔴 loomy 必须支持短信验证码登录（且走**两步流程**，不是轮询）', () => {
+  // 用户要求「Loomy 和 LobsterAI 的设备码登录尽量支持一下」。
+  //
+  // 实测结论（读了参考实现）：
+  // · **loomy 短信**：纯 HTTP 三步（发码 → 用户输入 → 校验），
+  //   `loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次** ⇒ **Workers 上可行**。
+  // · **loomy 微信扫码**：需要本地服务器承载弹窗页
+  //   （`loomy-wechat-login.ts:11-13` 的 `127.0.0.1:随机端口`）⇒ **不可行**。
+  // · **lobsterai**：强制 `http://127.0.0.1:{port}/auth/callback`
+  //   （`lobsterai-oauth.ts:95,109`）⇒ **不可行**，已如实声明。
+  const loomy = readFileSync('src/providers/loomy.ts', 'utf8')
+  assert.ok(/login: true/.test(loomy), 'loomy 应声明 login: true（短信已接线）')
+
+  const index = readFileSync('src/index.ts', 'utf8')
+  // 第 1 步：发码（要 phone）
+  assert.ok(index.includes("providerId === 'loomy'"), '应有 loomy 发起分支')
+  assert.ok(/sendLoomySmsCode/.test(index), '第 1 步应调 sendLoomySmsCode')
+  // 第 2 步：提交验证码（**单独端点**，不是 poll）
+  assert.ok(index.includes("/admin/providers/login/loomy/sms"), '应有短信提交端点')
+  assert.ok(/loginLoomyBySmsCode/.test(index), '第 2 步应调 loginLoomyBySmsCode')
+  // ⚠️ 必须是 POST 而不是 GET：验证码进 URL 会落进日志与 Referer
+  const i = index.indexOf("path === '/admin/providers/login/loomy/sms'")
+  assert.ok(/request\.method === 'POST'/.test(index.slice(i, i + 80)), '⚠️ 提交验证码必须用 POST')
+
+  // ⚠️ msgid 必须持久化（Workers 无跨请求内存）；丢了会被上游判「msgid 无效」
+  assert.ok(/msgid/.test(index.slice(index.indexOf("providerId === 'loomy'"), index.indexOf("providerId === 'loomy'") + 2500)),
+    '⚠️ 发码后必须把 msgid 存进登录会话')
+})
+
+test('⚠️ lobsterai 必须如实声明登录不可行（强制 127.0.0.1 回调）', () => {
+  // ⚠️ 用户希望「尽量支持」，但它**架构上不可行** —— 参考实现
+  // `lobsterai-oauth.ts:95,109` 明确：`redirect_uri` **必须**是
+  // `http://127.0.0.1:{port}/auth/callback`，且回调服务器绑 `127.0.0.1`
+  // （`:342` 注释：「绑 127.0.0.1 而非 0.0.0.0：回调只可能来自本机浏览器」）。
+  // Workers 没有 listen socket ⇒ 这条链不成立。
+  const src = readFileSync('src/providers/lobsterai.ts', 'utf8')
+  assert.ok(/login: false/.test(src), 'lobsterai 应如实声明 login: false')
+  assert.ok(/loginBlockedReason/.test(src), '必须说明原因（不能只给个 false）')
+  // ⚠️ 原因里要说清「怎么做才能用」（导出凭据导入），否则用户卡死
+  assert.ok(/导出凭据|粘贴/.test(src), '原因里要给出替代做法')
+})
+
+test('⚠️ loomy 面板必须走短信两步流程（不能进轮询逻辑）', () => {
+  // ⚠️ 短信登录是「用户输入后主动提交」，**不是**「等服务端状态变化」。
+  // 混进轮询那套会让用户干等一个永远不会自己完成的流程。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(js.includes('startLoomySmsLogin'), '应有独立的短信流程函数')
+  // 必须在进轮询**之前**分派走
+  const fn = js.indexOf('async function startModalLogin')
+  const block = js.slice(fn, fn + 600)
+  assert.ok(/providerId === 'loomy'/.test(block), '⚠️ 必须在轮询之前分派走')
+  assert.ok(/LOGIN_KIND_LABEL[\s\S]{0,120}loomy:/.test(js), '要有「短信验证码登录」标签')
+})

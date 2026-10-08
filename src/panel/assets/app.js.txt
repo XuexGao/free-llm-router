@@ -811,7 +811,7 @@ const CAPS = [
  * 也就是说：把 trae 加进来只是让它显示成「浏览器登录」，
  * 真正让它出现在下拉里的是 `trae.ts` 的 `capabilities.login = true`。
  */
-const LOGIN_KIND_LABEL = { codearts: '浏览器登录', trae: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录' }
+const LOGIN_KIND_LABEL = { codearts: '浏览器登录', trae: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录', loomy: '短信验证码登录' }
 
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
@@ -1293,8 +1293,85 @@ function renderModalAdd() {
 
 let modalLoginTimer = null
 
+/**
+ * loomy（讯飞）**短信验证码**登录：两步，不是轮询。
+ *
+ * ⚠️ 与其它所有家都不同 —— 参考实现写得很清楚
+ *（`loomy-oauth.ts:6-7`）：
+ * > 那 7 个都是「返回 loginUrl → 前端 window.open → 轮询 login.poll」。
+ * > 短信登录**没有 URL 可打开**，故走「发验证码 → 用户输入 → 提交」三步。
+ *
+ * 故这里**不能**走 `renderLoginPrompt` + 轮询那套 —— 那套是「等服务端状态变化」，
+ * 而这里要**用户输入一个值**。混在一起会让用户干等一个永远不会自己完成的流程。
+ */
+async function startLoomySmsLogin(out) {
+  clear(out)
+  // 第一步：填手机号 → 发码
+  const tip = document.createElement('div')
+  tip.textContent = '讯飞（loomy）用短信验证码登录。请填写手机号后点「发送验证码」。'
+  out.appendChild(tip)
+
+  const row = document.createElement('div'); row.className = 'row'
+  const phone = document.createElement('input')
+  phone.type = 'tel'; phone.placeholder = '11 位手机号'; phone.maxLength = 11
+  row.appendChild(phone)
+  const send = document.createElement('button'); send.textContent = '发送验证码'
+  row.appendChild(send)
+  out.appendChild(row)
+
+  const status = document.createElement('div'); status.className = 'hint'
+  out.appendChild(status)
+
+  send.onclick = async () => {
+    const value = phone.value.trim()
+    status.textContent = '发送中…'
+    const r = await api('/admin/providers/login/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'loomy', phone: value, realm: 'cn' }),
+    })
+    if (!r.ok) {
+      status.textContent = (r.body && r.body.error && r.body.error.message) || '发送失败'
+      return
+    }
+    // 第二步：填验证码 → 提交
+    status.textContent = '验证码已发送。'
+    phone.disabled = true; send.disabled = true
+    const codeRow = document.createElement('div'); codeRow.className = 'row'
+    const code = document.createElement('input')
+    code.type = 'text'; code.placeholder = '收到的验证码'; code.maxLength = 8
+    codeRow.appendChild(code)
+    const submit = document.createElement('button'); submit.textContent = '登录'
+    codeRow.appendChild(submit)
+    out.appendChild(codeRow)
+    const msg = document.createElement('div'); msg.className = 'hint'
+    out.appendChild(msg)
+
+    submit.onclick = async () => {
+      msg.textContent = '校验中…'
+      const r2 = await api('/admin/providers/login/loomy/sms', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ state: r.body.state, code: code.value.trim(), realm: 'cn' }),
+      })
+      if (r2.ok) {
+        msg.textContent = '登录成功：' + (r2.body.nickname || r2.body.uid)
+        loadModalAccounts(); loadAccounts(); loadPool()
+        return
+      }
+      // ⚠️ 失败文案里已含「请重新获取验证码」（服务端加的）——
+      // 验证码是一次性的，失败后**必须重新发码**，不能让用户反复重试同一个码。
+      msg.textContent = (r2.body && r2.body.error && r2.body.error.message) || '登录失败'
+      codeRow.remove()
+      phone.disabled = false; send.disabled = false
+      status.textContent = '请重新点「发送验证码」获取新验证码。'
+    }
+  }
+}
+
 async function startModalLogin(providerId, out) {
   if (modalLoginTimer) clearInterval(modalLoginTimer)
+  // ⚠️ loomy 是**短信**流程（需用户输入），与「设备码/扫码 + 轮询」完全不同，
+  // 故在这里就分派走，不进入下面的轮询逻辑。
+  if (providerId === 'loomy') { await startLoomySmsLogin(out); return }
   const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
   const res = await api(endpoint, {
     method: 'POST', headers: { 'content-type': 'application/json' },

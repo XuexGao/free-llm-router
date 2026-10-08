@@ -1030,10 +1030,23 @@ export const loomyProvider: Provider = {
      * ⚠️ 参考项目的 `createServer` 只在承载二维码 HTML 展示页
      * （`src/loomy-wechat-login.ts:161-175`），那部分应由本服务面板承担。
      */
-    login: false,
-
-    loginBlockedReason:
-      '本服务暂未接线该家的登录流程（微信扫码/短信登录函数已实现但未接线到 /admin/providers/login/*）。请导出凭据后粘贴导入。',
+    /**
+     * ✅ **短信验证码登录已接线**（`/admin/providers/login/start` + `/login/loomy/sms`）。
+     *
+     * ## ⚠️ 它为什么在 Workers 上可行（与 loomy 的微信扫码相反）
+     *
+     * 短信路径是**纯 HTTP 三步**（发码 → 用户输入 → 校验），
+     * `loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**（实测 grep）——
+     * 不需要任何本地回调监听。
+     *
+     * ⚠️ 而**微信扫码**那条需要本地服务器承载弹窗页
+     *（`loomy-wechat-login.ts:11-13`：`127.0.0.1:随机端口` 上的 `/wechat/qr`
+     * 与 `/wechat/poll`），Workers 拉不起本地端口 ⇒ **那条不可行**。
+     * 故面板上 loomy 只提供**短信**一种方式。
+     *
+     * 依据：参考实现 `deepseek-harness-codearts/src/loomy-oauth.ts:6-7,131-186`。
+     */
+    login: true,
     listModels: true,
     chat: true,
     balance: true,

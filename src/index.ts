@@ -1431,6 +1431,59 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         )
       }
     }
+
+    // ── loomy（讯飞办公助手）：**短信验证码**登录 ──
+    //
+    // ## ⚠️ 与其它家都不同：它**没有 loginUrl**，要用户输入
+    //
+    // 参考实现的注释写得很清楚（`src/loomy-oauth.ts:6-7`）：
+    // > 那 7 个都是「返回 loginUrl → 前端 window.open → 轮询 login.poll」。
+    // > 短信登录**没有 URL 可打开**，故走「发验证码 → 用户输入 → 提交」三步。
+    //
+    // ## ✅ 为什么它在 Workers 上**可行**（与微信扫码相反）
+    //
+    // 短信路径是**纯 HTTP 三步**，`loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**
+    //（实测 grep）—— 不需要任何本地回调监听。
+    // ⚠️ 而 loomy 的**微信扫码**路径需要本地服务器承载弹窗页
+    //（`loomy-wechat-login.ts:11-13` 的 `127.0.0.1:随机端口`），那条**不可行**。
+    //
+    // ## 流程
+    //
+    // 1. `POST {provider:'loomy', phone}` → 发短信，返回 `state`（存 msgid）
+    // 2. `POST {provider:'loomy', phone, code, state}` → 校验，拿 session/userid
+    //
+    // ⚠️ `msgid` 必须持久化在登录会话里（Workers 无跨请求内存）——
+    // 丢了它第二步会被服务端判「msgid 无效」，而那个报错与真实原因无关
+    //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
+    if (providerId === 'loomy') {
+      const { sendLoomySmsCode } = await import('./providers/loomy.js')
+      const reqBody = await request.json().catch(() => ({})) as { phone?: string }
+      const phone = typeof reqBody.phone === 'string' ? reqBody.phone.trim() : ''
+      // ⚠️ 只做**最基本的**格式检查（11 位数字，1 开头）—— 详细的号码规则
+      // 交给上游判（它才知道哪些号段可用）。这里拦的是明显的空值/乱填。
+      if (!/^1\d{10}$/.test(phone)) {
+        return jsonError(400, '请填写 11 位手机号（以 1 开头）', 'invalid_phone')
+      }
+      try {
+        const msgid = await sendLoomySmsCode(phone, AbortSignal.timeout(30_000))
+        const state = crypto.randomUUID()
+        const now = Date.now()
+        // 验证码 5 分钟有效（`LOOMY_SMS_CODE_TTL_SECONDS`）。
+        await pool.saveLoginSession(
+          state,
+          { provider: 'loomy', kind: 'loomy-sms', realm: loginRealm, phone, msgid, createdAt: now },
+          // ⚠️ TTL 用**上游的验证码有效期**，不留宽限：码过期后再提交
+          // 必然是「验证码错误」，多留时间只会让用户白等。
+          5 * 60 * 1000,
+        )
+        return json({ ok: true, provider: 'loomy', state, phone, needsCode: true })
+      } catch (error) {
+        return json(
+          { error: { message: error instanceof Error ? error.message : String(error), type: 'login_start_failed' } },
+          502,
+        )
+      }
+    }
     // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
     //
     // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
@@ -1480,6 +1533,67 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       `供应商「${providerId}」不支持从本服务发起登录（${providerId === DEFAULT_PROVIDER ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
       'login_unsupported',
     )
+  }
+
+  // ── loomy 短信登录第 2 步：提交验证码 ──
+  //
+  // ⚠️ 为什么单独一个端点而不是复用 `/login/poll`：
+  // 短信登录**不是轮询** —— 它是「用户输入后主动提交」。
+  // 塞进 poll（那是个按 state 查询的 GET）会让两种语义混在一处：
+  // poll 是**幂等只读**，而这个**会消费验证码**（提交即用掉）。
+  // ⚠️ 更不能做成 GET：验证码会进 URL，落进日志与 Referer。
+  if (path === '/admin/providers/login/loomy/sms' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      state?: string; phone?: string; code?: string; realm?: string
+    }
+    const state = typeof body.state === 'string' ? body.state : ''
+    const code = typeof body.code === 'string' ? body.code.trim() : ''
+    if (state === '') return jsonError(400, 'state 必填（重新发起登录）', 'missing_state')
+    if (!/^\d{4,8}$/.test(code)) return jsonError(400, '请填写收到的验证码', 'invalid_code')
+
+    const realm = body.realm === 'global' ? 'global' : 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const saved = await (async () => {
+      // 逐个分片找（与 `/login/poll` 同法：会话所在分片由发起时决定）
+      for (const r of [realm, realm === 'cn' ? 'global' : 'cn']) {
+        const p = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+        const hit = (await p.getLoginSession(state, Date.now())) as
+          | { payload: Record<string, unknown>; pool: typeof p }
+          | undefined
+        if (hit !== undefined) return { payload: hit.payload, pool: p }
+      }
+      return undefined
+    })()
+    if (saved === undefined) {
+      return jsonError(404, '登录会话不存在或已过期，请重新发起登录', 'session_not_found')
+    }
+    if (saved.payload['kind'] !== 'loomy-sms') {
+      return jsonError(400, '该会话不是短信登录，请重新发起', 'wrong_flow')
+    }
+    const msgid = typeof saved.payload['msgid'] === 'string' ? saved.payload['msgid'] : ''
+    const phone = typeof saved.payload['phone'] === 'string' ? saved.payload['phone'] : ''
+    if (msgid === '' || phone === '') {
+      await saved.pool.removeLoginSession(state)
+      return jsonError(400, '登录会话缺少 msgid/phone，请重新发起登录', 'session_incomplete')
+    }
+
+    const { loginLoomyBySmsCode } = await import('./providers/loomy.js')
+    try {
+      const result = await loginLoomyBySmsCode(phone, code, msgid, AbortSignal.timeout(30_000))
+      // ⚠️ 验证码是**一次性**的：无论成败都清掉会话，
+      // 免得用户拿同一个码重复提交（上游会回「已使用」，那个报错会让人困惑）。
+      await saved.pool.removeLoginSession(state)
+      return json(await persistProviderCredential(env, result.credential, Date.now()))
+    } catch (error) {
+      // ⚠️ 失败**也清会话**（同上：码已消费）。用户需要重新发码。
+      await saved.pool.removeLoginSession(state)
+      const message = error instanceof Error ? error.message : String(error)
+      // ⚠️ 文案要说清「下一步做什么」：用户卡在这里最需要知道的是「重新获取验证码」。
+      return json(
+        { error: { message: `验证码校验失败：${message}。请重新获取验证码后再试。`, type: 'sms_failed' } },
+        400,
+      )
+    }
   }
 
   // ── 轮询供应商登录结果 ──
