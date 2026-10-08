@@ -1090,6 +1090,27 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   }
 
   // ── 删除账号（连带凭据；不可逆，故要求显式确认字段） ──
+  // ── 按账号启用/停用（面板的「停用 / 启用」按钮） ──
+  //
+  // ⚠️ 与 `/admin/accounts/remove` 的区别：这个**可逆**，故**不需要 confirm**。
+  // 用户点错了再点一次就好，加确认反而烦。
+  if (path === '/admin/accounts/toggle' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: string; realm?: string; disabled?: boolean
+    }
+    if (typeof body.uid !== 'string' || body.uid === '') {
+      return json({ error: { message: 'uid 必填' } }, 400)
+    }
+    if (typeof body.disabled !== 'boolean') {
+      return json({ error: { message: 'disabled 必须是布尔值' } }, 400)
+    }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const ok = await pool.setAccountDisabled(body.uid, body.disabled, Date.now())
+    if (!ok) return json({ error: { message: '账号不存在' } }, 404)
+    return json({ ok: true, uid: body.uid, disabled: body.disabled, realm })
+  }
+
   if (path === '/admin/accounts/remove' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { uid?: string; realm?: string; confirm?: boolean }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -1877,7 +1898,44 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 
   // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
   if (path === '/admin/providers' && request.method === 'GET') {
-    return json({ default: DEFAULT_PROVIDER, providers: providerCatalog() })
+    // ⚠️ 带上**面板设置**（顺序 + 已关闭的家）—— 面板据此渲染
+    //   「供应商」卡片与排序。「关闭」是**服务端**状态（会真的影响
+    //   `/v1/models` 与路由），不是浏览器 localStorage。
+    //
+    // ⚠️ 设置存在 `cn` 分片的 DO 里当全局值用（见 `getProviderSettings` 的说明）。
+    // 读失败**不能让整个端点失败** —— 设置只是展示偏好，缺了就用默认顺序。
+    let settings: { order: string[]; disabled: string[] } = { order: [], disabled: [] }
+    try {
+      const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      settings = await cnPool.getProviderSettings()
+    } catch {
+      // 用默认值（空顺序 = 注册表原顺序；无关闭）
+    }
+    return json({
+      default: DEFAULT_PROVIDER,
+      providers: providerCatalog(),
+      order: settings.order,
+      disabled: settings.disabled,
+    })
+  }
+
+  // ── 改供应商面板设置（顺序 / 启用开关） ──
+  //
+  // ⚠️ 语义（用户明确）：
+  // · **关闭 = 彻底关掉** ⇒ 该家的模型从 `/v1/models` 消失、也拒绝路由到它；
+  // · **排序只影响面板展示**，**不**改默认供应商
+  //  （裸模型名仍回落到 `DEFAULT_PROVIDER` —— 悄悄改掉既有请求的路由不可接受）。
+  if (path === '/admin/providers/settings' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { order?: unknown; disabled?: unknown }
+    const known = new Set(providerIds())
+    const toIds = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && known.has(x)) : []
+    // ⚠️ 未知 id 一律丢弃：否则一个笔误就会在存储里留下永远匹配不上的条目。
+    const order = toIds(body.order)
+    const disabled = toIds(body.disabled)
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    await cnPool.setProviderSettings({ order, disabled })
+    return json({ ok: true, order, disabled })
   }
 
   // ── 按供应商列模特（面板用） ──
@@ -2390,7 +2448,20 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const errors: Array<{ provider: string; error: string }> = []
     let disabledTotal = 0
 
+    // ⚠️ 读一次「已被用户关闭的供应商」——关闭 = **彻底关掉**：
+    // 它们的模型**不出现在目录里**（也不允许路由到，见 handleChatCompletions
+    // 的同类判据）。设置是全局的，故只需读 cn 分片一次。
+    const userDisabledProviders = new Set<string>()
+    try {
+      const cnPool = pools.get('cn') ?? env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      for (const id of (await cnPool.getProviderSettings()).disabled) userDisabledProviders.add(id)
+    } catch {
+      // 读不到设置就按「都没关」处理 —— 目录功能不该因为偏好读取失败而整体失败
+    }
+
     for (const [providerId, list] of byProvider) {
+      // ⚠️ 用户关闭的家直接跳过（不入 errors：那不是**故障**，是用户的**选择**）
+      if (userDisabledProviders.has(providerId)) continue
       const provider = findProvider(providerId)
       if (provider === undefined || !provider.capabilities.listModels) continue
       const picked = list.find((x) => !x.account.disabled)

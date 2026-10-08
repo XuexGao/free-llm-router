@@ -152,6 +152,27 @@ export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
   return /unapproved channel|security policy|11128|安全策略/i.test(message) ? 'soft' : 'breaker'
 }
 
+/**
+ * 该供应商是否已被**用户在面板里关闭**。
+ *
+ * ## 语义（用户 2026-10-07 明确）
+ *
+ * 「关闭」= **彻底关掉**：模型从 `/v1/models` 消失，**且拒绝路由到它**。
+ * 故判据读**服务端**设置（DO storage），不是浏览器 localStorage。
+ *
+ * ⚠️ **读失败一律按「没关」处理**：设置只是偏好，不该因为读不到它
+ * 就让**所有**请求 403 —— 那会把一个小故障放大成全面不可用。
+ */
+async function isProviderClosedByUser(env: Env, providerId: string): Promise<boolean> {
+  try {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const settings = await pool.getProviderSettings()
+    return settings.disabled.includes(providerId)
+  } catch {
+    return false
+  }
+}
+
 export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string): number {
   // 上游 5xx ⇒ 网关上必然是 502
   if (upstreamStatus >= 500) return 502
@@ -369,6 +390,27 @@ export async function handleChatCompletions(
    * 故判据是**严格等 true**：只有显式 `stream: true` 才走流式。
    */
   const wantsStream = (rawBody as Record<string, unknown>).stream === true
+
+  // ⚠️ **用户关闭的供应商必须拒绝路由**（关闭 = 彻底关掉，不只是从目录里消失）。
+  //
+  // ## 为什么必须在这里拦
+  //
+  // 只在 `/v1/models` 里过滤是**不够的** —— 客户端可能缓存了旧目录，
+  // 或者直接按名字硬编码调用。那会让「我明明关了它」变成一句空话：
+  // 关了之后仍能用，只是「不好找」而已。
+  //
+  // ⚠️ 判据读的是**服务端**设置（DO storage），不是浏览器 localStorage ——
+  // 后者只在面板生效，API 照样能调。
+  const closedByUser = await isProviderClosedByUser(env, providerId)
+  if (closedByUser) {
+    return {
+      response: jsonError(
+        403,
+        `供应商「${providerId}」已被你在面板中关闭。如需使用，请在「供应商与账号」页重新启用。`,
+        'provider_disabled',
+      ),
+    }
+  }
 
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。

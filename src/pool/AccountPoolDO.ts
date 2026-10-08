@@ -373,6 +373,37 @@ export class AccountPoolDO extends DurableObject<Env> {
     this.recentlyPicked.set(uid, now)
   }
 
+  /**
+   * 读**供应商面板设置**（顺序 + 是否启用）。
+   *
+   * ## 语义（用户 2026-10-07 明确）
+   *
+   * - **关闭供应商 = 彻底关掉**：该家的模型从 `/v1/models` 消失、
+   *   `/v1/chat/completions` 也拒绝路由到它（故这里是**服务端**状态，
+   *   不是浏览器 localStorage —— 后者只在面板生效，API 仍可调用）。
+   * - **排序只影响面板展示顺序**，**不**改变默认供应商
+   *   （裸模型名仍回落到 `DEFAULT_PROVIDER`）—— 那会悄悄改掉既有请求的路由。
+   *
+   * ⚠️ 存在 `cn` 分片的 DO 里当**全局**设置用：它描述的是「面板怎么显示」，
+   * 与 realm 无关；按 realm 各存一份会让两个分片显示不一致。
+   */
+  async getProviderSettings(): Promise<{ order: string[]; disabled: string[] }> {
+    const raw = await this.ctx.storage.get<{ order?: unknown; disabled?: unknown }>('providerSettings')
+    const order = Array.isArray(raw?.order) ? raw!.order.filter((x): x is string => typeof x === 'string') : []
+    const disabled = Array.isArray(raw?.disabled)
+      ? raw!.disabled.filter((x): x is string => typeof x === 'string')
+      : []
+    return { order, disabled }
+  }
+
+  /** 写供应商面板设置（整体覆盖，调用方负责传完整值）。 */
+  async setProviderSettings(input: { order: string[]; disabled: string[] }): Promise<void> {
+    await this.ctx.storage.put('providerSettings', {
+      order: input.order.filter((x) => typeof x === 'string'),
+      disabled: input.disabled.filter((x) => typeof x === 'string'),
+    })
+  }
+
   /** 账号池计数摘要（供 `/healthz` 与面板）。 */
   async counts(realm: string, now: number): Promise<{
     total: number
@@ -615,6 +646,51 @@ export class AccountPoolDO extends DurableObject<Env> {
     const state = JSON.parse(raw) as AccountState
     state.lastCheckinDay = cstDay(now)
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+  }
+
+  /**
+   * **人工**启用/停用某个账号（面板的「停用 / 启用」按钮）。
+   *
+   * ## ⚠️ 与 `disable()` / `applyFailure` 的区别（不要混用）
+   *
+   * | 入口 | 语义 | 谁能解除 |
+   * |---|---|---|
+   * | {@link setAccountDisabled} | **用户显式**停用 | 只有用户再点「启用」 |
+   * | {@link disable} | 上游强信号（如 11140）判死 | 重新登录 / 人工清状态 |
+   * | `applyFailure` | 失败累积到阈值后的自动熔断 | 时间到期自动恢复 |
+   *
+   * ⚠️ 故这里**同时清掉自动熔断/冷却**：
+   * 用户说「启用」，意思是「我要用这个号」—— 若留着旧的 `until` /
+   * `breakerUntil`，号虽然 `disabled=false` 但**仍然选不到**，
+   * 面板上看起来「启用了却没用」。那是本项目反复踩到的
+   * 「状态看着对、行为不对」型缺陷。
+   *
+   * ⚠️ 也清 `reason`：那是上一次失败的原因，留着会让面板显示
+   * 「正常」却带着一条旧错误，误导排查。
+   */
+  async setAccountDisabled(uid: string, disabled: boolean, now: number): Promise<boolean> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return false
+    const state = normalizeAccountState(JSON.parse(raw))
+    if (state === undefined) return false
+    state.disabled = disabled
+    if (disabled) {
+      state.reason = '已被手动停用'
+    } else {
+      // ⚠️ 启用时**必须一并清掉自动惩罚状态**，否则「启用了仍选不到」。
+      state.reason = ''
+      state.until = 0
+      state.breakerUntil = 0
+      state.degradeUntil = 0
+      state.coolKind = ''
+      state.fails = 0
+      state.retryCount = 0
+      state.softStreak = 0
+      state.consecutiveFails = 0
+      state.sessionDeadFails = 0
+    }
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
   }
 
   /** 显式禁用（人工或 11140 这类强信号）。 */

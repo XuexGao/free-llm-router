@@ -206,6 +206,11 @@ async function loadPool() {
   box.appendChild(countBlock('冷却中', c.cooling, () => showCoolingDetail()))
   box.appendChild(countBlock('模型限流', c.modelExempt, () => showModelThrottleDetail()))
   box.appendChild(countBlock('已禁用', c.disabled))
+  // ⚠️ **「供应商」计数块紧跟「已禁用」右边**（用户要求：放在已禁用右边）。
+  // 它复用 `countBlock` 的**同款样式**（不是另做一套）—— 视觉统一。
+  // 数字是**已启用的供应商数**，点开调整顺序与开关。
+  const enabledProviders = providerCache.filter((p) => !providerDisabled.has(p.id)).length
+  box.appendChild(countBlock('供应商', enabledProviders, () => openProviderManager()))
 }
 
 /**
@@ -384,28 +389,6 @@ async function loadAccounts() {
   await loadTaskUids()
 }
 
-// ─────────────────────────── 导入 / 登录 ───────────────────────────
-
-async function doImport() {
-  const raw = $('import-body').value.trim()
-  if (raw === '') { show('import-result', '请先粘贴凭据 JSON'); return }
-  let payload
-  try { payload = JSON.parse(raw) } catch (e) { show('import-result', 'JSON 解析失败：' + e.message); return }
-  // 显式声明供应商（可选）：取「添加账号」里选的那家，让后端只试它。
-  // 不选（空 = 自动识别）则由后端按凭据形状判别。
-  const declared = $('login-provider') ? $('login-provider').value : ''
-  if (declared && payload !== null && typeof payload === 'object' && !Array.isArray(payload) && !payload.provider) {
-    payload = Object.assign({}, payload, { provider: declared })
-  }
-  const res = await api('/admin/import', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
-  show('import-result', res.body)
-  if (res.ok) { $('import-body').value = ''; loadAccounts(); loadPool() }
-}
-
 let loginTimer = null
 
 /**
@@ -433,10 +416,10 @@ function loginWaitHint(providerId) {
  * ## ⚠️ 为什么必须抽成共享函数（实测踩到）
  *
  * 面板里有**两个**登录入口：
- * - 顶部「一键登录」区（`doLogin`）
+ * - （原先还有顶部「一键登录」区，已按用户要求**删除** —— 登录入口只在各供应商卡片内）
  * - 供应商弹窗的「添加账号」页（`startModalLogin`）
  *
- * 我第一版只给 `doLogin` 加了扫码支持，忘了 `startModalLogin` ——
+ * 我第一版只给顶部的旧登录区加了扫码支持，忘了 `startModalLogin` ——
  * 于是用户在**弹窗里**发起商汤登录时，`res.body.qrSvg` 被完全忽略，
  * 代码去读不存在的 `res.body.authUrl`（扫码家不返回它），
  * 页面就显示 **`undefined`**。
@@ -536,53 +519,6 @@ function renderLoginPrompt(el, body, providerId) {
   a.textContent = '打开授权页面'
   el.appendChild(document.createElement('br'))
   el.appendChild(a)
-}
-
-async function doLogin() {
-  if (loginTimer) clearInterval(loginTimer)
-  // 空 = 自动识别，此时用默认供应商（buddy）走既有端点
-  const providerId = ($('login-provider') && $('login-provider').value) || 'buddy'
-  // workbuddy 走既有端点；其它供应商走通用端点
-  const endpoint = providerId === 'buddy' ? '/admin/login/start' : '/admin/providers/login/start'
-  const res = await api(endpoint, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ realm: 'cn', provider: providerId }),
-  })
-  if (!res.ok) { show('login-result', res.body); return }
-  const authUrl = res.body.authUrl
-  const state = res.body.state
-
-  const el = $('login-result')
-  clear(el)
-  renderLoginPrompt(el, res.body, providerId)
-
-  let tries = 0
-  loginTimer = setInterval(async () => {
-    tries += 1
-    if (tries > 100) { clearInterval(loginTimer); el.textContent += '\n授权超时，请重新发起。'; return }
-    const pollPath = providerId === 'buddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
-    const r = await api(pollPath + '?state=' + encodeURIComponent(state))
-    if (r.ok && r.body && r.body.done) {
-      clearInterval(loginTimer)
-      el.textContent = '授权成功，凭据已加密保存：' + (r.body.nickname || r.body.uid)
-      loadAccounts(); loadPool()
-    } else if (r.ok && r.body && r.body.status === 'failed') {
-      // 终态失败：再轮询一万次也是同一结果，如实显示并停下（避免空等到超时）
-      clearInterval(loginTimer)
-      el.textContent = (r.body.message || '登录失败') + '\n可改用「粘贴凭据导入」，或稍后重试。'
-    } else if (r.status === 404) {
-      clearInterval(loginTimer)
-      el.textContent += '\n该登录会话已过期，请重新发起。'
-    } else if (r.ok && r.body && r.body.status === 'canceled') {
-      clearInterval(loginTimer)
-      el.textContent = (r.body.message || '已取消授权') + '\n请重新发起。'
-    } else if (r.ok && r.body && r.body.message) {
-      // 扫码流程只更新状态文字（二维码必须留在页面上，不能被文字覆盖掉）
-      if (el._loginStatus) el._loginStatus.textContent = r.body.message
-      else el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n' + r.body.message
-    }
-  }, 3000)
 }
 
 // ─────────────────────────── 任务中心 ───────────────────────────
@@ -879,6 +815,9 @@ const LOGIN_KIND_LABEL = { codearts: '浏览器登录', trae: '浏览器登录',
 
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
+/** 服务端的面板设置：展示顺序 与 已关闭的供应商。 */
+let providerOrder = []
+let providerDisabled = new Set()
 
 /**
  * 各供应商的剩余总积分（**每张卡片右上角**）。
@@ -935,20 +874,28 @@ async function loadProviders() {
     const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p); return
   }
   providerCache = res.body.providers || []
+  // ⚠️ 面板设置（顺序 + 已关闭的家）来自**服务端** —— 「关闭」是真的关掉
+  //（模型从 /v1/models 消失、且拒绝路由），不是浏览器本地偏好。
+  providerOrder = Array.isArray(res.body.order) ? res.body.order : []
+  providerDisabled = new Set(Array.isArray(res.body.disabled) ? res.body.disabled : [])
 
-  // ⚠️ 登录下拉必须**先清空**再填。
-  // 之前只追加不清空，而 loadProviders 会被多次调用（切视图/刷新），
-  // 于是选项**重复累积** —— 这就是「添加账号选项重复」的根因。
-  const loginSelect = $('login-provider')
-  clear(loginSelect)
-  const autoOpt = document.createElement('option')
-  autoOpt.value = ''; autoOpt.textContent = '自动识别'
-  loginSelect.appendChild(autoOpt)
+  // ⚠️ **按服务端设置排序**：`providerOrder` 是用户拖出来的顺序，
+  // 不在里面的（新加的供应商）**按注册表原顺序追加在后面** ——
+  // 这样新供应商出现时不会「插队」到用户排好的前面，也不会消失。
+  const ordered = []
+  const seen = new Set()
+  for (const id of providerOrder) {
+    const p = providerCache.find((x) => x.id === id)
+    if (p !== undefined) { ordered.push(p); seen.add(id) }
+  }
+  for (const p of providerCache) if (!seen.has(p.id)) ordered.push(p)
 
-  for (const prov of providerCache) {
+  for (const prov of ordered) {
     // 卡片：名称 + id + 能力标签
     const card = document.createElement('div')
-    card.className = 'prov-card'
+    // ⚠️ 已关闭的家加 `off` 类：面板要能一眼看出「这家我关了」，
+    // 而不是以为它坏了（它只是**按你的选择**不参与）。
+    card.className = 'prov-card' + (providerDisabled.has(prov.id) ? ' off' : '')
     card.dataset.provider = prov.id
     card.onclick = () => openProviderModal(prov.id)
 
@@ -979,17 +926,137 @@ async function loadProviders() {
       caps.appendChild(tag)
     }
     card.appendChild(caps)
-    box.appendChild(card)
-
-    // 只有声明能登录的家才进下拉
-    if (prov.capabilities.login) {
-      const lo = document.createElement('option')
-      lo.value = prov.id
-      lo.textContent = prov.name
-      loginSelect.appendChild(lo)
+    // ⚠️ 已关闭的家在卡片上**明说**，否则用户会以为是账号/网络问题。
+    if (providerDisabled.has(prov.id)) {
+      const off = document.createElement('div'); off.className = 'prov-off-tag'
+      off.textContent = '已关闭（不参与 API）'
+      card.appendChild(off)
     }
+    box.appendChild(card)
   }
+
 }
+
+// ─────────────────── 供应商管理（排序 + 开关） ───────────────────
+
+/**
+ * 打开「供应商」管理弹窗：调整展示顺序、启用/停用整家。
+ *
+ * ## ⚠️ 两件事的语义完全不同（用户 2026-10-07 明确）
+ *
+ * | 操作 | 影响范围 |
+ * |---|---|
+ * | **排序** | **只影响面板展示顺序**。⚠️ **不改默认供应商** —— 裸模型名仍回落到 `buddy`。 |
+ * | **关闭** | **彻底关掉**：模型从 `/v1/models` 消失，**且拒绝路由到它**（403）。 |
+ *
+ * ⚠️ 关闭是**服务端**状态（存 DO），故关掉后**任何客户端**都调不到 ——
+ * 这是用户要的语义（不是只在面板藏起来）。
+ *
+ * ## 为什么用「上移/下移」而不是拖拽
+ *
+ * 拖拽需要 pointer 事件 + 占位符 + 触摸适配，在手机上尤其容易误操作；
+ * 而上移/下移是**确定性**的（点一下移动一格），手机上与大屏上行为一致。
+ * 供应商总数是十几家，逐格移动完全够用。
+ */
+function openProviderManager() {
+  // ⚠️ 用**当前展示顺序**初始化（含用户已排的部分），而不是注册表原顺序 ——
+  // 否则每次打开都从原顺序开始，用户的排序看着就「丢了」。
+  const ordered = []
+  const seen = new Set()
+  for (const id of providerOrder) {
+    const p = providerCache.find((x) => x.id === id)
+    if (p !== undefined) { ordered.push(p); seen.add(id) }
+  }
+  for (const p of providerCache) if (!seen.has(p.id)) ordered.push(p)
+
+  const body = document.createElement('div')
+
+  const hint = document.createElement('p'); hint.className = 'hint'
+  hint.textContent = '拖动左侧手柄调整顺序（只影响面板展示）；开关会真的停用该供应商。'
+  body.appendChild(hint)
+
+  const list = document.createElement('div')
+
+  const save = async () => {
+    const r = await api('/admin/providers/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ order: ordered.map((p) => p.id), disabled: [...providerDisabled] }),
+    })
+    if (!r.ok) { alert('保存失败：' + JSON.stringify(r.body)); return false }
+    providerOrder = r.body.order || []
+    providerDisabled = new Set(r.body.disabled || [])
+    return true
+  }
+
+  // ⚠️ **拖动排序**（用户要求「加一个拖动移动位置」）。
+  //
+  // 用 HTML5 drag-and-drop（`draggable`）而不是 pointer 事件：
+  // 前者在桌面浏览器上零依赖，且**手机上由浏览器映射成长按拖动**。
+  // 手柄只放在左侧的 `≡` 上（不是整行可拖）—— 否则点「启用/关闭」按钮时
+  // 会误触发拖动，按钮变得难以点中。
+  let dragIdx = -1
+
+  const render = () => {
+    clear(list)
+    ordered.forEach((prov, idx) => {
+      // ⚠️ 复用现有的 `.card` 样式（与「账号」页统一），不另造一套。
+      const row = document.createElement('div')
+      row.className = 'card'
+      row.draggable = true
+
+      row.ondragstart = (e) => {
+        dragIdx = idx
+        row.classList.add('dragging')
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+      }
+      row.ondragend = () => { row.classList.remove('dragging'); dragIdx = -1 }
+      // ⚠️ 必须 `preventDefault` 才允许 drop —— 否则浏览器拒绝接收。
+      row.ondragover = (e) => { e.preventDefault(); row.classList.add('drop-target') }
+      row.ondragleave = () => row.classList.remove('drop-target')
+      row.ondrop = async (e) => {
+        e.preventDefault(); row.classList.remove('drop-target')
+        if (dragIdx < 0 || dragIdx === idx) return
+        const moved = ordered.splice(dragIdx, 1)[0]
+        ordered.splice(idx, 0, moved)
+        dragIdx = -1
+        if (await save()) { render(); void loadProviders() }
+      }
+
+      // 左侧拖动手柄
+      const handle = document.createElement('span')
+      handle.className = 'drag-handle'
+      handle.textContent = '≡'
+      handle.title = '拖动调整顺序'
+      row.appendChild(handle)
+
+      const nm = document.createElement('div'); nm.className = 'grow'
+      const strong = document.createElement('strong'); strong.textContent = prov.name
+      const idLine = document.createElement('div'); idLine.className = 'uid'; idLine.textContent = prov.id
+      nm.appendChild(strong); nm.appendChild(idLine)
+      row.appendChild(nm)
+
+      // 开关：复用现有的 ghost / danger 按钮样式
+      const off = providerDisabled.has(prov.id)
+      const sw = document.createElement('button')
+      sw.className = off ? 'ghost' : 'danger'
+      sw.textContent = off ? '启用' : '关闭'
+      sw.onclick = async () => {
+        if (!off && !confirm('关闭「' + prov.name + '」？\n\n它的模型会从 /v1/models 消失，'
+          + '并且调用它会返回 403。账号与凭据都保留，随时可以重新启用。')) return
+        if (off) providerDisabled.delete(prov.id); else providerDisabled.add(prov.id)
+        if (await save()) { render(); void loadProviders() }
+      }
+      row.appendChild(sw)
+      list.appendChild(row)
+    })
+  }
+  render()
+  body.appendChild(list)
+  // ⚠️ `openInfo(title, nodes)` 收的是**节点数组**（不是单个节点）。
+  openInfo('供应商设置', [body])
+}
+
+
 
 // ─────────────────── 供应商弹窗（管理账号 / 模型 / 添加） ───────────────────
 
@@ -1041,6 +1108,38 @@ async function loadModalAccounts() {
     const m = document.createElement('span'); m.className = 'metrics'
     m.textContent = '成功 ' + a.successCount + ' · 错误 ' + a.errTotal
     card.appendChild(m)
+
+    // ⚠️ **每个账号单独显示积分**（用户要求）。
+    // 数据已由 `/admin/accounts` 回传（`a.credits`），故不需要额外请求 ——
+    // 逐账号再打一次上游既慢又会消耗额度。
+    const cr = document.createElement('span'); cr.className = 'acct-credits'
+    if (typeof a.credits === 'number' && a.credits > 0) {
+      cr.textContent = a.credits.toLocaleString('zh-CN') + ' 积分'
+      cr.title = '该账号剩余积分（来自上次查询缓存）'
+    } else {
+      cr.textContent = '—'
+      cr.title = '未查到积分（在「积分包」页点「实时查询」可刷新）'
+    }
+    card.appendChild(cr)
+
+    // ⚠️ **停用/启用放在「删除」左边**（用户要求），且两者视觉要区分：
+    // 停用是可逆的轻操作（用 ghost 样式），删除是不可逆的重操作（danger）。
+    // 把可逆操作也做成红色会让用户不敢点。
+    const tog = document.createElement('button')
+    tog.className = a.disabled ? 'ghost' : 'ghost'
+    tog.textContent = a.disabled ? '启用' : '停用'
+    tog.title = a.disabled
+      ? '重新启用该账号（会同时清掉它的冷却/熔断，否则「启用了仍选不到」）'
+      : '停用该账号（保留凭据与积分，随时可再启用）'
+    tog.onclick = async () => {
+      const r = await api('/admin/accounts/toggle', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uid: a.uid, realm: a.realm || 'cn', disabled: !a.disabled }),
+      })
+      if (!r.ok) { alert('操作失败：' + JSON.stringify(r.body)); return }
+      loadModalAccounts(); loadAccounts(); loadPool()
+    }
+    card.appendChild(tog)
 
     const del = document.createElement('button'); del.className = 'danger'; del.textContent = '删除'
     del.onclick = async () => {
@@ -1139,6 +1238,31 @@ function renderModalAdd() {
   const prov = providerCache.find((p) => p.id === modalProviderId)
   const canLogin = prov && prov.capabilities.login
 
+  // ⚠️ **顺序**：设备码登录在上、粘贴凭据在下（用户要求）。
+  // ⚠️ 文案**保持原样不动** —— 只调顺序，不改用词。
+  if (!canLogin) {
+    const n = document.createElement('p'); n.className = 'hint'
+    n.textContent = '该供应商不支持从本服务发起登录，请导入凭据。'
+    box.appendChild(n)
+  } else {
+    const h2 = document.createElement('h3')
+    h2.textContent = LOGIN_KIND_LABEL[modalProviderId] || '设备码登录'
+    box.appendChild(h2)
+    const btn = document.createElement('button'); btn.textContent = '发起登录'
+    const out = document.createElement('pre'); out.className = 'out'
+    btn.onclick = () => startModalLogin(modalProviderId, out)
+    box.appendChild(btn); box.appendChild(out)
+  }
+
+  // 粘贴凭据导入（移到登录**下面**）。
+  //
+  // ⚠️ **必须与上面的登录标题同级**（都是 `h3` + 同款 `hint`）——
+  // 用户报「粘贴凭据导入 字体颜色大小也不统一」：登录那边是 `h3`（13px），
+  // 而导入这边原先只有一句 `hint`（12px），两个区块看起来不像同一层级。
+  // 现在两块各有一个 `h3` 标题 + 一句 `hint` 说明，视觉一致。
+  const ih = document.createElement('h3')
+  ih.textContent = '粘贴凭据导入'
+  box.appendChild(ih)
   const hint = document.createElement('p'); hint.className = 'hint'
   hint.textContent = '粘贴凭据 JSON（会自动声明为本供应商）。'
   box.appendChild(hint)
@@ -1165,21 +1289,6 @@ function renderModalAdd() {
     if (r.ok) { ta.value = ''; loadModalAccounts(); loadAccounts(); loadPool() }
   }
   box.appendChild(imp)
-
-  if (!canLogin) {
-    const n = document.createElement('p'); n.className = 'hint'
-    n.textContent = '该供应商不支持从本服务发起登录，请导入凭据。'
-    box.appendChild(n)
-    return
-  }
-
-  const h2 = document.createElement('h3')
-  h2.textContent = LOGIN_KIND_LABEL[modalProviderId] || '设备码登录'
-  box.appendChild(h2)
-  const btn = document.createElement('button'); btn.textContent = '发起登录'
-  const out = document.createElement('pre'); out.className = 'out'
-  btn.onclick = () => startModalLogin(modalProviderId, out)
-  box.appendChild(btn); box.appendChild(out)
 }
 
 let modalLoginTimer = null
@@ -1397,8 +1506,6 @@ $('toggle-theme').onclick = () => {
   applyTheme(next)
 }
 
-$('do-import').onclick = doImport
-$('do-login').onclick = doLogin
 $('run-checkin-all').onclick = runCheckinAll
 $('run-daily-all').onclick = runDailyAll
 // 「查进度」时**顺带刷新积分** —— 这是用户确认「到底加没加」的入口。

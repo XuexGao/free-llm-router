@@ -311,19 +311,35 @@ test('⚠️ 供应商视图必须支持点开弹窗管理（账号 / 模型 / �
   assert.ok(js.includes('/admin/providers/models'), '弹窗模型页应调按供应商列模接口')
 })
 
-test('⚠️ 登录下拉必须先清空再填（否则选项重复累积）', () => {
-  // 实测 bug：HTML 里硬编码了一个 option，JS 又追加且不清空，
-  // 而 loadProviders 会被多次调用 → 下拉项重复。
-  const js = panelAsset('/panel/app.js')?.body ?? ''
+test('⚠️ 顶层的添加账号/粘贴凭据已删除（登录入口只在各供应商卡片内）', () => {
+  // 用户要求：把「供应商与账号」底部的「添加账号」与「粘贴凭据导入」删掉，
+  // 登录入口改到**每个供应商卡片**里（设备码登录在上、粘贴凭据在下）。
+  //
+  // ⚠️ 这条同时锁住两个层面：
+  // · HTML 里不能再有那套顶层控件；
+  // · JS 里不能残留对它们的引用 —— 残留会**在加载时**抛
+  //   `Cannot set properties of null`，整个面板白屏（比样式错更难查）。
   const html = panelAsset('/panel/')?.body ?? ''
-  // HTML 里不该有硬编码的登录供应商 option
-  const selectBlock = /<select id="login-provider">([\s\S]*?)<\/select>/.exec(html)
-  assert.notEqual(selectBlock, null, '应有 login-provider 下拉')
-  assert.ok(!selectBlock[1].includes('<option'), 'HTML 里不该硬编码 option（应由 JS 统一填）')
-  // JS 必须先 clear 再 append
-  assert.ok(/clear\(loginSelect\)/.test(js), '填选项前必须先 clear')
-})
+  const js = panelAsset('/panel/app.js')?.body ?? ''
 
+  // 顶层控件必须消失
+  assert.ok(!html.includes('id="login-provider"'), '顶层登录下拉应已删除')
+  assert.ok(!html.includes('id="import-body"'), '顶层粘贴凭据框应已删除')
+  assert.ok(!html.includes('id="do-login"'), '顶层「发起登录」按钮应已删除')
+  assert.ok(!html.includes('id="do-import"'), '顶层「导入」按钮应已删除')
+
+  // ⚠️ JS 里不得残留引用（否则面板启动即崩）
+  for (const id of ['login-provider', 'do-login', 'import-body', 'do-import', 'login-result', 'import-result']) {
+    assert.ok(
+      !js.includes(`$('${id}')`),
+      `⚠️ app.js 不得再引用已删除的 #${id} —— 那会在加载时抛 null 异常，面板白屏`,
+    )
+  }
+
+  // 登录入口仍在**供应商弹窗**里（设备码登录在上、粘贴凭据在下）
+  assert.ok(/startModalLogin\(/.test(js), '供应商弹窗仍应有登录入口')
+  assert.ok(/modal-import-body/.test(js), '供应商弹窗仍应有粘贴凭据')
+})
 test('⚠️ CSS 必须有 [hidden] 的全局兜底（否则 display:flex 会压过它）', () => {
   // 实测 bug：`.banner { display: flex }` 优先级高于 UA 的 `[hidden]{display:none}`，
   // 导致 WAF 横幅**永远显示**，点「立即解除」也没用。
@@ -740,4 +756,122 @@ test('⚠️ 模型目录的候选筛选必须与 chat 的健康判据一致', (
   assert.ok(/a\.disabled === true/.test(block), '应跳过 disabled 账号')
   assert.ok(/a\.until > Date\.now\(\)/.test(block), '应跳过冷却中的账号')
   assert.ok(/a\.breakerUntil > Date\.now\(\)/.test(block), '应跳过熔断的账号')
+})
+
+test('⚠️ 「供应商」计数块必须在「已禁用」**右边**，且复用同款样式', () => {
+  // 用户要求：「在已禁用卡片后面加上供应商，数字显示支持的供应商数量，
+  // 点开后弹窗可以调整排序和开关供应商」，并明确纠正为**右边**。
+  //
+  // ⚠️ 「已禁用」等计数块在同一个横向 flex 行里（`.counts`），
+  // 故 DOM 顺序就是视觉左右顺序 —— 必须紧跟其后 append。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const disabledLine = js.indexOf("countBlock('已禁用'")
+  const provLine = js.indexOf("countBlock('供应商'")
+  assert.ok(disabledLine > 0, '应有「已禁用」计数块')
+  assert.ok(provLine > 0, '应有「供应商」计数块')
+  assert.ok(provLine > disabledLine, '⚠️「供应商」必须在「已禁用」的右边（DOM 顺序即左右）')
+  // ⚠️ 复用它自己的 countBlock（不是另造一套卡片）—— 视觉才统一
+  assert.ok(/countBlock\('供应商',\s*\w+,\s*\(\) => openProviderManager\(\)\)/.test(js),
+    '应复用 countBlock 并绑定点击打开管理弹窗')
+  // 数字是**已启用的供应商数**
+  assert.ok(/enabledProviders/.test(js), '数字应是已启用的供应商数')
+  // 点开能排序与开关
+  assert.ok(js.includes('openProviderManager'), '点击应打开管理弹窗')
+  assert.ok(js.includes('/admin/providers/settings'), '弹窗要能把设置存到服务端')
+})
+
+test('⚠️ 供应商列表必须支持**拖动**排序（不是上移/下移按钮）', () => {
+  // 用户明确要求：「加一个拖动移动位置」。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  // 行可拖 + 有手柄
+  assert.ok(/row\.draggable = true/.test(js), '行必须是 draggable')
+  assert.ok(/ondragstart/.test(js) && /ondrop/.test(js), '要处理 dragstart 与 drop')
+  assert.ok(js.includes('drag-handle'), '要有拖动手柄')
+  assert.ok(/drag-handle/.test(css), '手柄要有样式（cursor: grab）')
+  // ⚠️ `dragover` 必须 preventDefault，否则浏览器拒绝 drop（静默失效）
+  assert.ok(/ondragover = \(e\) => \{ e\.preventDefault\(\)/.test(js),
+    '⚠️ dragover 必须 preventDefault，否则 drop 不触发')
+  // ⚠️ 不能再有上移/下移按钮（用户要的是拖动）
+  assert.ok(!/up\.textContent = '↑'/.test(js), '不应保留「上移」按钮')
+})
+
+test('⚠️ 供应商管理弹窗必须复用现有 .card 样式（视觉统一）', () => {
+  // 用户报：「打开后的风格也不统一」。故弹窗里的行要用**现有的** `.card`
+  //（与「账号」页同款），不是自己造一套 `.prow`。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const i = js.indexOf('function openProviderManager')
+  const block = js.slice(i, i + 3200)
+  assert.ok(/row\.className = 'card'/.test(block), '管理行应复用 .card 样式')
+  // ⚠️ 按钮也复用现有的 ghost / danger（不另立样式）
+  assert.ok(/sw\.className = off \? 'ghost' : 'danger'/.test(block), '开关应复用 ghost/danger')
+  // 自造的 .prow 样式必须已删除（否则就是两套风格）
+  assert.ok(!/\.prow\b/.test(css), '⚠️ 不得残留自造的 .prow 样式')
+})
+
+test('🔴 账号卡片必须支持单独停用/启用，且按钮在「删除」左边', () => {
+  // 用户要求：「每个账号支持单独停用和启用，放在删除左边」。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  // 调的是可逆端点（不是 remove）
+  assert.ok(js.includes('/admin/accounts/toggle'), '停用/启用应走 toggle 端点')
+  // ⚠️ **顺序**：停用按钮必须先 append，删除在后 ——
+  // 用户明确要「放在删除左边」，而 DOM 顺序就是视觉顺序。
+  const togAppend = js.indexOf("card.appendChild(tog)")
+  const delAppend = js.indexOf("card.appendChild(del)")
+  assert.ok(togAppend > 0 && delAppend > 0, '两个按钮都应存在')
+  assert.ok(togAppend < delAppend, '⚠️ 停用/启用必须在「删除」左边')
+  // ⚠️ 视觉区分：停用可逆（ghost），删除不可逆（danger）——
+  // 把可逆操作也做成红色会让用户不敢点。
+  assert.ok(/const del = document.createElement\('button'\); del\.className = 'danger'/.test(js),
+    '删除仍应是 danger 样式')
+})
+
+test('⚠️ 每个账号卡片必须单独显示积分（用户要求）', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(js.includes('acct-credits'), '账号卡片要有积分元素')
+  // ⚠️ 数据必须来自已有的 `/admin/accounts`（`a.credits`），
+  // **不能**为每个账号再打一次上游 —— 那既慢又消耗额度。
+  assert.ok(/a\.credits/.test(js), '积分应取账号自身字段，不额外请求')
+  assert.ok(/acct-credits/.test(css), '要有样式')
+  // 查不到时显示 `—` 而不是 0（显示 0 会让人以为额度用光）
+  assert.ok(js.includes("cr.textContent = '—'"), '未查到应显示破折号而非 0')
+})
+
+test('🔴 供应商关闭必须真的关掉（服务端状态 + 双向拦截）', () => {
+  // 用户明确：「彻底关掉（面板 + API 都消失）」。
+  // ⚠️ 只在面板隐藏是不够的 —— 客户端可能缓存了旧目录，或按名字硬编码调用。
+  const index = readFileSync('src/index.ts', 'utf8')
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① /v1/models 要跳过被关闭的家
+  assert.ok(/userDisabledProviders\.has\(providerId\)/.test(index),
+    '⚠️ /v1/models 必须跳过被关闭的供应商')
+
+  // ② 路由要拒绝
+  assert.ok(index.includes('/admin/providers/settings'), '应有设置端点')
+  assert.ok(server.includes('isProviderClosedByUser'), '路由必须有「已关闭」判据')
+  assert.ok(/provider_disabled/.test(server), '应回一个可识别的错误码')
+
+  // ③ ⚠️ 判据读**服务端**设置，不是浏览器 localStorage
+  assert.ok(/getProviderSettings/.test(server), '判据必须读服务端设置（localStorage 只在面板生效）')
+
+  // ④ ⚠️ 读失败必须按「没关」处理 —— 不能把偏好读取失败放大成全面 403
+  const i = server.indexOf('async function isProviderClosedByUser')
+  const block = server.slice(i, i + 400)
+  assert.ok(/catch\s*\{[\s\S]*?return false/.test(block), '⚠️ 读设置失败必须回 false（不能全面 403）')
+})
+
+test('⚠️ 供应商排序不得改变默认供应商（避免悄悄改路由）', () => {
+  // 用户选择：「只影响面板展示顺序」，不改默认供应商。
+  // ⚠️ 若排序决定默认值，裸模型名的既有请求会被悄悄路由到别家 —— 不可接受。
+  const src = readFileSync('src/providers/index.ts', 'utf8')
+  assert.ok(/export const DEFAULT_PROVIDER = PROVIDERS\[0\]/.test(src),
+    '默认供应商必须仍由**注册表第 0 项**决定，不受面板排序影响')
+  // 面板设置里不该有「默认供应商」这个概念
+  const index = readFileSync('src/index.ts', 'utf8')
+  const i = index.indexOf("path === '/admin/providers/settings'")
+  const block = index.slice(i, i + 900)
+  assert.ok(!/defaultProvider/.test(block), '设置端点不该改默认供应商')
 })

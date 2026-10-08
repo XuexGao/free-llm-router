@@ -492,3 +492,39 @@ main > * { min-width: 0; }
   .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
   .bar-label { width: 52px; }  /* 此时折成两行可以接受 */
 }
+
+/* ── 供应商管理（计数块样式复用 .count，这里只加拖动手柄与已关闭标记）── */
+
+/*
+ * 拖动排序手柄。
+ * ⚠️ 只有手柄可拖（不是整行）：整行可拖会让「启用/关闭」按钮几乎点不中 ——
+ * 按下即开始拖动，click 事件不会触发。
+ * `cursor: grab` 明示可拖；手机上由浏览器映射成长按拖动。
+ */
+.drag-handle {
+  cursor: grab;
+  color: var(--dim);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+  user-select: none;
+}
+.drag-handle:active { cursor: grabbing; }
+
+/* 拖动中的行：降透明度，让「正在拖谁」一目了然 */
+.card.dragging { opacity: 0.45; }
+/* 悬停中的落点：用左侧高亮条标出「会插到这里」 */
+.card.drop-target { border-color: var(--accent, #4a9eff); }
+
+/*
+ * 已关闭的供应商卡片：降透明度。
+ * ⚠️ 这是**必需的**：否则用户会以为它坏了，而它只是按你的选择不参与。
+ */
+.prov-card.off { opacity: 0.55; }
+.prov-off-tag { margin-top: 6px; font-size: 12px; color: var(--err); }
+
+/* ⚠️ 手机断点：账号卡片元素变多（积分 + 停用 + 删除），
+   让积分单独占一行，否则会把 uid/昵称挤成一条竖线。 */
+@media (max-width: 720px) {
+  .card .acct-credits { flex-basis: 100%; }
+}

@@ -121,26 +121,6 @@
     <p class="hint">点任意一家可管理它的账号与模型。</p>
     <div id="providers" class="prov-grid"></div>
 
-    <h3>添加账号</h3>
-    <p class="hint">选供应商后点「发起登录」；不支持登录的家请粘贴凭据导入。
-    凭据会自动声明为该供应商（避免被别家按形状抢走）。</p>
-    <div class="row">
-      <label>供应商
-        <!-- ⚠️ 选项全部由 JS 填（见 loadProviders）。这里刻意不放硬编码
-             option —— 之前放了又由 JS 追加，而 loadProviders 会被多次调用
-             且不清空，导致下拉项重复累积。 -->
-        <select id="login-provider"></select>
-      </label>
-      <button id="do-login">发起登录</button>
-    </div>
-    <pre id="login-result" class="out"></pre>
-
-    <details>
-      <summary>粘贴凭据导入</summary>
-      <textarea id="import-body" rows="6" placeholder='{"accessToken":"...","uid":"..."}'></textarea>
-      <button id="do-import">导入</button>
-      <pre id="import-result" class="out"></pre>
-    </details>
   </section>
 
   <!-- ───────── 配置 ───────── -->
