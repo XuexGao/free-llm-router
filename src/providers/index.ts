@@ -20,6 +20,7 @@ import { clineProvider } from './cline.js'
 import { minimaxProvider } from './minimax.js'
 import { codeartsProvider } from './codearts.js'
 import { lobsteraiProvider } from './lobsterai.js'
+import { loomyProvider } from './loomy.js'
 import { traeProvider } from './trae.js'
 import { qoderProvider } from './qoder.js'
 import { opencodeProvider } from './opencode.js'
@@ -49,6 +50,8 @@ export const PROVIDERS: readonly Provider[] = [
   opencodeProvider,
   raccoonProvider,
   zcodeProvider,
+  // ⚠️ **放在最后**：数组第 0 项是默认供应商，不能被新加的挤动。
+  loomyProvider,
 ]
 
 /** 默认供应商 id（裸模型名回落到它）。 */

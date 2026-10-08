@@ -84,6 +84,23 @@ export const ZCODE_BILLING_BALANCE_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/bill
 /** 客户端配置端点（模型池 + captcha 配置都从这里来）。 */
 export const ZCODE_CLIENT_CONFIGS_URL = `${ZCODE_ORIGIN}/api/v1/client/configs`
 
+/**
+ * 领取端点（**需要 Authorization + 阿里云 captcha**）。
+ *
+ * ⚠️ 实测：该端点**始终**索要 captcha（带非法 captcha 与不带都由
+ * `400 / code 3007` 拒绝，且**校验前置于 plan 校验**）。
+ * 参考：`deepseek-harness-codearts/src/zcode-upstream.ts:73`。
+ */
+export const ZCODE_BILLING_CLAIM_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/claim`
+
+/**
+ * 可领取计划预览端点（`GET`，**不需要 captcha**）。
+ *
+ * ⚠️ 与 claim 的区别很重要：本端点不需要验证码，故**在 Workers 上可用** ——
+ * 它让「有没有可领的」这件事仍然可查（而真正领取才需要浏览器）。
+ */
+export const ZCODE_BILLING_PREVIEW_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/preview`
+
 /** CLI 设备授权流的初始化端点。 */
 export const ZCODE_OAUTH_CLI_INIT_URL = `${ZCODE_ORIGIN}/api/v1/oauth/cli/init`
 
@@ -898,6 +915,120 @@ function orderReasoningLevels(keys: readonly string[]): string[] {
  * （没有单位字段），故把 `unit_type` 写进 `packages[].name` 让面板能带上它。
  * 出处：`src/zcode-upstream.ts:93-122`。
  */
+/**
+ * 每日签到（领取每日积分）。
+ *
+ * ## ⚠️ 诚实说明：本函数**大概率会失败**，原因在上游而不在我们
+ *
+ * 领取端点 `/zcode-plan/billing/claim` **始终强制索要阿里云 captcha**
+ * （实测：带非法 captcha 与不带 captcha 都回 `400 / code 3007`，
+ * 且验证码校验**前置于** plan 校验）—— 参考
+ * `deepseek-harness-codearts/src/zcode-upstream.ts:14,73`。
+ *
+ * 而阿里云验证码是**网页 SDK**，必须由真实浏览器过风控
+ *（参考实现为此在本机起了 `CarrierPageServer` 小服务 + headful Chromium；
+ * `zcode-captcha.ts` 实测 `--headless=new` 也过不了）。
+ * **Workers 没有 listen socket、也拉不起浏览器** ⇒ 这条链在架构上不成立。
+ *
+ * ## 那为什么还要实现它
+ *
+ * 用户明确要求「加上 zcode 签到，接受会经常失败」。故这里**如实发起请求**：
+ * - 先查 `preview`（**不需要 captcha**）—— 这一步能成功，让用户知道
+ *   「有没有可领的」；
+ * - 再尝试 `claim` —— 若上游回 3007，就**如实把上游原话报出来**，
+ *   而不是编造「签到成功」，也不是静默跳过。
+ *
+ * ⚠️ **绝不伪造成功**：`CheckinResult` 的成功路径只在真的拿到业务码 0 时走。
+ * 谎报签到成功会让用户以为积分到账了 —— 那比失败更糟。
+ *
+ * ⚠️ 也**不做 captcha 绕过尝试**：那既不可行（没有浏览器），
+ * 也是在主动对抗上游风控（本项目 §3.1 的合规红线）。
+ */
+async function checkin(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+): Promise<CheckinResult> {
+  // ① 先查可领取计划（**不需要 captcha**）—— 这步在 Workers 上真能跑通，
+  //    故即便后面 claim 失败，也能给用户一条有用信息。
+  let claimable: string[] = []
+  try {
+    const preview = await fetch(ZCODE_BILLING_PREVIEW_URL, {
+      method: 'GET',
+      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.accessToken}`, json: false }),
+      signal,
+    })
+    if (preview.ok) {
+      const body = (await preview.json().catch(() => undefined)) as
+        | { data?: { plans?: Array<Record<string, unknown>> } }
+        | undefined
+      const plans = body?.data?.plans
+      if (Array.isArray(plans)) {
+        claimable = plans
+          .filter((x) => x !== null && typeof x === 'object')
+          .filter((x) => {
+            // ⚠️ 判据取「可领取」标记；上游字段名未在参考实现里固定，
+            // 故同时看几个可能的名字，任一为真即算。
+            const r = x as Record<string, unknown>
+            return r['claimable'] === true || r['can_claim'] === true || r['available'] === true
+          })
+          .map((x) => String((x as Record<string, unknown>)['plan_id'] ?? (x as Record<string, unknown>)['id'] ?? ''))
+          .filter((id) => id !== '')
+      }
+    }
+  } catch {
+    // 预览失败不致命：继续尝试 claim，让它给出真实的失败原因。
+  }
+
+  if (claimable.length === 0) {
+    // 没有可领的 ⇒ 这是**正常状态**（今天已领过 / 没有活动），不是错误。
+    return { alreadyDone: true, gained: 0, detail: '没有可领取的每日积分（可能今天已领取）' }
+  }
+
+  // ② 尝试领取。⚠️ 不带 captcha 头 —— 我们知道它会失败，
+  //    但**如实发起**比直接抛「不可用」更诚实：上游若哪天放宽了校验，
+  //    这里就自然开始工作，无需再改代码。
+  const res = await fetch(ZCODE_BILLING_CLAIM_URL, {
+    method: 'POST',
+    headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.accessToken}` }),
+    body: JSON.stringify({ plan_id: claimable[0] }),
+    signal,
+  })
+  const text = await res.text().catch(() => '')
+  // ⚠️ 业务码可能是**纯数字字符串**（参考实现踩过：只认 number 会让风控码
+  //    整条丢失，见 `zcode-upstream.ts:518-528`）。
+  let code: number | undefined
+  let msg = ''
+  try {
+    const parsed = JSON.parse(text) as { code?: unknown; msg?: unknown; message?: unknown }
+    const raw = parsed.code
+    code = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : undefined
+    msg = typeof parsed.msg === 'string' ? parsed.msg : typeof parsed.message === 'string' ? parsed.message : ''
+  } catch {
+    // 非 JSON：保留原文供错误信息使用
+  }
+
+  if (code === 0) {
+    return { alreadyDone: false, gained: 0, detail: `签到成功（${claimable.length} 个待领计划）` }
+  }
+  // ⚠️ 3007 = captcha 被拒；这是**最可能**的结果，文案要说清「是验证码，不是你的账号坏了」。
+  if (code === 3007) {
+    throw new ProviderError({
+      provider: 'zcode',
+      httpStatus: res.status,
+      message:
+        'ZCode 签到需要阿里云验证码（上游强制要求真实浏览器过风控）。'
+        + '本服务运行在 Cloudflare Workers，无法拉起浏览器，故签到做不到 —— '
+        + '这不是你的账号问题，推理功能完全不受影响。'
+        + (msg !== '' ? `上游原话：${msg}` : ''),
+    })
+  }
+  throw new ProviderError({
+    provider: 'zcode',
+    httpStatus: res.status,
+    message: `ZCode 签到失败（code=${String(code)}）：${msg || text.slice(0, 160) || `HTTP ${res.status}`}`,
+  })
+}
+
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const res = await fetch(ZCODE_BILLING_BALANCE_URL, {
     method: 'GET',
@@ -967,46 +1098,6 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
   return { total, expiring: 0, earliestExpiry, packages: packages.map((p) => ({ ...p, amount: p.amount })) }
 }
 
-/**
- * 签到（**本适配器不实现** —— `capabilities.checkin = false`）。
- *
- * ## ❌ 为什么在 Workers 上不可行（必须如实声明）
- *
- * `POST /api/v1/zcode-plan/billing/claim` **始终索要**阿里云 captcha：
- * 不带验证头回 `400 {"code":3007}`，**且校验前置于 plan 校验**
- * （连 plan 都不给验）。出处：`src/zcode-captcha.ts:1-20` 的实测表。
- *
- * captcha 是**网页 SDK**（`o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js`），
- * 需要一个「有 DOM + canvas + 能跑 JS」的浏览器。参考实现用外挂 Chromium 产出，
- * 并有两条**实测约束**（`src/zcode-captcha.ts:57-65`）：
- *
- * | 模式 | 结果 |
- * |---|---|
- * | `--headless=new`（+ 补丁） | ✗ `fail` / `verifyCode: F001` |
- * | **headful + 补丁** | ✓ 280 字符合法 param |
- *
- * > 阿里云风控会看这个差异。headful 在 Windows 上可以**不打扰用户**
- * > （`--window-position=-32000,-32000` 移出屏幕）。
- *
- * Workers **不可能**拉起任何浏览器（无 `child_process`，`AGENTS.md §2.5`
- * 第 4 条），更不可能 headful ⇒ **签到整体排除**，
- * 与 Go 侧 `src/auto-checkin.ts` 排除 zcode 的做法一致
- * （`AGENTS.md §2.5` 第 4 条末尾）。
- *
- * ⚠️ **注意推理不受影响**：自 3.14.4（2026-09-29）起模型请求**不再索要**
- * captcha（不带验证头也是 HTTP 200，6 个采样点，`src/zcode-captcha.ts:5-12`）。
- * 故 `capabilities.chat = true` 而 `checkin = false` —— 两者是独立的。
- */
-async function checkin(): Promise<CheckinResult> {
-  throw new ProviderError({
-    provider: 'zcode',
-    message: 'ZCode 每日领取需要阿里云 captcha（`billing/claim` 恒回 400 code 3007），'
-      + '而该 captcha 是网页 SDK，必须由 **headful** 浏览器产出'
-      + '（实测 `--headless=new` 一律 fail/F001）—— Workers 无法拉起任何浏览器，'
-      + '故签到不可用。推理不受影响（自 3.14.4 起模型请求不再校验 captcha）。'
-      + '如需领取，请在 ZCode 官方客户端里操作',
-  })
-}
 
 // ─────────────────────────── Provider ───────────────────────────
 
@@ -1041,7 +1132,12 @@ export const zcodeProvider: Provider = {
      * ❌ **签到不可用** —— `billing/claim` 恒索要阿里云 captcha，
      * 而产出它必须 **headful** 浏览器。见 {@link checkin} 的完整依据。
      */
-    checkin: false,
+    /**
+     * ⚠️ **改为 `true`（用户要求「加上 zcode 签到，接受会经常失败」）**，
+     * 但如实声明它**大概率失败**：上游强制阿里云 captcha，Workers 无浏览器。
+     * 详见 `checkin()` 的文档注释。
+     */
+    checkin: true,
     /**
      * ⚠️ 上游 `billing/claim` **始终**索要阿里云 captcha，而验证码需要
      * **headful Chromium**（`src/zcode-captcha.ts:57-65` 实测：`--headless=new` 过不了风控）。
@@ -1051,10 +1147,9 @@ export const zcodeProvider: Provider = {
      * （`src/zcode-captcha.ts:5-12` 的 6 个采样点全部 HTTP 200）。
      */
     checkinBlockedReason:
-
-      'ZCode 的签到接口始终要求阿里云验证码（需真实浏览器过风控），Workers 无法完成。'
-
-      + '推理不受影响 —— 自 3.14.4 起模型请求已不再需要验证码。',
+      'ZCode 的签到接口**始终**要求阿里云验证码（需真实浏览器过风控），'
+      + 'Workers 无法完成 —— 尝试签到会如实报出上游的 3007 拒绝。'
+      + '推理不受影响（自 3.14.4 起模型请求已不再需要验证码）。',
   },
   parseCredential,
   listModels,
