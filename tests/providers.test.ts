@@ -665,3 +665,64 @@ test('🔴 zcode 签到前**必须**补发客户端活跃上报（否则 preview
   assert.ok(/catch \{[\s\S]{0,120}\}/.test(block.slice(reportAt - 200, reportAt + 2000)),
     '上报失败应被兜住（不阻塞）')
 })
+
+test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让请求挂到被平台掐断）', () => {
+  // ## 实测缺陷
+  //
+  // 原先只有「次数上限」（3 次 × 最多 10s 等待 + 每次 20s 超时 ≈ 90s），
+  // **没有总时间上限**。实测后果：
+  // ```
+  // 排队 3 轮耗尽（约 90s）→ 触发续期（再 30s）
+  //   ⇒ 请求挂到 122s ⇒ Worker 报 `Network connection lost.`
+  //   ⇒ 平台回一个裸 `error code: 1101`（无任何可读原因）
+  // ```
+  //
+  // ⚠️ 参考实现默认等 **30 分钟**（`qoder-adapter.ts:167-172`）——
+  // 那是**长驻本地进程**的合理预算，而本服务跑在 Worker 里：
+  // 挂几分钟既会被平台掐断，用户也早已放弃。
+  const src = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(/const QUEUE_TOTAL_BUDGET_MS = \d[\d_]*/.test(src), '必须有总预算常量')
+  const m = /const QUEUE_TOTAL_BUDGET_MS = ([\d_]+)/.exec(src)
+  const budget = Number(m![1]!.replaceAll('_', ''))
+  // ⚠️ 上限：不能长到被平台掐断（实测 122s 会挂）
+  assert.ok(budget <= 90_000, `总预算 ${budget}ms 太长，会被平台掐断（实测 122s 即失败）`)
+  // ⚠️ 下限：要够覆盖一次正常排队（实测常见 20–25s），否则正常用户会被误报
+  assert.ok(budget >= 30_000, `总预算 ${budget}ms 太短，正常排队（20–25s）会被误判为繁忙`)
+  // 循环里必须真的用上它
+  const i = src.indexOf('async function chat(')
+  const block = src.slice(i, i + 3000)
+  assert.ok(/DATE|Date\.now\(\) - queueStartedAt/.test(block), '要记录起始时刻')
+  assert.ok(/overBudget/.test(block), '⚠️ 必须有超预算判据')
+  // ⚠️ 排队超时要**如实说明是排队**，且标记为可重试（容量问题，换号/稍后有效）
+  assert.ok(/服务繁忙/.test(block) && /稍后重试/.test(block), '文案要说清是排队、稍后重试有效')
+  assert.ok(/retryable: true/.test(block), '⚠️ 排队是容量问题 ⇒ 应标可重试')
+})
+
+test('🔴 Worker 入口必须有异常边界（否则只回裸 `error code: 1101`）', () => {
+  // ## 实测缺陷
+  //
+  // 原先 `export default { fetch: handle }` 直接暴露业务函数，而 `handle`
+  // **完全没有 try/catch**。任何未捕获的抛出都变成 Cloudflare 的裸
+  // `error code: 1101`：客户端只看到 500 + 一个内部码，**不知道发生了什么**。
+  //
+  // ⚠️ 这与本项目「**绝不静默失败**」（§7.2）直接冲突 —— `1101` 就是
+  // 最彻底的静默失败：既没有原因，也没有可操作信息。
+  //
+  // ⚠️ 这条边界加上后**立刻**定位到了 qoder 的真实原因
+  //（`Network connection lost.`，此前完全不可见）。
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.ok(/async function handle\([\s\S]{0,120}?try \{/.test(src), '⚠️ handle 必须有 try')
+  assert.ok(/catch \(error\)/.test(src.slice(src.indexOf('async function handle('), src.indexOf('async function handle(') + 1200)),
+    '⚠️ handle 必须有 catch')
+  // 必须打**完整堆栈**（只打 message 会让排查失去线索）
+  const i = src.indexOf('async function handle(')
+  const block = src.slice(i, i + 1400)
+  assert.ok(/error\.stack/.test(block), '⚠️ 必须打完整堆栈')
+  // ⚠️ 回给客户端**可读原因**，不是裸内部码
+  assert.ok(/internal_error/.test(block), '应回可识别的错误码')
+  // ⚠️ 绝不能把 Authorization 打进日志。
+  // ⚠️ 判据要**排除注释** —— 我的说明注释里正写着「绝不打 Authorization」
+  //（不排除会把「解释为什么不打」的注释本身判成违规）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/Authorization/.test(code), '⚠️ 日志不得含 Authorization')
+})

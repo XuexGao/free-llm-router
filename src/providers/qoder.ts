@@ -770,8 +770,42 @@ export function unwrapQoderEnvelopeStream(
  * - **≥ 10 秒 → 封顶 10 秒** —— 避免一次阻塞 30 秒让 UI 长期停在「运行中」；
  * - 最多 3 次（本项目 `chat()` 只有一次请求的预算，且网关已有换号层）。
  */
+/**
+ * 单次排队等待的上限（服务端要求的 `retryAfter` 更大时按此截断）。
+ *
+ * ⚠️ **必须截断**：服务端可能给出很长的 `retryAfter`，照等会让一个 HTTP
+ * 请求挂住几分钟，而 Worker 最终会被平台掐断（实测报
+ * `Network connection lost.` 且耗时 122s）。
+ */
 const QUEUE_MAX_DELAY_MS = 10_000
+
+/** 排队重试的次数上限。 */
 const QUEUE_MAX_ATTEMPTS = 3
+
+/**
+ * 排队的**总墙钟预算**（毫秒）—— 所有重试与等待加起来不得超过它。
+ *
+ * ## 🔴 为什么必须有总预算（实测缺陷）
+ *
+ * 原先只有「次数上限」（3 次 × 最多 10s 等待 + 每次 20s 超时 ≈ 90s），
+ * **没有总时间上限**。实测后果：
+ *
+ * ```
+ * qoder 排队 3 轮耗尽（约 90s）→ 触发续期（再 30s）
+ *   ⇒ 请求总共挂到 122s
+ *   ⇒ Worker 报 `Network connection lost.`
+ *   ⇒ 以前还因为缺异常边界而只回一个裸 `error code: 1101`（无任何原因）
+ * ```
+ *
+ * ⚠️ 参考实现（`qoder-adapter.ts:167-172`）默认等 **30 分钟** ——
+ * 那是一个**长驻本地进程**的合理预算，而**本服务跑在 Worker 里**：
+ * 一个 HTTP 请求挂几分钟既会被平台掐断，用户也早已放弃。
+ *
+ * ⇒ 取 **45 秒**：足够覆盖「一次正常排队」（实测常见 20–25s），
+ * 又远低于平台会掐断的量级。超出预算时**如实报「排队太挤」**，
+ * 让客户端稍后重试 —— 那比挂到被平台掐断（无可读原因）好得多。
+ */
+const QUEUE_TOTAL_BUDGET_MS = 45_000
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -861,6 +895,8 @@ async function chat(
   credential: ProviderCredential,
   request: ChatRequest,
 ): Promise<Response> {
+  // ⚠️ 记**开始时刻**，用于总预算判据（见 QUEUE_TOTAL_BUDGET_MS 的说明）。
+  const queueStartedAt = Date.now()
   for (let attempt = 0; ; attempt += 1) {
     const response = await postQoderInfer(product, credential, request)
 
@@ -879,9 +915,27 @@ async function chat(
     // ── 排队（业务码 10605，可能藏在两层 message 里）→ 按服务端延迟等待后重试 ──
     // ⚠️ **不能用顶层 `code` 当门禁**：第三次回归时顶层是 403、10605 在 message 里。
     const queue = parseQoderQueueError(text)
-    if (queue !== undefined && attempt < QUEUE_MAX_ATTEMPTS) {
-      const asked = queue.retryAfterMs
-      const wait = asked === undefined ? 1000 : Math.min(asked, QUEUE_MAX_DELAY_MS)
+    if (queue !== undefined) {
+      // ⚠️ **先判总预算，再判次数** —— 两个上限都要守，任一超了就如实上报。
+      const spent = Date.now() - queueStartedAt
+      const overBudget = spent >= QUEUE_TOTAL_BUDGET_MS
+      if (overBudget || attempt >= QUEUE_MAX_ATTEMPTS) {
+        // ⚠️ 如实说明「是排队太挤」，而不是把它伪装成失败 ——
+        // 用户据此知道「稍后重试有用」，而不是「我的账号/配置有问题」。
+        // ⚠️ `retryable: true`：排队是**容量**问题，换号或稍后重试确实有效。
+        throw new ProviderError({
+          provider: product.id,
+          httpStatus: response.status,
+          retryable: true,
+          message:
+            `Qoder 服务繁忙：排队等待已超过 ${Math.round(QUEUE_TOTAL_BUDGET_MS / 1000)} 秒`
+            + `（已尝试 ${attempt + 1} 次，实际等待 ${Math.round(spent / 1000)} 秒）。`
+            + '请稍后重试 —— 这是上游排队，不是账号或配置问题。',
+        })
+      }
+      const wait = queue.retryAfterMs === undefined
+        ? 1000
+        : Math.min(queue.retryAfterMs, QUEUE_MAX_DELAY_MS)
       await sleep(wait, request.signal)
       continue
     }
