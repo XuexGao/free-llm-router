@@ -857,3 +857,126 @@ test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透�
   // ⚠️ 要参与记账（否则失败不入池状态：不换号、不冷却）
   assert.ok(/hooks\.onError\(message\)/.test(block), '⚠️ 必须调 hooks.onError 参与记账')
 })
+
+test('🔴 saveLoginSession 的第三个参数必须是**绝对时刻**（不是时长）', () => {
+  // ## 实测缺陷（用户报「讯飞登录显示登录会话不存在或已过期」）
+  //
+  // `saveLoginSession(state, payload, expiresAt)` 的第三个参数**必须是
+  // `Date.now() + TTL` 形态的绝对毫秒时间戳**（见 `AccountPoolDO.ts:767-769`
+  // → `writeLoginSession` 直接拿它比 `now`）。
+  //
+  // ⚠️ 我原先写的是裸的 `5 * 60 * 1000`（= 300000）—— 那是一个
+  // **1970-01-01T00:05:00Z** 的时刻 ⇒ 会话**存进去就已经过期**
+  // ⇒ 第二步必然报「会话不存在或已过期」，而第一步明明刚成功、验证码也真的发出去了。
+  //
+  // ⚠️ 这个参数名是 `expiresAt`（**时刻**）而非 `ttl`（**时长**）——
+  // 凡是「传时长还是时刻」的接口都极易写错，且症状是**静默失效**
+  //（不报错，只是永远查不到）。故这里用单测把所有调用点钉住。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const calls: string[] = []
+  const re = /saveLoginSession\(/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(src)) !== null) {
+    // 从该位置往后配平括号，取出整个调用
+    let depth = 1
+    let k = m.index + 'saveLoginSession('.length
+    while (k < src.length && depth > 0) {
+      if (src[k] === '(') depth += 1
+      else if (src[k] === ')') depth -= 1
+      k += 1
+    }
+    calls.push(src.slice(m.index, k))
+  }
+  assert.ok(calls.length >= 10, `应找到全部调用点（找到 ${calls.length}）`)
+
+  for (const call of calls) {
+    // 取**最后一个顶层参数**
+    const body = call.slice(call.indexOf('(') + 1, -1)
+    const parts: string[] = []
+    let d = 0
+    let cur = ''
+    for (const c of body) {
+      if ('([{'.includes(c)) d += 1
+      else if (')]}'.includes(c)) d -= 1
+      if (c === ',' && d === 0) { parts.push(cur.trim()); cur = '' } else cur += c
+    }
+    // ⚠️ 收尾的 `cur` **必须** push（我的 JS 版原先在循环里 push 了，
+    // 但 Python 原型漏了 —— 这里保证补上，否则最后一个参数会丢）。
+    if (cur.trim() !== '') parts.push(cur.trim())
+    const third = parts[parts.length - 1] ?? ''
+    // ⚠️ 判据：必须含「时刻」语义的表达式。
+    // 合法形态：`Date.now() + …` / `expiresAt` / `now + …` / `…TTL` / `deadline + …`
+    const ok = /Date\.now\(\)|expiresAt|now \+|TTL|deadline|sessionTtl/.test(third)
+    assert.ok(
+      ok,
+      `⚠️ saveLoginSession 第 3 参数必须含「绝对时刻」语义（实际：${third.slice(0, 60)}）`
+        + ' —— 传裸时长会让会话**存进去就过期**，症状是「会话不存在」',
+    )
+  }
+})
+
+test('🔴 loomy 第二步必须复用 findLoginSession（不能自己解析 getLoginSession 的返回值）', () => {
+  // ## 实测缺陷（同上）
+  //
+  // `getLoginSession()` 返回的是**会话载荷本身**（`AccountPoolDO.ts:776-779`），
+  // 而 `findLoginSession()`（`index.ts:376-392`）才把它包成
+  // `{realm, payload: session, pool}`。
+  //
+  // ⚠️ 我原先自己写了个查找循环，还去取 `hit.payload` —— **那一层不存在**
+  // ⇒ 恒为 `undefined` ⇒ 第二步必然「会话不存在」。
+  //
+  // ⚠️ 教训：**同一个查找逻辑已有共享实现时，不要自己再写一遍** ——
+  // 我把「包装层的形状」搞错了，而这类错误只表现为「查不到」。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("path === '/admin/providers/login/loomy/sms'")
+  const block = src.slice(i, i + 4000)
+  assert.ok(/await findLoginSession\(env, state\)/.test(block),
+    '⚠️ loomy 第二步必须用 findLoginSession（它才是那个包装层）')
+  assert.ok(!/for \(const r of \[/.test(block),
+    '⚠️ 不得自己再写一遍分片查找循环')
+})
+
+test('🔴 cron 必须做**主动续期**（否则每次凭据过期都先失败一批请求）', () => {
+  // ## 用户报「其它账号的稳定性能不能提升一下，动不动就掉登录」
+  //
+  // 在此之前本项目续期**只有一条路径**：网关收到 401/403 时**才**续期。
+  // ⇒ **每一次凭据过期都必然先失败一批请求** ⇒ 用户看到「动不动就掉登录」，
+  // 而且掉的时候是**硬失败**（要等客户端重试才恢复）。
+  //
+  // ⚠️ 参考实现为此专门有 `refresh-scheduler.ts`，`refresh.ts:1` 写明：
+  // > 在凭据过期前**提前 1 小时**触发刷新（对齐真实插件的 `36e5`）。
+  //
+  // 本服务 cron 恰好**每小时一条**，天然是「提前量」的载体。
+  const src = readFileSync('src/index.ts', 'utf8')
+
+  // ① 必须有提前量与续期函数
+  assert.ok(/const REFRESH_LEAD_MS = 3_600_000/.test(src),
+    '提前量必须是 1 小时（对齐参考实现 REFRESH_LEAD_MS）')
+  assert.ok(/async function refreshExpiringCredentials/.test(src), '必须有主动续期函数')
+
+  // ② ⚠️ **必须在 cron 的「非任务时点 return」之前调用** ——
+  // 否则非任务时点就不会续期，而那正是「保持登录态」的关键。
+  const sched = src.slice(src.indexOf('async function scheduled('))
+  const callAt = sched.indexOf('await refreshExpiringCredentials(')
+  const returnAt = sched.indexOf('if (plan === undefined)')
+  assert.ok(callAt > 0, 'cron 里必须调用主动续期')
+  assert.ok(returnAt > 0, 'cron 里应有「非任务时点直接返回」的分支')
+  assert.ok(callAt < returnAt,
+    '⚠️ 主动续期必须在「非任务时点 return」**之前** —— 否则非任务时点永远不续期')
+
+  // ③ ⚠️ 只对**有 refresh 能力**的家动手（否则是「不实承诺」+ 白打上游）
+  const fn = src.slice(src.indexOf('async function refreshExpiringCredentials'))
+  assert.ok(/provider\?\.refresh === undefined\) continue/.test(fn),
+    '⚠️ 没有 refresh 的家必须跳过（zcode/opencode/loomy 无可续期之物）')
+  // ④ ⚠️ `expiresAt === 0` 表示**未知**而非「已过期」，不能拿它去续期
+  assert.ok(/Number\.isFinite\(expiresAt\) \|\| expiresAt <= 0\) continue/.test(fn),
+    '⚠️ expiresAt 为 0/NaN（未知）时必须跳过，不能当成已过期')
+  // ⑤ ⚠️ 逐账号 try（一个坏凭据不该让全场不续期）
+  assert.ok(/catch \(error\)[\s\S]{0,300}主动续期失败/.test(fn),
+    '⚠️ 必须逐账号兜错，否则一个失败会让后面全部不续期')
+  // ⑥ ⚠️ 整体也不能让 cron 抛（否则任务分发一起停）
+  assert.ok(/catch \(error\)[\s\S]{0,200}主动续期整体失败/.test(sched),
+    '⚠️ 续期整体失败不能让 cron 抛出（否则任务分发一起停）')
+  // ⑦ 停用的账号不续期（用户明确不用了）
+  assert.ok(/if \(account\.disabled\) continue/.test(fn), '停用账号应跳过')
+})

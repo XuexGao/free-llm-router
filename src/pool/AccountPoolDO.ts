@@ -746,6 +746,53 @@ export class AccountPoolDO extends DurableObject<Env> {
     return await decryptCredential(key, ciphertext)
   }
 
+  /**
+   * 批量取「各账号凭据的过期时刻」（一次 RPC，不是 N 次）。
+   *
+   * ## 为什么需要它
+   *
+   * 用户报「动不动就掉登录」时，面板要能回答「是凭据过期了，还是账号被限流」——
+   * 这两者的处置**完全不同**（前者等自动续期，后者要重新登录）。
+   * 而 `expiresAt` 是加密存在凭据里的，逐账号 `getCredential` 会产生 N 次
+   * DO RPC（账号多时开销明显）。
+   *
+   * ⚠️ **解密失败/DTO 异常一律记 `null`**，绝不让一个坏凭据把整个列表打成 500
+   *（与 `listAccounts` 里「解析失败就跳过该条」同一取舍）。
+   *
+   * @returns `uid → 过期时刻(ms)`；未知/读不到为 `null`。
+   */
+  async listCredentialExpiry(now: number): Promise<Record<string, number | null>> {
+    void now
+    const out: Record<string, number | null> = {}
+    // ⚠️ `requireCredentialKey` 返回的是**字符串密钥**（内部再派生），
+    // 而 `decryptCredential(secret: string, stored: string)` 收的也是字符串 ——
+    // 我第一版误标成 `CryptoKey` 并传给 `decryptCredential`，两处类型都不对。
+    let key: string
+    try {
+      key = requireCredentialKey(this.env.CREDENTIAL_KEY)
+    } catch {
+      // 未配密钥 ⇒ 全部无从判断（不是错误，是「读不到」）。
+      return out
+    }
+    // ⚠️ `listCredentialUids()` 是 **async**（DO 方法），必须 await。
+    for (const uid of await this.listCredentialUids()) {
+      const ciphertext = readCredential(this.ctx.storage.sql, uid)
+      if (ciphertext === undefined) {
+        out[uid] = null
+        continue
+      }
+      try {
+        const credential = (await decryptCredential(key, ciphertext)) as { expiresAt?: unknown }
+        const e = credential?.expiresAt
+        out[uid] = typeof e === 'number' && Number.isFinite(e) && e > 0 ? e : null
+      } catch {
+        // 解密失败（密钥换了 / 数据损坏）⇒ 如实记 null，不让整表失败。
+        out[uid] = null
+      }
+    }
+    return out
+  }
+
   /** 删除凭据。 */
   async removeCredential(uid: string): Promise<void> {
     deleteCredential(this.ctx.storage.sql, uid)

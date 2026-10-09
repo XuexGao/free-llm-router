@@ -1533,13 +1533,26 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         const msgid = await sendLoomySmsCode(phone, AbortSignal.timeout(30_000))
         const state = crypto.randomUUID()
         const now = Date.now()
-        // 验证码 5 分钟有效（`LOOMY_SMS_CODE_TTL_SECONDS`）。
+        // ⚠️ 验证码 5 分钟有效（上游 `LOOMY_SMS_CODE_TTL_SECONDS = 300`）。
+        //
+        // ## 🔴 `expiresAt` 是**绝对时刻**，不是「有效期时长」
+        //
+        // `saveLoginSession(state, payload, expiresAt)` 的第三个参数
+        // **必须是 `Date.now() + TTL` 形态的绝对毫秒时间戳**
+        //（见 `AccountPoolDO.ts:767-769` → `writeLoginSession` 直接拿它比 `now`）。
+        //
+        // ⚠️ 我原先写的是裸的 `5 * 60 * 1000`（= 300000）—— 那是一个
+        // **1970-01-01T00:05:00Z** 的时刻 ⇒ 会话**存进去就已经过期** ⇒
+        // 第二步必然报「登录会话不存在或已过期，请重新发起登录」，
+        // 而第一步明明刚返回成功、验证码也真的发出去了。
+        // **教训**：这个参数名是 `expiresAt`（时刻）而非 `ttl`（时长），
+        // 凡是「传时长还是时刻」的接口都极易写错，且症状是**静默失效**。
+        // 其他调用点全部是 `Date.now() + …`，可对照。
+        const expiresAt = now + 5 * 60 * 1000
         await pool.saveLoginSession(
           state,
-          { provider: 'loomy', kind: 'loomy-sms', realm: loginRealm, phone, msgid, createdAt: now },
-          // ⚠️ TTL 用**上游的验证码有效期**，不留宽限：码过期后再提交
-          // 必然是「验证码错误」，多留时间只会让用户白等。
-          5 * 60 * 1000,
+          { provider: 'loomy', kind: 'loomy-sms', realm: loginRealm, phone, msgid, createdAt: now, expiresAt },
+          expiresAt,
         )
         return json({ ok: true, provider: 'loomy', state, phone, needsCode: true })
       } catch (error) {
@@ -1618,17 +1631,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
     const realm = body.realm === 'global' ? 'global' : 'cn'
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const saved = await (async () => {
-      // 逐个分片找（与 `/login/poll` 同法：会话所在分片由发起时决定）
-      for (const r of [realm, realm === 'cn' ? 'global' : 'cn']) {
-        const p = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
-        const hit = (await p.getLoginSession(state, Date.now())) as
-          | { payload: Record<string, unknown>; pool: typeof p }
-          | undefined
-        if (hit !== undefined) return { payload: hit.payload, pool: p }
-      }
-      return undefined
-    })()
+    // ⚠️ **复用既有的 `findLoginSession`，不要自己再写一遍查找循环。**
+    //
+    // ## 🔴 实测缺陷（用户报「讯飞登录显示登录会话不存在或已过期」）
+    //
+    // 我原先自己写了个循环，并把 `getLoginSession()` 的返回值当成
+    // 「带 `payload` 包装」的对象去取 `hit.payload` —— **那一层不存在**：
+    // `getLoginSession()` 返回的就是**会话载荷本身**（`AccountPoolDO.ts:776-779`）。
+    // ⇒ `hit.payload` 恒为 `undefined` ⇒ 第二步**必然**报
+    // 「登录会话不存在或已过期」，而第一步明明刚发过验证码。
+    //
+    // ⚠️ 而 `findLoginSession`（`index.ts:376-392`）**已经**把
+    // `{realm, payload: session, pool}` 包好了 —— 它才是那个包装层。
+    // **教训：同一个查找逻辑已有共享实现时，不要自己再写一遍** ——
+    // 我写的那版把「包装层的形状」搞错了，而这类错误只表现为「查不到」。
+    const saved = await findLoginSession(env, state)
     if (saved === undefined) {
       return jsonError(404, '登录会话不存在或已过期，请重新发起登录', 'session_not_found')
     }
@@ -2458,6 +2475,17 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const realm = url.searchParams.get('realm') ?? 'cn'
     const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const accounts = await stub.listAccounts(realm, Date.now())
+    // ⚠️ **凭据过期时刻**（epoch ms）—— 用户报「动不动就掉登录」时，
+    // 这是**唯一**能回答「是凭据过期了还是账号被限流了」的观测口。
+    // 不暴露它就只能靠猜，而这两者的处置完全不同：
+    // 前者等自动续期（cron 每小时扫一次），后者要重新登录。
+    //
+    // ⚠️ 走**一次**批量 RPC（不是逐账号 `getCredential`）—— 后者是 N 次
+    // DO 往返 + N 次 AES 解密，账号一多就很贵。
+    // ⚠️ 取不到不该让整个列表 500（凭据读不到只是少一列信息）。
+    const expiry = await stub.listCredentialExpiry(Date.now()).catch(
+      () => ({}) as Record<string, number | null>,
+    )
     // ⚠️ 只回可展示字段，**绝不回凭据**
     return json({
       realm,
@@ -2479,6 +2507,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         // 而记账失效是静默的（冷却/熔断形同虚设，但表面一切正常）。
         successCount: a.successCount,
         errTotal: a.errTotal,
+        // ⚠️ 凭据过期时刻（null = 未知/读不到，**不是**「已过期」）。
+        expiresAt: expiry[a.uid] ?? null,
         lastSuccess: a.lastSuccess,
         lastErr: a.lastErr,
         fails: a.fails,
@@ -2798,14 +2828,112 @@ function hourUtc8(now: number): number {
  * 判断时点 → 列账号 → 对每个账号调一次 `start()`（入队 + 排 alarm）→ 立即返回。
  * **任何实际的上游请求都发生在 DO 的 alarm 里。**
  */
+/**
+ * 提前量：凭据距过期**不足**这个时长就主动续期（1 小时）。
+ *
+ * ⚠️ 取值对齐参考实现（`src/refresh.ts:1-2` 的 `REFRESH_LEAD_MS = 3_600_000`，
+ * 注释写明「对齐真实插件的 `36e5`」）。
+ *
+ * 为什么是 1 小时而不是更短：本服务的续期载体是**每小时一条 cron**。
+ * 若提前量 < 1 小时，就可能出现「这次 cron 看过还没到期、下次 cron 时已过期」
+ * 的空档 —— 那正是「动不动就掉登录」。取 1 小时可保证**至少被扫到一次**。
+ */
+const REFRESH_LEAD_MS = 3_600_000
+
+/**
+ * 扫一遍所有账号，把**快过期**的凭据提前续掉。
+ *
+ * 这是「动不动就掉登录」的根治手段：把「撞到 401 才续期」变成
+ * 「过期前就换好」。
+ *
+ * ⚠️ **只对有 `refresh` 能力的家动手**（`provider.refresh !== undefined`）——
+ * 其余家（zcode 静态凭据、opencode 匿名通道、loomy 无端点）**没有可续期的
+ * 东西**，硬试只会是「不实承诺」并白打上游。
+ *
+ * ⚠️ 逐账号 try：单条失败不影响其他账号（一个坏凭据不该让全场不续期）。
+ *
+ * ⚠️ `expiresAt` 为 0 表示**未知**（不是「已过期」）—— 那是导入凭据时
+ * 上游没给过期时间的情形。**不拿它去续期**（无从判断该不该续），
+ * 留待请求路径的 401 兜底。
+ */
+async function refreshExpiringCredentials(env: Env, now: number): Promise<void> {
+  for (const realm of ['cn', 'global']) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, now)
+    for (const account of accounts) {
+      // ⚠️ 停用的账号不动它 —— 用户明确说不用了，续期是多余的上游请求。
+      if (account.disabled) continue
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      const provider = findProvider(providerId)
+      // ⚠️ 没有 `refresh` 的家直接跳过（见函数注释的说明）。
+      if (provider?.refresh === undefined) continue
+
+      let credential: ProviderCredential | undefined
+      try {
+        credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      } catch {
+        continue
+      }
+      if (credential === undefined) continue
+
+      const expiresAt = credential.expiresAt
+      // ⚠️ `0` = **未知**，不是「已过期」（见函数注释）。
+      if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
+      // 还没到「提前量」窗口 ⇒ 不动它（避免每个整点都白打一次上游）。
+      if (expiresAt - now > REFRESH_LEAD_MS) continue
+
+      try {
+        const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+        await pool.putCredential(account.uid, fresh, now)
+        console.log(
+          `[cron] ${providerId} ${account.uid} 主动续期成功`
+            + `（原过期于 ${new Date(expiresAt).toISOString()}）`,
+        )
+      } catch (error) {
+        // ⚠️ 如实记原因。**不惩罚账号** —— 续期失败可能是网络抖动，
+        // 而请求路径的 401 兜底仍会兜住真正失效的凭据。
+        console.error(
+          `[cron] ${providerId} ${account.uid} 主动续期失败：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
+  }
+}
+
 async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const now = Date.now()
+
+  // ⚠️ **主动续期扫一遍（每个整点都做，与是否有任务时点无关）。**
+  //
+  // ## 🔴 为什么必须主动续期（用户报「其它账号的稳定性能不能提升一下，
+  //    动不动就掉登录」）
+  //
+  // 在此之前，本项目的续期**只有一条路径**：网关收到 401/403 时**才**续期。
+  // 那意味着**每一次凭据过期，都必然先失败一批请求** —— 用户看到的就是
+  // 「动不动就掉登录」，而且掉的时候是**硬失败**（要等客户端重试才恢复）。
+  //
+  // ⚠️ 参考实现为此专门有 `refresh-scheduler.ts`，并在 `refresh.ts:1` 写明：
+  // > 在凭据过期前**提前 1 小时**触发刷新（对齐真实插件的 `36e5`）。
+  //
+  // 本服务的 cron 恰好是**每小时一条**，天然就是这个「提前量」的载体 ——
+  // 故在这里扫一遍：**快过期的就提前换掉**，让 401 不再发生。
+  //
+  // ⚠️ 扫到失败**不抛**：一条 cron 不能因为某个账号续期失败就整体不跑
+  //（那会让任务分发也一起停掉）。逐账号 try，如实记日志。
+  try {
+    await refreshExpiringCredentials(env, now)
+  } catch (error) {
+    console.error('[cron] 主动续期整体失败：', error instanceof Error ? error.message : String(error))
+  }
+
   const hour = hourUtc8(now)
   const plan = SCHEDULE_UTC8[hour]
 
-  // 非任务时点：直接返回，不产生任何 DO 调用（省配额，也避免无谓的 DO Duration）。
+  // 非任务时点：**续期已经做过了**，这里再返回。
+  // ⚠️ 注意：续期在 return **之前** —— 这正是「非任务时点也保持登录态」的关键。
   if (plan === undefined) {
-    console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，跳过`)
+    console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，已做完续期扫描`)
     return
   }
 
