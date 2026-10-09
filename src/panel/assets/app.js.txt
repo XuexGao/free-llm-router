@@ -1082,6 +1082,28 @@ function switchModalTab(name) {
 async function loadModalAccounts() {
   const box = $('modal-accounts')
   clear(box)
+  // ⚠️ **必须先取实时积分**（按 uid）。
+  //
+  // ## 🔴 我第一版读的是 `/admin/accounts` 的 `a.credits` —— 那**永远是 0**
+  //
+  // 实测：13 个账号的 `credits` 全是 0。追查发现它**只在 `AccountPoolDO.revive()`
+  // 里被写**，而 `revive` 是「清冷却」用的，平时没有任何地方写它
+  // ⇒ 那个字段事实上是个**废弃字段**，读它只能拿到 0。
+  //
+  // 真实的账号级积分在 `/admin/packages`（逐账号实时查上游），字段是
+  // `total`，按 `uid` 对应。故这里复用它 —— 与「总积分」徽标**同一个数据源**，
+  // 不会出现「卡片有数、账号无数字」的不一致。
+  // 逐账号再单独打一次上游既慢又费额度，没必要。
+  const creditByUid = new Map()
+  try {
+    for (const p of await fetchPackages()) {
+      if (p && typeof p.uid === 'string' && typeof p.total === 'number') {
+        creditByUid.set(p.uid, { total: p.total, error: p.error })
+      }
+    }
+  } catch {
+    // 取不到积分不该让整个账号列表打不开 —— 下面会显示 `—`。
+  }
   // ⚠️ 合并两个 realm —— 否则国际版（global）的账号弹窗永远显示「还没有账号」。
   const res = { ok: true, body: { accounts: await fetchAccounts() } }
   if (!res.ok) { box.textContent = '加载失败'; return }
@@ -1110,15 +1132,22 @@ async function loadModalAccounts() {
     card.appendChild(m)
 
     // ⚠️ **每个账号单独显示积分**（用户要求）。
-    // 数据已由 `/admin/accounts` 回传（`a.credits`），故不需要额外请求 ——
-    // 逐账号再打一次上游既慢又会消耗额度。
+    // 数据来自 `/admin/packages`（逐账号实时查上游），**不是** `a.credits`
+    //（那个字段永远是 0，见本函数开头的说明）。
     const cr = document.createElement('span'); cr.className = 'acct-credits'
-    if (typeof a.credits === 'number' && a.credits > 0) {
-      cr.textContent = a.credits.toLocaleString('zh-CN') + ' 积分'
-      cr.title = '该账号剩余积分（来自上次查询缓存）'
+    const cred = creditByUid.get(a.uid)
+    if (cred !== undefined && typeof cred.total === 'number' && cred.total > 0) {
+      cr.textContent = cred.total.toLocaleString('zh-CN') + ' 积分'
+      cr.title = '该账号剩余积分（实时查上游）'
+    } else if (cred !== undefined && typeof cred.error === 'string' && cred.error !== '') {
+      // ⚠️ 查失败要说**原因**，不能只显示 `—` —— 否则用户以为「这家没额度」，
+      // 而真实原因可能是「登录态过期」（该重新登录）或「上游不支持查余额」。
+      cr.textContent = '查询失败'
+      cr.title = cred.error
+      cr.style.color = 'var(--err)'
     } else {
       cr.textContent = '—'
-      cr.title = '未查到积分（在「积分包」页点「实时查询」可刷新）'
+      cr.title = '未查到积分（该账号可能在冷却，或上游未返回额度）'
     }
     card.appendChild(cr)
 

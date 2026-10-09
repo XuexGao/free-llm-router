@@ -1186,7 +1186,9 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 其余家即便声明了 `login: true` 也无法从本服务发起 —— 见各 provider 的
   // `capabilities.loginBlockedReason`（这是刻意如实声明的，不是遗漏）。
   if (path === '/admin/providers/login/start' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { provider?: string; realm?: string }
+    const body = (await request.json().catch(() => ({}))) as {
+      provider?: string; realm?: string; phone?: string
+    }
     const providerId = body.provider ?? ''
     // ⚠️ 会话分片必须与**账号将要落入的分片**一致，否则轮询时找不到会话
     //（轮询按 realm 逐个分片查，见 `/admin/providers/login/poll`）。
@@ -1507,8 +1509,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
     if (providerId === 'loomy') {
       const { sendLoomySmsCode } = await import('./providers/loomy.js')
-      const reqBody = await request.json().catch(() => ({})) as { phone?: string }
-      const phone = typeof reqBody.phone === 'string' ? reqBody.phone.trim() : ''
+      // 🔴 **必须复用上面已经解析过的 `body`，不能再次 `request.json()`**。
+      //
+      // ## 实测缺陷（用户报「明明是 11 位号码却发不了验证码」）
+      //
+      // 原先这里写了 `await request.json()` **第二次**。而 HTTP 请求体是
+      // **一次性流** —— 第二次读会抛 `TypeError: body used already`
+      //（或 `Unexpected end of JSON input`），被 `.catch(() => ({}))` 吞掉后
+      // `phone` 恒为 `''` ⇒ **任何号码都被判「请填写 11 位手机号」**。
+      //
+      // ⚠️ 症状极具误导性：错误文案说的是「号码格式不对」，而真实原因是
+      // **我们没读到号码**。用户会反复检查自己输入的号码。
+      // ⚠️ 这类「静默吞掉解析异常」的写法正是本项目明令禁止的
+      //（AGENTS.md §7.2「失败必须显式」）—— `.catch(() => ({}))` 让一个
+      // 必然失败的操作看起来像「用户传了空值」。
+      const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
       // ⚠️ 只做**最基本的**格式检查（11 位数字，1 开头）—— 详细的号码规则
       // 交给上游判（它才知道哪些号段可用）。这里拦的是明显的空值/乱填。
       if (!/^1\d{10}$/.test(phone)) {

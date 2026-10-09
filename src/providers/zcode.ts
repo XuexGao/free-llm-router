@@ -332,7 +332,13 @@ export function buildZcodeSystemBlocks(
     ' - Is a git repository: no',
     ` - Platform: ${platform}`,
     ` - Shell: ${platform === 'win32' ? 'powershell' : 'bash'}`,
-    ` - OS Version: ${platform}`,
+    // ⚠️ 官方形态是 `<platform> <arch>`（参考实现 `zcode-identity.ts:183`：
+    // `${platform} ${process.arch}`）。我们此前只发 `linux`。
+    // ⚠️ **这本身不是 3012 的判据**（参考实现明说判据只有「身份块是否存在」），
+    // 但既然要贴近官方指纹，就逐字对齐 —— 少一个词就少一分「像官方客户端」。
+    // Workers 里没有 `process.arch`，官方客户端在 Windows 上是 win32 x64，
+    // 故这里显式写死 `win32 x64`（与请求头里硬编码的 `win32` 一致）。
+    ` - OS Version: ${options.platform ?? 'win32'} x64`,
     ` - You are powered by the model named ${provider}/${model}.`,
   ].join('\n')
 
@@ -1111,12 +1117,35 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
       message: `ZCode 余额查询失败：http=${res.status} ${text.slice(0, 200)}`,
     })
   }
+  // ⚠️ **响应可能没有 `data` 包裹**（实测）。
+  //
+  // 线上实测原文是：
+  // ```json
+  // {"server_time":1791524120,"plans":[],"balances":[]}
+  // ```
+  // 而参考实现的类型标注写的是 `data.balances`（`zcode-upstream.ts:271-277`）。
+  // ⇒ 两种形态都要认：**先看 `data`，没有就回落顶层**。
+  //
+  // ⚠️ 我第一版只读 `parsed.data` ⇒ 对上面这个真实响应恒判「缺少 data 字段」，
+  // 于是 zcode 的余额**永远查不出来**（面板显示错误、账号卡片无积分）。
+  // 这类「层级猜错」的缺陷不会报错得很难看，只会让功能静默失效。
   const parsed = (await res.json()) as {
-    data?: { displayMode?: unknown; balances?: unknown }
+    data?: { displayMode?: unknown; balances?: unknown; plans?: unknown }
+    displayMode?: unknown
+    balances?: unknown
+    plans?: unknown
   }
-  const data = parsed.data
-  if (data === undefined) {
-    throw new ProviderError({ provider: 'zcode', message: 'ZCode 余额响应缺少 data 字段' })
+  // 顶层与 `data` 里各字段取并集（顶层优先，因为实测顶层才是真实形态）
+  const data = {
+    displayMode: parsed.displayMode ?? parsed.data?.displayMode,
+    balances: parsed.balances ?? parsed.data?.balances,
+    plans: parsed.plans ?? parsed.data?.plans,
+  }
+  if (data.balances === undefined && data.plans === undefined) {
+    throw new ProviderError({
+      provider: 'zcode',
+      message: `ZCode 余额响应缺少 balances/plans 字段（原文：${JSON.stringify(parsed).slice(0, 200)}）`,
+    })
   }
   // ⚠️ 企业版不下发额度数字、只给外部链接 ⇒ **抛错说明**，不要显示成 0
   //（0 是「已用光」的语义，会误导用户）。
@@ -1155,14 +1184,47 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
     total += bucketTotal
     if (expiryMs > 0 && (earliestExpiry === 0 || expiryMs < earliestExpiry)) earliestExpiry = expiryMs
   }
-  // ⚠️ 一个桶都没解析出来 → **抛错**（响应形状与预期不符），而不是返回 0。
+  // ## 🔴 `balances: []` **是正常的** —— 不能当异常抛
+  //
+  // 参考实现实测记录（`zcode-upstream.ts:338-348`）：
+  // ```
+  // GET /billing/balance → data.balances = []                       ← 0 个桶
+  // GET /billing/preview → data.plans[0].plan_id = …trust-1003
+  // ```
+  // > **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+  // > 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+  //
+  // ⚠️ 我第一版把「0 个桶」判成「形状无法识别」并抛错 ⇒
+  // zcode 余额**永远查不出**（账号卡片无积分、实时查询报错）。
+  // 正确做法：桶与 plans 都是空时，**如实返回 0**（真的没有额度），
+  // 只有「连字段都没有」才算形状异常（那已在上面判过）。
   if (packages.length === 0) {
-    throw new ProviderError({
-      provider: 'zcode',
-      message: `ZCode 余额响应形状无法识别（原文：${JSON.stringify(data).slice(0, 200)}）`,
-    })
+    // ⚠️ 顺带把 `plans` 里的可领额度也算进去 —— 那才是每日赠送额度的真实位置。
+    // （此处**只读展示**，不触发领取；`preview` 已在 checkin 路径里补过活跃上报。）
+    const rawPlans = Array.isArray(data.plans) ? data.plans : []
+    const planNames: string[] = []
+    for (const item of rawPlans) {
+      if (typeof item !== 'object' || item === null) continue
+      const rec = item as Record<string, unknown>
+      const planId = rec['plan_id']
+      if (typeof planId !== 'string' || planId === '') continue
+      const name = typeof rec['name'] === 'string' && rec['name'] !== '' ? rec['name'] : 'ZCode 每日额度'
+      const amount = num(rec['amount'])
+      planNames.push(amount !== undefined ? `${name}（${amount}）` : name)
+    }
+    // ⚠️ 用 `packages[].name` 承载说明 —— `ProviderBalance` 只有
+    // `total` / `expiring` / `earliestExpiry` / `packages` 四个字段，
+    // **没有自由文本字段**（参考实现里的 `detail` 不是本项目的契约）。
+    return {
+      total: 0,
+      expiring: 0,
+      earliestExpiry: 0,
+      packages: (planNames.length > 0
+        ? planNames.map((name) => ({ name: `可领：${name}`, amount: 0, expiry: 0 }))
+        : [{ name: '额度桶为空（当前没有可用额度，也没有可领活动）', amount: 0, expiry: 0 }]),
+    }
   }
-  return { total, expiring: 0, earliestExpiry, packages: packages.map((p) => ({ ...p, amount: p.amount })) }
+  return { total, expiring: 0, earliestExpiry, packages }
 }
 
 

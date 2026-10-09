@@ -752,3 +752,108 @@ test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = �
   assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
     '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
 })
+
+test('🔴 zcode 余额：`balances: []` **不是**异常，且要认顶层无 `data` 的形态', () => {
+  // ## 实测缺陷（用户报「商汤和 zcode 的账号怎么了，为什么不显示积分」）
+  //
+  // 线上实测上游原文是：
+  // ```json
+  // {"server_time":1791524120,"plans":[],"balances":[]}
+  // ```
+  // 两个问题叠在一起：
+  //
+  // ① **我们没有 `data` 包裹时也能解析** —— 参考实现的类型标注写的是
+  //    `data.balances`，但**实测响应根本没有 `data`**。我第一版只读
+  //    `parsed.data` ⇒ 恒判「缺少 data 字段」⇒ zcode 余额**永远查不出来**。
+  // ② **`balances: []` 是正常的** —— 参考实现实测记录
+  //    （`zcode-upstream.ts:338-348`）：
+  //    > **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+  //    > 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+  //    我第一版把「0 个桶」判成「形状无法识别」并**抛错** ⇒ 同样查不出。
+  const src = readFileSync('src/providers/zcode.ts', 'utf8')
+  const i = src.indexOf('async function balance(')
+  const block = src.slice(i, i + 5000)
+
+  // ① 必须兼容「顶层无 data」
+  assert.ok(/parsed\.balances \?\? parsed\.data\?\.balances/.test(block),
+    '⚠️ 必须同时认顶层与 data 两种层级（实测响应无 data 包裹）')
+  // ② 空桶**不能**抛错
+  assert.ok(!/packages\.length === 0[\s\S]{0,200}throw/.test(block),
+    '⚠️ 空桶不能抛错（那是正常形态，额度在 plans 里）')
+  // ③ 空桶时要去看 plans
+  assert.ok(/data\.plans/.test(block), '空桶时应回落到 plans（每日额度在那里）')
+  // ④ 必须符合 ProviderBalance 契约（没有 remaining/detail 这类自由字段）
+  assert.ok(!/remaining:\s*0/.test(block), '⚠️ 不得用 ProviderBalance 契约外的字段')
+})
+
+test('🔴 loomy 发验证码不能二次读 request body（否则号码永远被判非法）', () => {
+  // ## 实测缺陷（用户报「明明是 11 位电话号码但还是发不了验证码」）
+  //
+  // `/admin/providers/login/start` 在**开头**已经 `await request.json()`
+  // 解析过一次 body（拿 `provider` / `realm`）。而 loomy 分支里**又读了一次**
+  // `request.json()` —— HTTP 请求体是**一次性流**，第二次读会抛
+  // `TypeError: body used already`，被 `.catch(() => ({}))` 吞掉后
+  // `phone` 恒为 `''` ⇒ **任何号码都回「请填写 11 位手机号」**。
+  //
+  // ⚠️ 症状极具误导性：错误文案说的是「号码格式不对」，而真实原因是
+  // **我们没读到号码** —— 用户会反复检查自己输入的东西。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const start = src.indexOf("path === '/admin/providers/login/start'")
+  // ⚠️ 范围要**只到下一个 `path ===`** —— `/login/loomy/sms` 是**另一个端点**，
+  // 它有权利读自己的 body。我第一版把范围切到文件末尾，把它也算进来了。
+  const after = src.slice(start + 10)
+  const nextPath = after.search(/path === '/)
+  const block = src.slice(start, start + 10 + (nextPath > 0 ? nextPath : 30000))
+  // ⚠️ 只数**代码**里的调用（注释里会引用这个缺陷，要排除）
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  const reads = (code.match(/request\.json\(\)/g) ?? []).length
+  assert.equal(reads, 1, `⚠️ login/start 只能读一次 request body（实际 ${reads} 次）—— 第二次会抛异常且被吞掉`)
+  // loomy 分支必须用已解析的 body
+  const li = code.indexOf("providerId === 'loomy'")
+  assert.ok(/body\.phone/.test(code.slice(li, li + 1500)), '⚠️ loomy 必须复用已解析的 body.phone')
+})
+
+test('⚠️ 续期失败的原因必须出现在用户可见错误里（不能只进日志）', () => {
+  // 用户报「商汤和 zcode 的账号怎么了，为什么调用不了」。
+  // 实测 codearts 返回的原始错误是 `APIG.0301 Incorrect IAM authentication
+  // Unauthorized` —— ⚠️ **极具误导性**：它说的是「IAM 鉴权不对」，
+  // 让人以为账号被封；而真实原因是**凭据缺自动续期材料/refresh token 已消耗**。
+  //
+  // 两者该采取的行动完全不同：前者等，后者去重新登录。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/let refreshFailure = ''/.test(src), '要记录续期失败原因')
+  assert.ok(/refreshFailure = error instanceof Error/.test(src), '要在 catch 里记下来')
+  assert.ok(/自动续期也失败了：\$\{refreshFailure/.test(src),
+    '⚠️ 必须把原因附到用户可见的错误文案里')
+})
+
+test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透成 500 internal_error）', () => {
+  // ## 实测缺陷（用户报「qoder 调用不了」，返回「服务内部错误」）
+  //
+  // provider 的**推理超时**（qoder `INFER_TIMEOUT_MS`）触发点**不在**
+  // `provider.chat()` 里 —— `chat()` 返回 `Response` 时**流还没读完**，
+  // 超时是在 `nonStreamingResponse` **读体时**炸的。
+  //
+  // 而那里原先只有 `try/finally`、**没有 `catch`** ⇒ 那个 `TimeoutError`
+  // 穿透整个 `handleProviderChat`（它的 try 只包了 `provider.chat` 调用）
+  // ⇒ 落到 Worker 异常边界 ⇒ 客户端看到 **`服务内部错误`**。
+  //
+  // ⚠️ 这是**错误分类**错误：上游慢/超时是**可重试的上游问题**，
+  // 不是我们的内部故障。报成 500 会让用户以为服务坏了。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf('async function nonStreamingResponse')
+  const block = src.slice(i, i + 4000)
+  // 读体必须有 catch
+  assert.ok(/catch \(error\) \{[\s\S]{0,400}读取上游响应/.test(block),
+    '⚠️ 读体必须有 catch 并翻译成可读错误')
+  // ⚠️ 必须回 502 `upstream_error`，不是 500 `internal_error`
+  assert.ok(/'upstream_error'/.test(block), '⚠️ 应回 upstream_error 类型')
+  assert.ok(/status: 502/.test(block), '⚠️ 应是 502（上游问题），不是 500')
+  // ⚠️ 判据要**排除注释**（我的说明里正引用 `internal_error` 这个词）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/internal_error/.test(code), '⚠️ 不得报成 internal_error')
+  // ⚠️ 要参与记账（否则失败不入池状态：不换号、不冷却）
+  assert.ok(/hooks\.onError\(message\)/.test(block), '⚠️ 必须调 hooks.onError 参与记账')
+})

@@ -917,6 +917,14 @@ async function handleProviderChat(input: {
     const startedAt = Date.now()
     // ⚠️ 续期只试一次（见下方 401 分支的说明）。
     let refreshed = false
+    /**
+     * 续期失败的原因（若有）。
+     *
+     * ⚠️ 必须**回给用户**，不能只进日志 —— 否则用户看到的是上游那句
+     * 误导性的 `IAM authentication Unauthorized`，而真实原因可能是
+     * 「凭据缺少续期材料，请重新登录」（见下方 catch 的说明）。
+     */
+    let refreshFailure = ''
     let upstream: Response
     try {
       upstream = await provider.chat(credential, { model, body, signal: request.signal })
@@ -1047,12 +1055,20 @@ async function handleProviderChat(input: {
             }
           }
         } catch (error) {
-          // 续期失败（refresh token 也废了）→ 落回正常失败路径，
-          // 并把这个号标成需要重新登录（软冷却，避免每请求都试一次续期）。
-          console.error(
-            `[refresh] ${providerId} 续期失败：`,
-            error instanceof Error ? error.message : String(error),
-          )
+          // ## 🔴 续期失败的原因**必须带到用户可见的错误里**
+          //
+          // 实测缺陷（用户报「商汤和 zcode 的账号怎么了，为什么调用不了」）：
+          // 续期失败的原因此前只 `console.error` 到日志，用户看到的仍是
+          // **上游的原始错误** —— 例如 codearts 那条：
+          // ```
+          // APIG.0301 Incorrect IAM authentication information: Unauthorized
+          // ```
+          // ⚠️ 那句极具误导性：它说的是「IAM 鉴权不对」，让人以为**账号被封**，
+          // 而真实原因是**这个凭据缺自动续期所需的材料**（见下）。
+          //
+          // ⇒ 把续期失败的原因**记下来**，附在最终错误里。
+          refreshFailure = error instanceof Error ? error.message : String(error)
+          console.error(`[refresh] ${providerId} 续期失败：`, refreshFailure)
         }
       }
 
@@ -1089,7 +1105,14 @@ async function handleProviderChat(input: {
       // ⚠️ 同上：不原样透传上游状态码（避免把网关故障伪装成客户端的 400）
       lastError = {
         status: clientStatusFor(upstream.status, 'unknown'),
-        message: text.slice(0, 300) || `http=${upstream.status}`,
+        // ⚠️ **续期失败时要把原因一并说明** —— 否则用户只看到上游那句
+        // 误导性的错误（如 codearts 的 `IAM authentication Unauthorized`），
+        // 会以为账号被封，而真实原因是「凭据缺少续期材料，该重新登录」。
+        // 两者该采取的行动完全不同：前者等，后者去重新登录。
+        message: refreshFailure !== ''
+          ? `${text.slice(0, 200) || `http=${upstream.status}`}`
+            + `（自动续期也失败了：${refreshFailure.slice(0, 200)}）`
+          : text.slice(0, 300) || `http=${upstream.status}`,
       }
       if (!rotate) break
       continue
@@ -1256,12 +1279,52 @@ async function nonStreamingResponse(
   const reader = upstreamBody.getReader()
   const decoder = new TextDecoder()
   let raw = ''
+  /**
+   * 🔴 **读体失败必须被翻译成上游错误，不能让它穿透成 500。**
+   *
+   * ## 实测缺陷（用户报「qoder 调用不了」，返回 `服务内部错误`）
+   *
+   * 原先这里只有 `try/finally`、**没有 `catch`**。而 provider 的推理超时
+   * （qoder 的 `INFER_TIMEOUT_MS`）触发点**不在** `provider.chat()` 里 ——
+   * `chat()` 返回 `Response` 时**流还没读完**，超时是在**这里读体时**炸的。
+   *
+   * ⇒ 那个 `TimeoutError` 穿透整个 `handleProviderChat`（它的 try 只包了
+   * `provider.chat` 调用）⇒ 落到 Worker 异常边界 ⇒ 客户端看到
+   * **`服务内部错误`**，而不是「上游超时，请重试」。
+   *
+   * ⚠️ 这是**错误分类**错误：上游慢/超时是**可重试的上游问题**，
+   * 不是我们的内部故障。把它报成 500 会让用户以为服务坏了。
+   *
+   * ⚠️ 修法：在这里兜住，**转成一个正常的错误响应**（与「上游返回错误帧」
+   * 同一条出口），并调用 `hooks.onError` 让它参与记账/换号。
+   */
   try {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       raw += decoder.decode(value, { stream: true })
     }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    // ⚠️ 超时/中止 ⇒ 如实说「上游超时/繁忙」，并标成**可重试**。
+    const timedOut = /timeout|timed out|abort/i.test(detail)
+    const message = timedOut
+      ? `读取上游响应超时（${model}）：上游长时间不返回数据。请稍后重试。`
+      : `读取上游响应失败（${model}）：${detail}`
+    // 让记账路径知道这次失败（换号/冷却仍按既有规则走）。
+    hooks.onError(message)
+    return new Response(
+      JSON.stringify({
+        error: {
+          message,
+          // ⚠️ 用 `upstream_error`（502 语义）而不是 `internal_error` ——
+          // 这是**上游**的问题，不是我们的内部故障。
+          type: 'upstream_error',
+          code: 'upstream_error',
+        },
+      }),
+      { status: 502, headers: { 'content-type': 'application/json; charset=utf-8' } },
+    )
   } finally {
     try {
       reader.releaseLock()
