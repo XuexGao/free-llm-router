@@ -583,6 +583,9 @@ export async function handleChatCompletions(
     const startedAt = Date.now()
     return {
       response: await streamResponse(upstream.body, {
+        // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+        //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+        clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
           const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
@@ -950,6 +953,9 @@ async function handleProviderChat(input: {
             const startedAt2 = Date.now()
             return {
               response: await streamResponse(retry.body, {
+                // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+                //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+                clientGone: () => request.signal.aborted,
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
@@ -1125,6 +1131,9 @@ async function handleProviderChat(input: {
 
     return {
       response: await streamResponse(upstream.body, {
+        // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+        //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+        clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
@@ -1274,6 +1283,14 @@ async function nonStreamingResponse(
     onFirstChunk: () => void
     onError: (message: string) => void
     onFinish?: (usage: { input: number; output: number } | undefined) => void
+    /**
+     * ⚠️ **诊断用**：客户端是否已断开（`request.signal.aborted`）。
+     *
+     * 与流式路径的 `hooks.clientGone` 同一用途 —— 这是「客户端取消」与
+     * 「上游失败」的**唯一分界**。非流式路径读体时同样需要它：
+     * 不分清就会把用户的取消动作记成账号失败，进而熔断健康账号。
+     */
+    clientGone?: () => boolean
   },
 ): Promise<Response> {
   const reader = upstreamBody.getReader()
@@ -1306,6 +1323,36 @@ async function nonStreamingResponse(
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
+    // ## 🔴 必须区分「客户端断开」与「上游失败」
+    //
+    // ⚠️ 我第一版**无条件**调 `hooks.onError(message)`，那是错的：
+    // 客户端中途取消（用户点了停止 / 关了标签页 / 客户端超时）同样会让
+    // 上游流 abort、`reader.read()` 抛 `AbortError`，于是**一个健康账号
+    // 会因用户的取消动作被记一次失败**，而 `punishmentForStreamError`
+    // 对非 11128 的错误一律返回 `'breaker'` ⇒ **3 次就把好号熔断 30 分钟**。
+    //
+    // ⇒ 症状正是本项目反复踩到的那个：「账号明明好的，却越来越用不了」。
+    //
+    // ⚠️ 本项目已有这条纪律（`qoder.ts:924`、`zcode.ts:752` 都显式把
+    // 「请求已被客户端取消」原样区分开），且流式路径**已经**用
+    // `hooks.clientGone?.()` 做这个判别（见下方 `[stream] aborted` 那段）。
+    // 非流式路径此前漏了同一条判据 —— 又是「同一个 bug 只修一半」。
+    const clientGone = hooks.clientGone?.() === true
+    if (clientGone) {
+      // ⚠️ **不记失败、不惩罚账号**：这不是账号的问题。
+      // 也不必回响应体（客户端已经走了），但返回一个明确的 499 语义响应，
+      // 便于日志/中间层观察，且**不**触发 hooks.onError。
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: '请求已被客户端取消（连接已断开）。',
+            type: 'client_closed_request',
+            code: 'client_closed_request',
+          },
+        }),
+        { status: 499, headers: { 'content-type': 'application/json; charset=utf-8' } },
+      )
+    }
     // ⚠️ 超时/中止 ⇒ 如实说「上游超时/繁忙」，并标成**可重试**。
     const timedOut = /timeout|timed out|abort/i.test(detail)
     const message = timedOut

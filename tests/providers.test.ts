@@ -55,6 +55,24 @@ function catchError(fn: () => unknown): Error | undefined {
 
 // ─────────────────── 模型名路由 ───────────────────
 
+/**
+ * 去掉 TS 源码里的 `//` 行注释与 `/* *\/` 块注释。
+ *
+ * ⚠️ **本文件的断言大量基于源码文本 grep，必须先剥注释** ——
+ * 本项目的注释习惯是逐字引用缺陷原文（含 `hooks.onError(message)`
+ * 这类**代码字面量**），不剥注释时注释会先于真正的代码命中，
+ * 产生「顺序反了 / 找不到」这类**假失败**。我已为此返工两次。
+ *
+ * ⚠️ 这是**粗略**剥离：不处理字符串里的 `//`（本文件断言的代码里没有这种写法）。
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n')
+}
+
 test('无前缀的裸模型名回落到默认供应商（保持既有用户兼容）', () => {
   // 本项目既有用户已经在用 `deepseek-v4-flash`，不能因为多供应商就要求加前缀
   const r = splitModelName('deepseek-v4-flash', ['workbuddy', 'cline'], 'workbuddy')
@@ -843,9 +861,17 @@ test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透�
   // 不是我们的内部故障。报成 500 会让用户以为服务坏了。
   const src = readFileSync('src/gateway/server.ts', 'utf8')
   const i = src.indexOf('async function nonStreamingResponse')
-  const block = src.slice(i, i + 4000)
+  assert.ok(i > 0, '必须能找到 nonStreamingResponse')
+  // ⚠️ 窗口取到**文件末尾**：`nonStreamingResponse` 是本文件最后一个函数。
+  // 用固定长度（我原先写 4000）会在注释变长后**切掉真正的代码**，
+  // 让断言变成「找不到 ⇒ 失败」这种**假失败**（加完 clientGone 说明后就踩到了）。
+  // ⚠️ **必须剥掉注释再断言。**
+  // 本项目所有解释性注释都用中文详细引用缺陷原文 —— 包括
+  // `hooks.onError(message)` 这种**代码字面量**。不剥注释时，注释会先于
+  // 真正的代码命中 grep，产生「顺序反了」这种**假失败**（我为此返工两次）。
+  const block = stripComments(src.slice(i))
   // 读体必须有 catch
-  assert.ok(/catch \(error\) \{[\s\S]{0,400}读取上游响应/.test(block),
+  assert.ok(/catch \(error\) \{[\s\S]{0,600}读取上游响应/.test(block),
     '⚠️ 读体必须有 catch 并翻译成可读错误')
   // ⚠️ 必须回 502 `upstream_error`，不是 500 `internal_error`
   assert.ok(/'upstream_error'/.test(block), '⚠️ 应回 upstream_error 类型')
@@ -1120,4 +1146,60 @@ test('⚠️ aggregateSse 确实会把 tool_calls 放进 message（上一条测�
     '⚠️ aggregateSse 必须把 tool_calls 挂在 choice.message 上')
   assert.ok(/finish_reason = toolCalls\.length > 0 \? 'tool_calls' : 'stop'/.test(src),
     "⚠️ 有工具调用时 finish_reason 应为 'tool_calls'")
+})
+
+test('🔴 客户端取消**不得**记成账号失败（否则用户的取消会熔断健康账号）', () => {
+  // ## 代码审查发现的真缺陷（我自己上一轮引入的）
+  //
+  // 我给 `nonStreamingResponse` 加的读体 catch 里**无条件**调
+  // `hooks.onError(message)`。但那 catch 也会捕获**客户端中途取消**
+  //（用户点停止 / 关标签页 / 客户端超时）：那同样会让上游流 abort、
+  // `reader.read()` 抛 `AbortError`。
+  //
+  // ⇒ 一个**健康账号**会因用户的取消动作被记一次失败，而
+  // `punishmentForStreamError` 对非 11128 的错误一律返回 `'breaker'`
+  // ⇒ **3 次就把好号熔断 30 分钟**。症状正是本项目反复踩到的
+  //「账号明明好的，却越来越用不了」。
+  //
+  // ⚠️ 本项目**已有**这条纪律（`qoder.ts:924`、`zcode.ts:752` 都显式把
+  //「请求已被客户端取消」原样区分开），且流式路径**已经**用
+  // `hooks.clientGone?.()` 做这个判别 —— 非流式路径此前漏了同一条判据。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 非流式读体 catch 里必须有 clientGone 分支，且在 onError **之前**
+  const i = src.indexOf('async function nonStreamingResponse')
+  assert.ok(i > 0, '必须能找到 nonStreamingResponse')
+  // ⚠️ 同上：取到文件末尾，不用固定长度窗口（否则注释一长就产生假失败）。
+  // ⚠️ 同上：必须剥注释（我的说明里正引用 `hooks.onError(message)` 这个字面量，
+  // 不剥就会让「注释里的 onError」排在真正的代码之前 ⇒ 假失败）。
+  const block = stripComments(src.slice(i))
+  const goneAt = block.indexOf('const clientGone = hooks.clientGone?.() === true')
+  const onErrAt = block.indexOf('hooks.onError(message)')
+  assert.ok(goneAt > 0, '⚠️ 非流式读体失败必须先用 clientGone 判别客户端取消')
+  assert.ok(onErrAt > 0, '应有 hooks.onError 调用')
+  assert.ok(goneAt < onErrAt,
+    '⚠️ clientGone 判别必须在 hooks.onError **之前**（否则取消仍会被记成失败）')
+
+  // ② 取消分支必须**不**调 onError —— 即那个 return 要出现在 onError 之前
+  const cancelReturn = block.indexOf('client_closed_request')
+  assert.ok(cancelReturn > 0 && cancelReturn < onErrAt,
+    '⚠️ 客户端取消分支必须在 onError 之前 return（不记失败）')
+
+  // ③ hooks 类型必须声明 clientGone（否则调用点传了也拿不到）
+  assert.ok(/clientGone\?: \(\) => boolean/.test(block.slice(0, 600)),
+    '⚠️ nonStreamingResponse 的 hooks 类型必须声明 clientGone')
+
+  // ④ ⚠️ **所有** streamResponse 调用点都要传 clientGone。
+  // 只传一个等于没修：其余路径 clientGone?.() 返回 undefined ⇒ 仍会记失败。
+  const sites = [...src.matchAll(/await streamResponse\(/g)].map((m) => m.index)
+  assert.ok(sites.length >= 4, `应有 4 个 streamResponse 调用点（实际 ${sites.length}）`)
+  const missing: number[] = []
+  sites.forEach((at, n) => {
+    // 该调用点往后 1200 字符内应出现 clientGone
+    const scope = src.slice(at, at + 1200)
+    if (!scope.includes('clientGone')) missing.push(n + 1)
+  })
+  assert.deepEqual(missing, [],
+    `⚠️ 第 ${missing.join('、')} 个 streamResponse 调用点没传 clientGone`
+      + '（漏传的路径仍会把客户端取消记成账号失败）')
 })
