@@ -971,6 +971,30 @@ export const raccoonProvider: Provider = {
   },
 
   matchesShape(input) {
+    // ## 🔴 必须**先排除** LobsterAI 的凭据（实测缺陷）
+    //
+    // 用户报「我在本地登录了 lobsterai，你推送上去试试」——实测导入后
+    // 它被判成了 **raccoon**（账号以 `raccoon:116092` 出现）。
+    //
+    // 根因：本函数下面的判据是「`user_id` 是**纯数字**」，而
+    // **LobsterAI 的 `user_id` 恰好也是纯数字**（`116092`）⇒ 判别式重叠。
+    // 且 `lobsteraiProvider` 当时**没有 `matchesShape`**，
+    // 在 `parseCredentialAnywhere` 的循环里会被「形状不属于该供应商」直接跳过
+    // ⇒ 凭据落到排在后面的 raccoon 手里。
+    //
+    // ⚠️ 判据用 LobsterAI 的**独有字段** `first_keyfrom` / `latest_keyfrom`
+    //（它的身份载荷必带，Raccoon 协议里没有这个概念）—— 与
+    // `lobsterai.ts:299-305` 拒绝 TRAE 凭据用的是同一思路：
+    // **靠凭据本身的判别特征分家，而不是靠注册顺序**。
+    if (typeof input['first_keyfrom'] === 'string' || typeof input['latest_keyfrom'] === 'string') {
+      return false
+    }
+    if (typeof input['first_keyfrom'] === 'number' || typeof input['latest_keyfrom'] === 'number') {
+      return false
+    }
+    if (typeof input['firstKeyfrom'] === 'string' || typeof input['latestKeyfrom'] === 'string') {
+      return false
+    }
     if (typeof input['phone'] === 'string' && input['phone'] !== '') return true
     // Raccoon 的 user_id 是**纯数字**（buddy 的 user_id 是 UUID 形态）
     const uid = input['user_id']

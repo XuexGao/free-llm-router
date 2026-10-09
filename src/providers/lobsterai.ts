@@ -1042,6 +1042,47 @@ export const lobsteraiProvider: Provider = {
     balance: true,
     checkin: true,
   },
+  /**
+   * 对象凭据的判别式（自动识别时用）。
+   *
+   * ## 🔴 为什么必须有它（实测缺陷）
+   *
+   * 用户报「我在本地登录了 lobsterai，你推送上去试试」——实测导入后
+   * 凭据被判成了 **raccoon**（账号以 `raccoon:116092` 出现）。
+   *
+   * 根因有**两层**：
+   * 1. Raccoon 的 `matchesShape` 判据是「`user_id` 是纯数字」，而
+   *    **LobsterAI 的 `user_id` 恰好也是纯数字**（`116092`）；
+   * 2. 本家**原先没有 `matchesShape`** ⇒ `parseCredentialAnywhere` 的循环里
+   *    会被「对象的字段形状不属于该供应商」直接**跳过**
+   *    ⇒ 凭据落到排在后面的 raccoon 手里（Raccoon 在注册表里更靠后，
+   *    但 LobsterAI 自己先被跳过了）。
+   *
+   * ⚠️ **教训：任何支持「凭据导入」的供应商都必须有 `matchesShape`** ——
+   * 没有它，自动识别时**永远轮不到你**，而症状是「凭据被别家认走」，
+   * 用户看到的是「导入成功但一发消息就 401」。
+   *
+   * 判据用**独有字段**：`first_keyfrom` / `latest_keyfrom`（身份载荷必带，
+   * 别家没有这个概念）；或同时具备 `uuid` + `access_token`（LobsterAI 的
+   * 最小可用凭据形态）。
+   */
+  matchesShape(input) {
+    // ⚠️ 先排除 TRAE（它有 machine_id 且没有 uuid）—— 与 `parseCredential`
+    // 里的拒绝逻辑同一判据（那边是抛错，这里是返回 false，语义一致）。
+    const hasMachine = typeof input['machine_id'] === 'string' && input['machine_id'] !== ''
+    const hasUuid = typeof input['uuid'] === 'string' && input['uuid'] !== ''
+    if (hasMachine && !hasUuid) return false
+    // 独有字段：keyfrom（camelCase 与 snake_case 都认）
+    for (const k of ['first_keyfrom', 'latest_keyfrom', 'firstKeyfrom', 'latestKeyfrom']) {
+      const v = input[k]
+      if (typeof v === 'string' || typeof v === 'number') return true
+    }
+    // 兜底形态：uuid + access_token（LobsterAI 协议的必要组合）
+    const hasToken =
+      (typeof input['access_token'] === 'string' && input['access_token'] !== '')
+      || (typeof input['accessToken'] === 'string' && input['accessToken'] !== '')
+    return hasUuid && hasToken
+  },
   parseCredential,
   listModels,
   chat,

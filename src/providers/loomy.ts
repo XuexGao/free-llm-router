@@ -484,6 +484,38 @@ const LOOMY_PHONE_HINT = /^1\d{10}$/
  * ⚠️ **绝不用手机号当唯一 uid** —— 同一手机号可以对应多个讯飞账号，
  *   那会把两个账号合并成一条记录。
  */
+/**
+ * 判定一份**原始凭据对象**是否具备 Loomy 的判别特征。
+ *
+ * ⚠️ **必须与 `parseCredential` 共用这一个函数**，不能各写一份 ——
+ * 两处判据一旦分叉，就会出现「`matchesShape` 说是我、`parseCredential` 说不是」
+ * 这种自相矛盾的组合，而症状是「自动识别选中了 Loomy，导入却报错」。
+ *
+ * 判据（见 `parseCredential` 的注释）：有 token 字段，**且**满足
+ * 「32 位 hex session / 15–20 位 userid / 11 位手机号」之一。
+ *
+ * @param input 任意原始输入（可以是整个导入对象）。
+ */
+export function looksLikeLoomyCredential(input: unknown): boolean {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return false
+  let source = input as Record<string, unknown>
+  // ⚠️ 与 `parseCredential` 同样先展开嵌套包装层（否则嵌套形永远判不出来）。
+  for (const wrapper of ['credential', 'credentials', 'auth']) {
+    const inner = source[wrapper]
+    if (inner !== null && typeof inner === 'object' && !Array.isArray(inner)) {
+      source = { ...source, ...(inner as Record<string, unknown>) }
+      break
+    }
+  }
+  const accessToken = pickString(source, 'access_token', 'accessToken', 'session', 'token')
+  if (accessToken === '') return false
+  const userid = pickString(source, 'userid', 'user_id', 'userId')
+  const phone = pickString(source, 'phone', 'mobile', 'phone_number')
+  return LOOMY_SESSION_HINT.test(accessToken)
+    || LOOMY_USERID_HINT.test(userid)
+    || LOOMY_PHONE_HINT.test(phone)
+}
+
 function parseCredential(input: unknown): ProviderCredential {
   const fail = (message: string): never => {
     throw new ProviderError({ provider: 'loomy', message })
@@ -514,11 +546,9 @@ function parseCredential(input: unknown): ProviderCredential {
 
   const userid = pickString(source, 'userid', 'user_id', 'userId')
   const phone = pickString(source, 'phone', 'mobile', 'phone_number')
-  const hasUserid = LOOMY_USERID_HINT.test(userid)
-  const looksLikeLoomy = LOOMY_SESSION_HINT.test(accessToken) || hasUserid || LOOMY_PHONE_HINT.test(phone)
-
-  // ⚠️ 判别特征必须至少命中一个，否则这份凭据更可能是别家的
-  if (!looksLikeLoomy) {
+  // ⚠️ 判据**复用** `looksLikeLoomyCredential`（与 `matchesShape` 同一份），
+  // 避免两处判据分叉 —— 那会导致「自动识别选中了 Loomy，导入却报错」。
+  if (!looksLikeLoomyCredential(source)) {
     fail(
       '这不像是 Loomy 凭据：`access_token` 不是 32 位十六进制的讯飞 session，'
       + '且没有 15–20 位 `userid` 或 11 位手机号可用于识别账号。'
@@ -530,6 +560,11 @@ function parseCredential(input: unknown): ProviderCredential {
   const expiresAt = pickTimestamp(source, 'expires_at', 'expiresAt')
 
   // ⚠️ uid 必须稳定且不泄漏凭据（见上方注释）
+  //
+  // ⚠️ `hasUserid` 原先是在上面算 `looksLikeLoomy` 时顺带得到的局部变量；
+  // 改用共享判据 `looksLikeLoomyCredential` 后它不再存在，故这里**重新算一次**
+  //（`LOOMY_USERID_HINT` 是纯正则，重新测一次没有成本，且口径完全一致）。
+  const hasUserid = LOOMY_USERID_HINT.test(userid)
   const uid = hasUserid ? userid : deriveLoomyUid(accessToken, phone)
 
   return {
@@ -1053,6 +1088,21 @@ export const loomyProvider: Provider = {
     /** ✅ `POST /points/first-login`（`src/loomy-credits.ts:208`）。 */
     checkin: true,
   },
+  /**
+   * 对象凭据的判别式（自动识别时用）。
+   *
+   * ## 🔴 为什么必须有它
+   *
+   * 用户报「我在本地登录了 lobsterai，你推送上去试试」时实测发现：
+   * **没有 `matchesShape` 的供应商在自动识别里永远轮不到** ——
+   * `parseCredentialAnywhere` 的循环会把「`matchesShape === undefined`」
+   * 当成「字段形状不属于该供应商」而**直接跳过**（`index.ts:170-176`）。
+   * LobsterAI 就是这样被判成了 Raccoon（两者 `user_id` 都是纯数字）。
+   * Loomy 是同一型缺陷的下一个受害者。
+   *
+   * ⚠️ 判据**复用** `looksLikeLoomyCredential`，与 `parseCredential` 同一份。
+   */
+  matchesShape: looksLikeLoomyCredential,
   parseCredential,
   listModels,
   chat,

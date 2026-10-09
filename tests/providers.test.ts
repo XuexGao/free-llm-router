@@ -14,7 +14,7 @@
  */
 
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
 import {
@@ -979,4 +979,145 @@ test('🔴 cron 必须做**主动续期**（否则每次凭据过期都先失败
     '⚠️ 续期整体失败不能让 cron 抛出（否则任务分发一起停）')
   // ⑦ 停用的账号不续期（用户明确不用了）
   assert.ok(/if \(account\.disabled\) continue/.test(fn), '停用账号应跳过')
+})
+
+test('🔴 每家 provider 都必须有 matchesShape（否则自动识别永远轮不到它）', () => {
+  // ## 实测缺陷（用户报「我在本地登录了 lobsterai，推送上去试试」）
+  //
+  // 导入后 LobsterAI 的凭据被判成了 **raccoon**（账号以 `raccoon:116092` 出现）。
+  //
+  // 根因：`parseCredentialAnywhere` 的循环里，`matchesShape === undefined`
+  // 会被当成「对象的字段形状不属于该供应商」而**直接跳过**
+  //（`src/providers/index.ts:170-176`）。
+  //
+  // - Raccoon 的判据是「`user_id` 是纯数字」；
+  // - **LobsterAI 的 `user_id` 恰好也是纯数字**（`116092`）；
+  // - 而 LobsterAI 当时**没有 `matchesShape`** ⇒ 被跳过 ⇒ 落到 Raccoon 手里。
+  //
+  // ⚠️ **教训：任何支持「凭据导入」的供应商都必须有 `matchesShape`。**
+  // 这类缺陷的症状是「导入成功但一发消息就 401」/「账号出现在别家下面」——
+  // 用户很难联想到判别式缺失。
+  //
+  // 本测试**动态**遍历注册表，新增供应商若忘了加判别式会立刻失败。
+  const src = readFileSync('src/providers/index.ts', 'utf8')
+  const registry = src.slice(src.indexOf('export const PROVIDERS'))
+  const ids = [...registry.matchAll(/^\s{2}(\w+Provider),$/gm)].map((m) => m[1])
+  assert.ok(ids.length >= 12, `应解析出全部 provider（实际 ${ids.length}）`)
+
+  const missing: string[] = []
+  for (const name of ids) {
+    // provider 的实现文件与变量名的对应：去掉结尾的 Provider 并转小写
+    const base = name.replace(/Provider$/, '').toLowerCase()
+    const file = `src/providers/${base}.ts`
+    if (!existsSync(file)) continue
+    const body = readFileSync(file, 'utf8')
+    // ⚠️ 两种挂载形态都算：`matchesShape(input) {` 与 `matchesShape: xxx,`
+    if (!/^\s*matchesShape[(:]/m.test(body)) missing.push(`${name} (${file})`)
+  }
+  assert.deepEqual(
+    missing,
+    [],
+    '⚠️ 以下 provider 缺 matchesShape，自动识别时会被跳过、凭据被别家认走：'
+      + missing.join('、'),
+  )
+})
+
+test('🔴 lobsterai 必须被识别为 lobsterai，而不是 raccoon', () => {
+  // 实测：LobsterAI 凭据（`user_id` 为纯数字 `116092`）被判成了 raccoon。
+  const raccoon = readFileSync('src/providers/raccoon.ts', 'utf8')
+  const lobster = readFileSync('src/providers/lobsterai.ts', 'utf8')
+
+  // ① raccoon 必须**显式排除** LobsterAI 的独有字段
+  const rMatch = raccoon.slice(raccoon.indexOf('matchesShape('))
+  const rBody = rMatch.slice(0, rMatch.indexOf('\n  },'))
+  for (const k of ['first_keyfrom', 'latest_keyfrom']) {
+    assert.ok(
+      rBody.includes(k),
+      `⚠️ raccoon 的判别式必须排除 LobsterAI 的独有字段 \`${k}\``
+        + '（两者 user_id 都是纯数字，不排除就会误判）',
+    )
+  }
+
+  // ② lobsterai 必须有 matchesShape，且认自己的独有字段
+  assert.ok(/^\s*matchesShape\(/m.test(lobster), '⚠️ lobsterai 必须有 matchesShape')
+  const lMatch = lobster.slice(lobster.indexOf('matchesShape('))
+  const lBody = lMatch.slice(0, lMatch.indexOf('\n  },'))
+  assert.ok(lBody.includes('first_keyfrom'), '⚠️ lobsterai 的判别式应认 first_keyfrom')
+  // ③ 也要排除 TRAE（有 machine_id 且无 uuid）—— 与 parseCredential 口径一致
+  assert.ok(/machine_id/.test(lBody), '⚠️ lobsterai 的判别式必须排除 TRAE 凭据')
+})
+
+test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判据', () => {
+  // 两处判据一旦分叉，就会出现「matchesShape 说是我、parseCredential 说不是」
+  // 这种自相矛盾的组合，症状是「自动识别选中了 Loomy，导入却报错」。
+  const src = readFileSync('src/providers/loomy.ts', 'utf8')
+  assert.ok(/export function looksLikeLoomyCredential/.test(src),
+    '必须有共享判据函数')
+  // parseCredential 内部必须复用它
+  const pi = src.indexOf('function parseCredential(')
+  const pBody = src.slice(pi, pi + 6000)
+  assert.ok(/looksLikeLoomyCredential\(source\)/.test(pBody),
+    '⚠️ parseCredential 必须复用共享判据，不能自己再写一份')
+  // provider 对象必须挂它
+  assert.ok(/matchesShape: looksLikeLoomyCredential/.test(src),
+    '⚠️ matchesShape 必须复用同一个函数')
+  // ⚠️ 嵌套包装层也要认（否则嵌套形凭据永远判不出来）
+  const fn = src.slice(src.indexOf('export function looksLikeLoomyCredential'))
+  assert.ok(/for \(const wrapper of \['credential', 'credentials', 'auth'\]\)/.test(fn),
+    '⚠️ 共享判据必须先展开嵌套包装层（与 parseCredential 一致）')
+})
+
+test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', () => {
+  // ## 实测缺陷（用户报「codearts 调用不了」）
+  //
+  // CodeArts 在「并发会话数已达上限(3个)」时，非流式路径回的是
+  //   `content:'' + finish_reason:'stop' + usage:null` 的 **HTTP 200 空答案**，
+  // 而它在**流式**路径是会正常报错的 —— 两条路径口径不一致。
+  //
+  // 根因有**两处**：
+  //
+  // 1. 判据里有个错误的合取项
+  //    `&& (completion.usage === undefined || completion.usage === null)` ——
+  //    它把「有 usage」当成「不是空响应」的理由。而 `usage` 只说「上游计了费」，
+  //    与「有没有内容」**无关**：最需要报错的恰恰是「消耗了 token 却没产出内容」。
+  // 2. 即使进了那个分支，**只有识别到错误帧才报错**；上游若给的是
+  //    「合法但完全空」的响应（没有错误帧、也没有内容），流程会**落回正常返回**
+  //    ⇒ 客户端拿到 `content:''`，看起来像「模型说了空话」。
+  //
+  // ⚠️ 这是本项目 §7.2「失败必须显式」明确禁止的形态：**空回复比报错更糟**。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf('async function nonStreamingResponse')
+  const block = src.slice(i, i + 8000)
+
+  // ① 判据不得把 usage 当「有内容」的判据
+  // ⚠️ 判据要**排除注释**（我的说明里正引用那个错误写法作反面教材）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(
+    !/completion\.usage === undefined \|\| completion\.usage === null/.test(code),
+    '⚠️ 空响应判据不得包含 usage 条件（usage 只说明计了费，与内容无关）',
+  )
+
+  // ② 必须有「找不到错误帧也要报错」的兜底
+  assert.ok(/上游返回了空响应（既没有正文\/思考内容，也没有可识别的错误帧）/.test(block),
+    '⚠️ 必须有兜底：找不到错误帧时也要如实报错，不能落回静默空回复')
+
+  // ③ ⚠️ 但**必须排除工具调用** —— 那时 content 也是 ''，不排除会把一次
+  //    **成功**的工具调用误报成空响应（假阳性比原缺陷更糟：工具调用是
+  //    agent 场景的主路径）。
+  assert.ok(/const hasToolCalls = Array\.isArray\(toolCalls\) && toolCalls\.length > 0/.test(block),
+    '必须计算 hasToolCalls')
+  assert.ok(/choice !== undefined\s*\n\s*&& !hasToolCalls/.test(block),
+    '⚠️ 空响应判据必须排除 tool_calls（否则误伤正常的工具调用）')
+})
+
+test('⚠️ aggregateSse 确实会把 tool_calls 放进 message（上一条测试的前提）', () => {
+  // 上面那条测试断言「必须排除 tool_calls」，其前提是聚合结果里
+  // tool_calls 真的在 `choice.message.tool_calls`（而不是别处）。
+  // 这个前提若变了，那条断言就会变成**无意义的空转**。
+  const src = readFileSync('src/gateway/stream.ts', 'utf8')
+  assert.ok(/if \(toolCalls\.length > 0\) choice\.message\.tool_calls = toolCalls/.test(src),
+    '⚠️ aggregateSse 必须把 tool_calls 挂在 choice.message 上')
+  assert.ok(/finish_reason = toolCalls\.length > 0 \? 'tool_calls' : 'stop'/.test(src),
+    "⚠️ 有工具调用时 finish_reason 应为 'tool_calls'")
 })

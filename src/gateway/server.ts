@@ -1342,11 +1342,25 @@ async function nonStreamingResponse(
   // 实测踩到：CodeArts 的模型名错误帧既没有 `usage` 也没有正文，
   // 而某次判断只查了 usage —— 结果给客户端一个 `content:''` 的空回答，
   // 用户以为是模型不行，其实是模型名写错了。
+  // ⚠️ 判据**只看有没有内容**，`usage` 不参与判断。
+  //
+  // 我原先写的是 `... && (completion.usage === undefined || completion.usage === null)`——
+  // ⚠️ 那是**错的**：它把「有 usage」当成「不是空响应」的理由，
+  // 于是「消耗了 token 但没产出任何内容」这种**最需要报错**的形态反而被放过
+  //（实测 codearts 就会回 `content:'' + usage:null` 或带 usage 的空帧）。
+  // `usage` 只说「上游计了费」，与「有没有内容」无关。
+  // ⚠️ **必须排除「只调用工具」的正常响应**：那时 `content` 也是 `''`
+  //（`aggregateSse` 把工具调用放进 `choice.message.tool_calls`，
+  // `finish_reason` 为 `'tool_calls'`）。不排除就会把一次**成功**的工具调用
+  // 误报成「上游返回空响应」—— 那是比原缺陷更糟的假阳性
+  //（工具调用是 agent 场景的主路径）。
+  const toolCalls = (choice?.message as { tool_calls?: unknown[] } | undefined)?.tool_calls
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0
   if (
     choice !== undefined
+    && !hasToolCalls
     && choice.message.content === ''
     && (choice.message.reasoning_content ?? '') === ''
-    && (completion.usage === undefined || completion.usage === null)
   ) {
     // ⚠️ **先处理「整个响应体就是一个 JSON（不是 SSE）」的情况**。
     //
@@ -1389,6 +1403,33 @@ async function nonStreamingResponse(
         // 非 JSON 帧，继续找
       }
     }
+
+    // ## 🔴 找不到错误帧时**也必须报错**，不能落回静默空回复
+    //
+    // 实测缺陷（用户报「codearts 调用不了」，且现象是**空回复而不是报错**）：
+    // CodeArts 在「并发会话数已达上限(3个)」时，旧版路径会给一个
+    // `content:'' + finish_reason:'stop' + usage:null` 的 **HTTP 200 空答案**，
+    // 而它在流式路径**是**会报错的 —— 两条路径口径不一致。
+    //
+    // ⚠️ 上面那段只在**识别到错误帧**时才报错；若上游给的是「合法但完全空」
+    // 的响应（没有错误帧、也没有内容），流程会**落回下面的正常返回**
+    // ⇒ 客户端拿到 `content:''`，看起来像「模型说了空话」。
+    //
+    // ⚠️ 这是本项目 §7.2「失败必须显式」明确禁止的形态：**空回复比报错更糟**，
+    // 用户会以为是模型能力问题，而真实原因是上游拒绝了这次请求。
+    // ⇒ 兜底：走到这里说明「既没内容、也没能定位到错误帧」，那也要如实报错。
+    //
+    // ⚠️ 注意此处**不能**用 `hooks.onError` 记成「账号失败」——我们无法确定
+    // 是账号问题还是上游临时抽风，而误记会让健康账号被冷却
+    //（本项目反复踩到的「状态看着对、行为不对」型缺陷）。只如实回报给客户端。
+    const snippet = raw.trim().slice(0, 200)
+    return jsonError(
+      502,
+      '上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。'
+        + '这通常意味着上游临时拒绝或该模型不可用，请稍后重试。'
+        + (snippet === '' ? '' : `上游原文片段：${snippet}`),
+      'upstream_error',
+    )
   }
 
   hooks.onFirstChunk()
