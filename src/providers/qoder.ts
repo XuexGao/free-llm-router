@@ -885,7 +885,12 @@ async function postQoderInfer(
     method: 'POST',
     headers: prepared.headers,
     body: prepared.body,
-    signal: request.signal,
+    // ⚠️ **必须带超时** —— 只透传 `request.signal` 等于「永不超时」，
+    // 一次挂住就会让上层所有预算（排队总预算等）失效。
+    // 两者用 `any` 组合：客户端取消与超时都要生效。
+    signal: request.signal.aborted
+      ? request.signal
+      : AbortSignal.any([request.signal, AbortSignal.timeout(INFER_TIMEOUT_MS)]),
   })
 }
 
@@ -1264,6 +1269,29 @@ const REFRESH_PATH = '/api/v1/deviceToken/refresh'
 
 /** 单次续期超时（对齐参考 `QODER_REQUEST_TIMEOUT_MS = 30_000`，`src/qoder.ts:14`）。 */
 const REFRESH_TIMEOUT_MS = 30_000
+
+/**
+ * **单次推理**的超时（毫秒）。
+ *
+ * ## 🔴 为什么必须有（实测缺陷）
+ *
+ * 原先 `postQoderInfer` 只透传 `request.signal`（**没有超时**）——
+ * 于是**一次** fetch 就能无限期挂住。实测后果：
+ *
+ * ```
+ * 一次 infer 挂住 → 排队预算（45s）根本来不及生效
+ *   ⇒ 整个请求挂到 121.8s
+ *   ⇒ Worker 报 `Network connection lost.`（连接被平台回收）
+ * ```
+ *
+ * ⚠️ 我加了「排队总预算」后**仍然** 121.8s，就是因为预算只能在
+ * 「每次 infer **返回之后**」才被检查 —— 而 infer 自己不返回。
+ * **教训：加总预算前，必须确认每一段都有界。**
+ *
+ * 取值 30s：与参考实现的 `QODER_REQUEST_TIMEOUT_MS` 一致
+ *（`src/qoder.ts:14`，用于 qoder 的鉴权与推理请求）。
+ */
+const INFER_TIMEOUT_MS = 30_000
 
 /**
  * 用 `refresh_token` 换一份新凭据。

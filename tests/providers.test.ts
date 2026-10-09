@@ -726,3 +726,29 @@ test('🔴 Worker 入口必须有异常边界（否则只回裸 `error code: 110
   const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
   assert.ok(!/Authorization/.test(code), '⚠️ 日志不得含 Authorization')
 })
+
+test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = 永不超时）', () => {
+  // ## 实测缺陷（「加了总预算仍然 121.8s」的根因）
+  //
+  // 我加了「排队总墙钟预算」后**仍然**挂到 121.8s。原因：
+  // `postQoderInfer` 只透传 `request.signal`，**没有超时** ⇒
+  // **一次** fetch 就能无限期挂住 ⇒ 预算检查根本没机会执行
+  //（预算只能在「每次 infer **返回之后**」才被检查，而 infer 自己不返回）。
+  //
+  // ⚠️ **教训：加总预算前，必须确认每一段都有界。**
+  // 一个无界的子步骤会让外层所有预算形同虚设。
+  const src = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(/const INFER_TIMEOUT_MS = \d[\d_]*/.test(src), '必须有推理超时常量')
+  const m = /const INFER_TIMEOUT_MS = ([\d_]+)/.exec(src)
+  const ms = Number(m![1]!.replaceAll('_', ''))
+  // 与参考实现的 `QODER_REQUEST_TIMEOUT_MS = 30_000` 一致
+  assert.equal(ms, 30_000, '应与参考实现的 30s 一致')
+  // ⚠️ **发起推理的那次 fetch** 必须用上它（不能只是定义）
+  const i = src.indexOf('async function postQoderInfer')
+  const j = src.indexOf('\n}', src.indexOf('return await fetch(', i))
+  const block = src.slice(i, j)
+  assert.ok(/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
+    '⚠️ 推理 fetch 必须带 AbortSignal.timeout(INFER_TIMEOUT_MS)')
+  assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
+    '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
+})
