@@ -604,6 +604,32 @@ TaskRunner DO
 
 **实测恢复**：minimax 8.2s 返回（走续期），再测 2.7s（用新 token）。
 
+**a2. zcode 签到：三处偏离官方口径（其中两处会产出「假结论」）**
+
+实现 checkin 后线上实测恒报「没有可领取的每日积分」。⚠️ **那是假结论** ——
+比报错更糟：用户以为「已经领过了」，实际是**我们根本没查到**。逐项对齐参考实现后修掉三处：
+
+1. **漏了客户端活跃上报** —— 参考实现 `zcode-upstream.ts:18-29` 写得很明确：
+   补发 `POST /api/v1/event/report {app_launch, app_daily_active}` **之前**
+   `preview → {"plans":[]}`，补之后才有 plan。**服务端不会主动推送活动**，
+   `preview` 的内容**依赖客户端活跃信号**。
+2. **自己编了判据字段** —— 我写了 `claimable` / `can_claim` / `available`
+   三个字段去筛，而上游**根本没有这些字段**（参考实现 `zcode-upstream.ts:445-447`
+   的判据只有 **`plan_id` 非空**）⇒ 列表恒为空。
+   ⚠️ **教训：字段名不能猜，要去参考实现里逐字核对。**
+3. **preview 多带了 `Authorization`** —— 参考实现的端点表明确写着该端点的
+   「需要 Authorization」是 **否**（`zcode-upstream.ts:11-17`），代码逐字只传
+   `{ json: false }`。另外还**漏了查询参数** `?app_version=…&platform=win32`。
+
+⚠️ 修完之后 `plans` 仍是 `[]` —— 但这次**确认过是上游的真实答复**
+（活跃上报 200/code 0、preview 200 + `{"plans":[],"server_time":…}`），
+且参考实现确认这种语义（「没有可领 plan」≠「今天已领」，也可能活动未投放）。
+**故这是正确行为，不再当作缺陷。** 区别在于：修之前我们**根本没查对**，
+修之后是**查对了但上游确实没有** —— 这两者的用户价值完全不同。
+
+⚠️ 定位手段：加了一个**只读**临时诊断端点（活跃上报 + preview，**绝不碰 claim**，
+因为 claim 会触发有账号惩罚的 3012），拿到上游原始响应后立即删除。
+
 **b. lobsterai 有 refresh_token 却没挂 refresh（同型缺陷第 2 次）**
 
 上游 `/api/auth/refresh` 存在、凭据有 `refresh_token`，但**没挂方法** ⇒
@@ -627,7 +653,7 @@ zcode（凭据静态/无端点）、opencode（匿名通道无凭据）、loomy�
 | qoder | ✅ 正常。⚠️ 会**排队**，实测 21–23s —— 是上游排队（`QUEUE_MAX_ATTEMPTS=3` × `QUEUE_MAX_DELAY_MS=10s`），**不是故障**。我最初用 90s 超时测，正好卡在边界上误判为失败 |
 | codearts | ❌ 账号侧：`APIG.0301 Incorrect IAM authentication`。AK/SK 签名的 security_token 过期，**该家无 refresh 机制**（三元组签名不是 OAuth），需重新拿 AK/SK |
 | opencode | ❌ 账号侧：`FreeUsageLimitError: Rate limit exceeded` |
-| zcode | ❌ 风控：`405 / code 3012 unusual activity`。⚠️ 官方身份块**已正确注入**（3130 字符、逐字对齐参考实现）；参考实现明说「身份块达标仍 3012 **目前没有已知解释**」 |
+| zcode | ⚠️ 推理：风控 `405 / code 3012 unusual activity`。官方身份块**已正确注入**（3130 字符、逐字对齐参考实现）；参考实现明说「身份块达标仍 3012 **目前没有已知解释**」。<br>⚠️ 签到：`preview` 返回 `plans: []` —— **这是上游的真实答复**（活跃上报也返回 200/code 0）。参考实现确认这种语义：「没有可领 plan」**不等于**「今天已领」，也可能是**活动未投放**，两者用户动作都是「明天再来」 |
 | raccoon | ❌ 账号侧：登录态过期，需重新微信扫码 |
 | loomy / lobsterai | 无账号，无法实测；由单测覆盖 |
 

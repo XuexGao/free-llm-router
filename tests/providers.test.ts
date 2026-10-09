@@ -610,3 +610,58 @@ test('⚠️ zcode / opencode / loomy 如实不提供 refresh（上游确实没�
   const zcode = readFileSync('src/providers/zcode.ts', 'utf8')
   assert.ok(/不可续期/.test(zcode), 'zcode 必须显式说明「不可续期」')
 })
+
+test('🔴 zcode 签到前**必须**补发客户端活跃上报（否则 preview 恒为空）', () => {
+  // ## 实测缺陷（我第一版漏了）
+  //
+  // 参考实现 `zcode-upstream.ts:18-29` 写得很明确：
+  // ```
+  // 补 POST /api/v1/event/report {app_launch, app_daily_active} 之前：
+  //   preview → {"code":0,"data":{"plans":[]}}          ← 空
+  // 补之后：
+  //   preview → {"code":0,"data":{"plans":[{plan_id:"…"}]}}
+  // ```
+  // ⚠️ 服务端**不会主动推送**活动，`preview` 的内容**依赖客户端活跃信号**。
+  //
+  // 我第一版直接查 preview ⇒ 永远拿空列表 ⇒ 把它当成「今天已领取」报给用户。
+  // **那是假结论**，比报错更糟：用户以为「已经领过了」，实际是我们**根本没查到**。
+  const src = readFileSync('src/providers/zcode.ts', 'utf8')
+  assert.ok(src.includes('ZCODE_EVENT_REPORT_URL'), '应有活跃上报端点常量')
+  const i = src.indexOf('async function checkin(')
+  const block = src.slice(i, i + 4000)
+  // ⚠️ 上报必须在**查 preview 之前**
+  const reportAt = block.indexOf('ZCODE_EVENT_REPORT_URL')
+  const previewAt = block.indexOf('ZCODE_BILLING_PREVIEW_URL')
+  assert.ok(reportAt > 0, 'checkin 里必须发活跃上报')
+  assert.ok(previewAt > 0, 'checkin 里要查 preview')
+  assert.ok(reportAt < previewAt, '⚠️ 上报必须在查 preview **之前**（否则查到的是空列表）')
+  // 两个事件都要发
+  assert.ok(block.includes("'app_launch'") && block.includes("'app_daily_active'"),
+    '两个活跃事件都要发')
+
+  // 🔴 preview **必须带** `app_version` 与 `platform=win32` 查询参数
+  //（参考实现 `zcode-upstream.ts:426` 逐字如此）。
+  assert.ok(/ZCODE_BILLING_PREVIEW_URL\}?app_version=/.test(block) || /app_version=\$\{encodeURIComponent/.test(block),
+    '⚠️ preview 必须带 app_version 查询参数')
+  assert.ok(block.includes('platform=win32'), '⚠️ preview 必须带 platform=win32')
+
+  // 🔴 判据必须是「`plan_id` 非空」，**不能**自己编「可领取」标记字段。
+  // ⚠️ 我第一版编了 `claimable`/`can_claim`/`available` 三个字段名去筛，
+  // 而上游**根本没有这些字段** ⇒ 列表恒为空 ⇒ 签到恒报「没有可领取的积分」
+  // ⇒ **假结论**（用户以为领过了，实际是我们筛错了）。
+  assert.ok(/\['plan_id'\]/.test(block), '⚠️ 判据必须读 plan_id')
+  // ⚠️ 判据要**排除注释** —— 我的说明注释里正引用了那三个臆造字段名
+  //（不排除会把「解释为什么不该用」的注释本身判成违规）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/claimable'\] === true|can_claim'\]|available'\] === true/.test(code),
+    '⚠️ 不得使用臆造的「可领取」标记字段（上游没有这些字段）')
+  // ⚠️ device_mid 必须用 EXTRA_* 常量取值 —— 存储键是 camelCase，
+  // 手写 snake_case 会读到 undefined ⇒ 发空串 ⇒ 上报静默失效。
+  assert.ok(/credential\.extras\[EXTRA_DEVICE_MID\]/.test(block),
+    '⚠️ device_mid 必须用 EXTRA_DEVICE_MID 常量（键名是 camelCase deviceMid）')
+  assert.ok(/credential\.extras\[EXTRA_APP_VERSION\]/.test(block),
+    '⚠️ app_version 必须用 EXTRA_APP_VERSION 常量')
+  // 上报失败不能阻塞签到
+  assert.ok(/catch \{[\s\S]{0,120}\}/.test(block.slice(reportAt - 200, reportAt + 2000)),
+    '上报失败应被兜住（不阻塞）')
+})
