@@ -903,7 +903,38 @@ async function chat(
   // ⚠️ 记**开始时刻**，用于总预算判据（见 QUEUE_TOTAL_BUDGET_MS 的说明）。
   const queueStartedAt = Date.now()
   for (let attempt = 0; ; attempt += 1) {
-    const response = await postQoderInfer(product, credential, request)
+    let response: Response
+    try {
+      response = await postQoderInfer(product, credential, request)
+    } catch (error) {
+      // ## 🔴 必须把「超时/客户端取消」翻译成**可分类**的错误
+      //
+      // 实测缺陷：`postQoderInfer` 的 `AbortSignal.timeout(INFER_TIMEOUT_MS)`
+      // 触发后抛 `TimeoutError`，而**这里没有 catch** ⇒ 它直接穿透到
+      // Worker 的异常边界 ⇒ 客户端收到 **HTTP 500 `internal_error`**。
+      //
+      // ⚠️ 那是**错的分类**：单次推理超时说明「上游慢/在排队」，
+      // 是**容量**问题 ⇒ 应该 `retryable`（换号或稍后重试有效），
+      // 而不是「服务内部错误」（那会让用户以为是我们坏了）。
+      //
+      // ⚠️ 客户端主动取消则**必须原样区分**（本项目已有此纪律，见
+      // `zcode.ts` 的同款说明）：把它当可重试会让「用户点了取消」
+      // 变成「我们偷偷又发了一次请求」。
+      if (request.signal.aborted) {
+        throw new ProviderError({ provider: product.id, message: '请求已被客户端取消' })
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      // ⚠️ 只有「超时/中止」才归为繁忙；其它传输层错误仍按可重试的网络问题处理。
+      const timedOut = /timeout|timed out|abort/i.test(message)
+      throw new ProviderError({
+        provider: product.id,
+        retryable: true,
+        message: timedOut
+          ? `Qoder 单次请求超过 ${Math.round(INFER_TIMEOUT_MS / 1000)} 秒未返回`
+            + `（上游繁忙或排队）。请稍后重试 —— 这是上游问题，不是账号或配置问题。`
+          : `Qoder 请求失败：${message}`,
+      })
+    }
 
     if (response.ok) {
       if (response.body === null) {
