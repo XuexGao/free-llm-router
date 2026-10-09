@@ -1435,12 +1435,35 @@ async function nonStreamingResponse(
     }
 
     // 流里没有任何内容 —— 找一下是不是错误帧
+    //
+    // ## 🔴 必须复用 `parseSseLine`，不能自己 `startsWith('data: ')`
+    //
+    // 实测缺陷：codearts 经华为 APIG 回的原文是
+    // ```
+    // data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found",...}
+    // ```
+    // ⚠️ 注意 **`data:` 后面没有空格**。
+    //
+    // 而本段原先判的是 `line.startsWith('data: ')`（**带空格**）
+    // ⇒ 这一帧**永远匹配不上** ⇒ 扫不到错误帧 ⇒ 落到下面那条通用兜底，
+    // 用户看到的是「上游返回了空响应…」，而**真实原因是 `benefit not found`**
+    //（账号权益未生效，该采取的行动完全不同）。
+    //
+    // ⚠️ 更值得记的是：**同一个项目里 `parseSseLine`（`stream.ts:47`）
+    // 早就同时容忍两种写法**（`startsWith('data:')` + `.trim()`）——
+    // 我在这里又手写了一遍解析，就漏掉了无空格形态。
+    // **教训：SSE 解析一律走 `parseSseLine`，不要手写前缀判断。**
     for (const line of raw.split('\n')) {
-      if (!line.startsWith('data: ')) continue
-      const payload = line.slice(6).trim()
-      if (payload === '' || payload === '[DONE]') continue
+      const frame = parseSseLine(line)
+      // ⚠️ `parseSseLine` 已经把注释/空行/`[DONE]` 归为 `ignore`/`done`。
+      // `kind === 'error'` 是它自己解析出的错误（`data:` 前缀两种写法都认）。
+      if (frame.kind === 'error' && typeof frame.error === 'string') {
+        hooks.onError(frame.error)
+        return jsonError(502, frame.error, 'upstream_error')
+      }
+      if (frame.kind !== 'chunk' || typeof frame.data !== 'string') continue
       try {
-        const parsed = JSON.parse(payload) as Record<string, unknown>
+        const parsed = JSON.parse(frame.data) as Record<string, unknown>
         const err = detectErrorFrame(parsed)
         if (err !== undefined) {
           hooks.onError(err)

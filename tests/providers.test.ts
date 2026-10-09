@@ -1203,3 +1203,41 @@ test('🔴 客户端取消**不得**记成账号失败（否则用户的取消�
     `⚠️ 第 ${missing.join('、')} 个 streamResponse 调用点没传 clientGone`
       + '（漏传的路径仍会把客户端取消记成账号失败）')
 })
+
+test('🔴 SSE `data:` 前缀必须容忍**无空格**形态（否则扫不到上游错误帧）', () => {
+  // ## 实测缺陷（全供应商验收时定位）
+  //
+  // codearts 经华为 APIG 回的错误帧原文是：
+  // ```
+  // data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found",...}
+  // ```
+  // ⚠️ 注意 **`data:` 后面没有空格**。
+  //
+  // 而非流式路径「找不到内容时回头扫错误帧」那段原先判的是
+  // `line.startsWith('data: ')`（**带空格**）⇒ 这一帧**永远匹配不上**
+  // ⇒ 用户看到通用兜底「上游返回了空响应…」，而**真实原因是 benefit not found**
+  //（账号权益未生效 —— 该采取的行动完全不同）。
+  //
+  // ⚠️ 关键在于：**同一个项目里 `parseSseLine` 早就同时容忍两种写法**，
+  // 而我在 server.ts 里又手写了一遍解析，就漏掉了无空格形态。
+  // ⇒ **教训：SSE 一律走 `parseSseLine`，不要手写 `data:` 前缀判断。**
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  const stream = readFileSync('src/gateway/stream.ts', 'utf8')
+
+  // ① parseSseLine 本身必须容忍无空格（这是前提）
+  assert.ok(/if \(!trimmed\.startsWith\('data:'\)\)/.test(stream),
+    "⚠️ parseSseLine 必须用 startsWith('data:')（不带空格）")
+  assert.ok(/trimmed\.slice\(5\)\.trim\(\)/.test(stream),
+    '⚠️ parseSseLine 应用 slice(5) 去掉 data: 并 trim')
+
+  // ② server.ts 里**不得**再手写 `startsWith('data: ')`（剥注释后判）
+  const code = stripComments(server)
+  assert.ok(!/startsWith\('data: '\)/.test(code),
+    "⚠️ 不得手写 startsWith('data: ')（带空格）—— 会漏掉上游的 `data:{...}` 形态")
+
+  // ③ 那段错误帧扫描必须复用 parseSseLine
+  const i = server.indexOf('async function nonStreamingResponse')
+  const block = stripComments(server.slice(i))
+  assert.ok(/const frame = parseSseLine\(line\)/.test(block),
+    '⚠️ 错误帧扫描必须复用 parseSseLine（同一件事只能有一个实现）')
+})
