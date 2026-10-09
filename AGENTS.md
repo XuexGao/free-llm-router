@@ -644,6 +644,75 @@ TaskRunner DO
 zcode（凭据静态/无端点）、opencode（匿名通道无凭据）、loomy（服务端无端点）——
 ⚠️ **不**给它们加假续期（那是不实承诺，UI 会显示「可自动续期」）。用单测钉住这个区分。
 
+#### ②b 用户报的 4 个功能缺陷（2026-10-09 修复）
+
+**测试基线：492 条单测通过。** 用户原话：「功能有问题你就修，只是界面别乱改就行」。
+
+**a. loomy 发不了验证码 —— 二次读 `request.body`（一次性流）**
+
+`/admin/providers/login/start` 开头已 `await request.json()`，loomy 分支**又读一次**
+⇒ 抛 `body used already`，被 `.catch(() => ({}))` 吞掉 ⇒ `phone` 恒为 `''`
+⇒ **任何号码都回「请填写 11 位手机号」**。
+
+⚠️ **症状极具误导性**：文案说「号码格式不对」，真实原因是**我们没读到号码** ——
+用户会反复检查自己输入的东西。
+⚠️ 教训：`.catch(() => ({}))` 把「必然失败的操作」伪装成「用户传了空值」，
+正是 §7.2「失败必须显式」禁止的形态。
+
+**b. 账号积分永远 0 —— 读了一个废弃字段**
+
+我上一版读 `/admin/accounts` 的 `a.credits`，而实测 **13 个账号全是 0**。
+追查：它**只在 `AccountPoolDO.revive()` 里被写**，而 `revive` 是「清冷却」用的
+⇒ 平时**没有任何地方写它** ⇒ 事实上是**废弃字段**。
+
+⇒ 改用 `/admin/packages`（逐账号实时查上游，`total`，按 uid 对应）——
+与「总积分」徽标**同一数据源**，不会「卡片有数、账号无数字」。
+⚠️ 教训：**读一个字段前先确认有谁写它** —— 否则拿到的是永久的默认值。
+
+**c. zcode 余额永远查不出 —— 层级猜错 + 把空桶当异常**
+
+上游实测原文 `{"server_time":…,"plans":[],"balances":[]}`。两个问题叠加：
+
+1. **响应没有 `data` 包裹**（参考实现的类型标注写的是 `data.balances`，
+   但实测在顶层）⇒ 只读 `parsed.data` ⇒ 恒判「缺少 data 字段」；
+2. **`balances: []` 是正常的**（参考实现 `zcode-upstream.ts:338-348`：
+   「每日赠送的 start-plan 额度**不在 `balances` 桶里**，只在 `plans` 里」）
+   ⇒ 我把「0 个桶」判成「形状无法识别」并**抛错**。
+
+⚠️ 教训：**参考实现的类型标注不等于实测响应形状** —— 两者不一致时以实测为准。
+
+**d. qoder 报「服务内部错误」—— 读体失败没被翻译**
+
+实测 `500 服务内部错误：The operation was aborted due to timeout`。
+
+根因：provider 的推理超时触发点**不在** `provider.chat()` 里 ——
+`chat()` 返回 `Response` 时**流还没读完**，超时是在 `nonStreamingResponse`
+**读体时**炸的；而那里只有 `try/finally`、**没有 `catch`**
+⇒ 穿透 `handleProviderChat`（它的 try 只包了 `provider.chat`）⇒ 异常边界 ⇒ 500。
+
+⚠️ 这是**错误分类**错误：上游慢/超时是**可重试的上游问题**，不是内部故障。
+⇒ 读体加 catch，翻成 **502 `upstream_error`** + 可读原因，并调 `hooks.onError` 参与记账。
+
+**e. 续期失败原因此前只进日志（用户看不到）**
+
+codearts 报的是上游那句 `APIG.0301 Incorrect IAM authentication Unauthorized`
+—— ⚠️ **极具误导性**（让人以为账号被封），而真实原因是
+`invalid refresh token: 'the refresh token has been used'`（**单次使用已消耗**）。
+两者该采取的行动完全不同：前者等，后者去重新登录。⇒ 现在附到用户可见错误里。
+
+**f. zcode 身份块对齐官方形态**
+
+`OS Version` 由 `linux` 改为 `<platform> <arch>`（参考实现 `zcode-identity.ts:183` 逐字如此）。
+⚠️ 这**不是** 3012 的判据，只是「更像官方客户端」。
+
+**⚠️ zcode 的 3012 结论（**不是**代码缺陷，不要再改）**
+
+本次用**只读**诊断抓到了我们**完整正确的请求**：3 个身份块、3149 字符、
+首块 `You are ZCode, an interactive coding agent`、日期块也在 —— **仍回 3012**。
+本文件 §9 早已记录该结论：3012 是**账号/IP 被上游风控，与请求形状无关**；
+参考实现也明说「身份块达标仍 3012 **目前没有已知解释**」。
+两个 zcode 账号历史上各有 **19 / 5 次成功**记录，证明代码正确。
+
 #### ③ 全供应商实测结论（跳过 buddy/workbuddy/trae）
 
 | 供应商 | 结果 |
