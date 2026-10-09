@@ -546,6 +546,130 @@ TaskRunner DO
 | 7. Web 面板 | ✅ **完成**：`/panel/` 上线，**7 视图**，CSP 严格 |
 | 8. 多供应商 | ✅ **完成**：**11 个变体 / 10 家厂商**接入统一 `Provider` 接口（约 14.5k 行） |
 
+### 9.1b 第 9 轮改造（2026-10-08/09）：Responses API + 续期缺陷 + 面板管理
+
+**测试基线：484 条单测通过。**
+
+#### ① OpenAI Responses API（`POST /v1/responses`）—— 已实现并线上验证
+
+新一代客户端（Codex CLI 等）不发 `messages`，而是发 `input` / `instructions` /
+`max_output_tokens`，且只解析 Responses 的 SSE 事件。
+
+**实现策略：借用 Chat 路径，只做协议外壳转换。**
+`Responses 请求 --toChatBody()--> Chat 请求体 --handleChatCompletions()-->`
+（非流式 `aggregateSse`→`toResponsesObject` / 流式 `toResponsesSse`）。
+
+⚠️ **为什么不重写一套路由**：那会让「Chat 路径修好的任何缺陷本端点**自动受益**」失效 ——
+本项目已经吃过「同一个 bug 只修一半」的教训（provider 路径的 6004 那次）。
+代价是多一层转换，值得。
+
+**关键协议点（写错都是静默失败）**：
+
+| 点 | 写错的后果 |
+|---|---|
+| `tools` 两边形状不同（Responses **扁平**，Chat 嵌在 `function` 下） | 上游认为「没有工具」⇒ 模型永不调用工具，客户端只以为「模型不听话」 |
+| `usage.input_tokens` **必须含**缓存命中 | ⚠️ 参考实现曾写反 ⇒ Codex 算 `input-cached` 得负数夹到 0 ⇒ 上下文少算上百倍 ⇒ **自动压缩永不触发** |
+| `input_text`/`input_image` → `text`/`image_url` | 类型名不同，图片与文本静默丢失 |
+| `instructions` → 首条 `system` | 国际版回 11128 且**伪装成安全策略拦截** |
+| `reasoning.effort` → 顶层 `reasoning_effort` | 思考档位静默丢失（「设了没用」） |
+| `previous_response_id` / `store:true` **报错** | 静默忽略 ⇒ 客户端以为有上下文 ⇒ 答非所问 |
+| `output[]` **按 output_index 排序** | 收尾顺序 ≠ 开启顺序 ⇒ 客户端按下标**取错项**（参考实现为此修过一次） |
+| 流式 `output_index` 与 `output[]` 下标一致、`in_progress` 时 `output:[]` | 客户端把项配错位 |
+
+**线上实测**：非流式字段完整（`created_at` 是**秒**）；流式 14 个事件次序正确、
+`sequence_number` **从 0 连续递增**、正文拼接 = `1，2，3。`；
+工具调用产出 `function_call get_weather` + `{"city":"北京"}`；流式工具调用 30 个事件
+（含 9 个 `function_call_arguments.delta`）序号连续；`previous_response_id` → 400。
+
+#### ② 🔴 三个真缺陷（全供应商实测定位）
+
+用户要求「用真实对话全面测试除 buddy/workbuddy/trae 以外的所有供应商」。
+逐家实测后定位到 **3 个真缺陷**，其余失败均为**账号侧**问题（如实记录，不修）。
+
+**a. 鉴权判据正则跨度写窄 ⇒ 续期静默不触发（minimax「用几分钟就永久 401」的根因）**
+
+实测：minimax 起初正常，**几分钟后**全部 `http=401 invalid access token`，
+而账号状态看起来完全正常。根因是**两层**的：
+
+1. minimax provider **完全没有 `refresh` 方法**（凭据里明明有 `refresh_token`）；
+2. 即使有，网关门禁 `isAuthLikeFailure()` 也**匹配不上**它的真实报错 ——
+   原判据 `invalid.?token` 的 `.?` 只允许**一个**字符，而真实报错
+   `invalid access token` 中间隔着 `access`（6 个字符）。
+
+**修法**：给 minimax 实现并**挂载** `refresh`；判据改为
+`invalid[\W_]+(?:\w+[\W_]+){0,2}?token`（允许中间夹最多两个词 + 兼容下划线）。
+
+⚠️ **我第一版加宽跨度时又把 `invalid_token` 弄坏了** —— `\W` 不匹配下划线。
+⚠️ 症状是「续期**静默**不触发」（不报错），故补了**正反两向**单测。
+
+**实测恢复**：minimax 8.2s 返回（走续期），再测 2.7s（用新 token）。
+
+**b. lobsterai 有 refresh_token 却没挂 refresh（同型缺陷第 2 次）**
+
+上游 `/api/auth/refresh` 存在、凭据有 `refresh_token`，但**没挂方法** ⇒
+网关按 `provider.refresh !== undefined` 判断 ⇒ 不续期、直接失败。
+
+⚠️ 与 minimax 是**同一个缺陷**。已实现并挂载（不带 Authorization；
+`firstKeyfrom`/`latestKeyfrom` 用**存储值**不取当前时刻；
+必须保留旧 `extras`）。
+
+**c. 审计其余 provider：三家「不续期」是诚实声明，不是遗漏**
+
+zcode（凭据静态/无端点）、opencode（匿名通道无凭据）、loomy（服务端无端点）——
+⚠️ **不**给它们加假续期（那是不实承诺，UI 会显示「可自动续期」）。用单测钉住这个区分。
+
+#### ③ 全供应商实测结论（跳过 buddy/workbuddy/trae）
+
+| 供应商 | 结果 |
+|---|---|
+| cline | ✅ 正常 |
+| minimax | ✅ **修复后**正常（续期生效） |
+| qoder | ✅ 正常。⚠️ 会**排队**，实测 21–23s —— 是上游排队（`QUEUE_MAX_ATTEMPTS=3` × `QUEUE_MAX_DELAY_MS=10s`），**不是故障**。我最初用 90s 超时测，正好卡在边界上误判为失败 |
+| codearts | ❌ 账号侧：`APIG.0301 Incorrect IAM authentication`。AK/SK 签名的 security_token 过期，**该家无 refresh 机制**（三元组签名不是 OAuth），需重新拿 AK/SK |
+| opencode | ❌ 账号侧：`FreeUsageLimitError: Rate limit exceeded` |
+| zcode | ❌ 风控：`405 / code 3012 unusual activity`。⚠️ 官方身份块**已正确注入**（3130 字符、逐字对齐参考实现）；参考实现明说「身份块达标仍 3012 **目前没有已知解释**」 |
+| raccoon | ❌ 账号侧：登录态过期，需重新微信扫码 |
+| loomy / lobsterai | 无账号，无法实测；由单测覆盖 |
+
+⚠️ **操作纪律（再次强调）**：zcode 的 3012 有**账号冷却惩罚（5 次停用）**。
+我这次在读到该警告前已触发若干次，**读到后立即停止探测**。对「有惩罚性风控」的上游，
+探测必须**极其吝啬**，先读错误分类注释再决定策略。
+
+#### ④ 面板改造（用户逐条纠正后）
+
+用户要求：删底部添加账号/粘贴凭据、加「供应商」卡片、每卡片登录在上导入在下、
+账号可单独停用并显示积分。⚠️ **用户明确纠正了我 3 处**：
+
+1. 「供应商」应放在「已禁用」**右边**（我放到了下面）—— 它属于 `.counts` 横向 flex 行，
+   故紧跟 `countBlock('已禁用')` 之后 append，**复用同一个 `countBlock()`**；
+2. **只调顺序，不许改字** —— 我擅自把文案改成「或：粘贴凭据导入（兜底）」，已全部还原；
+3. 弹窗风格要统一 —— 管理行**复用现有 `.card`**、按钮复用 `ghost`/`danger`，
+   删掉我自造的 `.prow` 那套。
+
+同时修掉字体不统一（导入区块原先只有 `.hint` 12px，登录那边是 `h3` 13px ⇒ 各加 `h3`）。
+排序用**拖动**（HTML5 drag-and-drop）：❗只需手柄可拖、不是整行 ——
+整行可拖会让「启用/关闭」按钮几乎点不中（按下即开始拖动，click 不触发）；
+❗`dragover` 必须 `preventDefault`，否则 drop 静默不触发。
+
+**供应商开关 = 彻底关掉**（用户明确）：`/v1/models` 跳过它、路由回 403 `provider_disabled`。
+⚠️ 判据读**服务端**设置（DO storage），不是 localStorage（后者只在面板生效、API 照样能调）；
+⚠️ 读设置失败一律按「没关」处理（不能把偏好读取失败放大成全面 403）；
+⚠️ **排序不改默认供应商**（仍由注册表第 0 项决定），避免悄悄改既有请求的路由。
+
+**账号级停用**（`/admin/accounts/toggle` + `setAccountDisabled`）：
+⚠️ 启用时**同时清掉冷却/熔断**，否则号虽 `disabled=false` 但**仍选不到**，
+表现为「启用了却没用」——本项目反复踩到的「状态看着对、行为不对」型缺陷。
+
+#### ⑤ 顺带修复的构建环境缺陷
+
+`@cloudflare/workerd-linux-arm64` 的**二进制文件缺失**（只剩 `package.json` 与
+`README.md`），导致 `wrangler` 一启动就崩、**完全无法部署**。
+从 npm registry 直接拉 tarball 并放入 `bin/workerd` 后恢复。
+
+⚠️ 另记录一条部署环境事实：本沙箱到 `api.cloudflare.com` 的**上传速度仅 ~89 KB/s**，
+而产物 gzip 后 368 KiB ⇒ 部署经常在 undici 的 10s connect 超时上失败。
+**必须**用重试循环（实测 1–4 次内总有一次成功），不要以为是自己代码的问题。
+
 ### 9.2 第 1 步：出口 IP / WAF 前置验证（✅ 通过）
 
 **为什么必须先做**：Go 参考实现在 `internal/server/wafip.go` 记录了真实的 IP 级拦截 ——
