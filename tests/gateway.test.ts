@@ -1301,3 +1301,35 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   assert.ok(!('X-Conversation-Request-ID' in dom), '⚠️ 不得发 X-Conversation-Request-ID')
   assert.equal(dom['Authorization'], 'Bearer tok', '只保留 Authorization')
 })
+
+test('🔴 鉴权失败判据必须认 `invalid access token`（正则跨度写窄会导致续期静默失效）', () => {
+  // ## 实测缺陷（这是 minimax「用几分钟就永久 401」的真正根因）
+  //
+  // 原判据是 `invalid.?token` —— `.?` 只允许**一个**字符，
+  // 而 minimax 的真实报错是 `invalid access token`（中间隔了 `access`，
+  // 6 个字符）⇒ **匹配失败** ⇒ 续期分支根本不进 ⇒ 「永远是 401」。
+  //
+  // ⚠️ 症状是「续期**静默**不触发」（不报错），故必须用单测钉死。
+  // ⚠️ 我当时的第一版修复（加宽跨度）**又把 `invalid_token` 弄坏了** ——
+  // 因为 `\W` 不匹配下划线。这里把两种分隔符都覆盖住。
+  for (const detail of [
+    'MiniMax 对话失败（http=401）：invalid access token', // ← 真实报错原文
+    'invalid_token',
+    'invalid-token',
+    'invalid token',
+    'Invalid access token',
+    'the token has expired',
+    'token has expired',
+  ]) {
+    assert.equal(isAuthLikeFailure(0, detail), true, `应判为鉴权失败：${detail}`)
+  }
+  // ⚠️ 反向：**不能**放宽到 `invalid.*token` —— 那会误伤这类非鉴权错误，
+  // 让网关拿一个没坏的凭据去续期（无谓打上游）。
+  assert.equal(isAuthLikeFailure(0, 'invalid model, but the token is fine'), false,
+    '⚠️ 不能误判：这只是模型名非法，不是鉴权问题')
+  // 状态码通路仍然独立有效
+  assert.equal(isAuthLikeFailure(401, 'whatever'), true)
+  assert.equal(isAuthLikeFailure(403, 'whatever'), true)
+  // CodeArts 走 HTTP 400 + 业务码，必须靠**内容**判
+  assert.equal(isAuthLikeFailure(400, '{"error_code":"APIG.0602"}'), true)
+})

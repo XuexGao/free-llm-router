@@ -536,3 +536,77 @@ test('⚠️ 二维码容量：超长内容应抛错而不是产出扫不出来�
   // 实际文案：「二维码内容过长（500 字节，上限 213 字节），请缩短内容」
   assert.throws(() => renderQrSvg('x'.repeat(500)), /过长|上限|213/)
 })
+
+// ───── 续期缺失：同型缺陷第 2 次（实测「号用一会儿就废」） ─────
+
+test('🔴 minimax 必须挂上 refresh（否则 token 过期后账号永久 401）', () => {
+  // ## 实测缺陷
+  //
+  // 上线实测：minimax 起初能正常对话，**几分钟后**全部变成
+  // `http=401 invalid access token`，而账号状态看起来完全正常。
+  //
+  // 根因：该 provider **完全没有 `refresh` 方法**，而凭据里明明有
+  // `refresh_token`。网关按 `provider.refresh !== undefined` 决定要不要续期
+  //（`src/gateway/server.ts:934,1003`）—— 它是 `undefined` ⇒ 不续期、直接失败。
+  //
+  // ⚠️ 这是本项目第 2 次踩到「续期写好了却没人调」（第 1 次见
+  // `types.ts` 的说明）。故连单测一起补上，防第 3 次。
+  const src = readFileSync('src/providers/minimax.ts', 'utf8')
+  assert.ok(/^async function refresh\(/m.test(src), '应有 refresh 函数')
+  assert.ok(/^  refresh,$/m.test(src), '⚠️ 必须**挂到 provider 对象**上（只定义不挂 = 等于没有）')
+  // 端点与参数必须逐字对（client_id 错了上游回 invalid_client）
+  assert.ok(src.includes("'/oauth2/token'"), '端点应为 /oauth2/token')
+  assert.ok(src.includes("'mcode-public'"), 'client_id 必须是官方常量 mcode-public')
+  assert.ok(src.includes("grant_type: 'refresh_token'"), '必须是 refresh_token grant')
+  assert.ok(src.includes("'agent.default'"), 'scope 必须是 agent.default')
+  assert.ok(src.includes("'agent-backend'"), 'audience 必须是 agent-backend')
+  // ⚠️ 新 refresh_token 缺失时必须**保留旧值**，否则「本次成功」变「下次永远失败」
+  assert.ok(/nextRefreshRaw !== undefined && nextRefreshRaw\.length > 0[\s\S]{0,80}: credential\.refreshToken/.test(src),
+    '⚠️ 新 refresh_token 为空时必须保留旧值')
+  // ⚠️ 终态文案必须含「重新登录」（调用方按该子串判定不该重试）
+  assert.ok(/请重新登录/.test(src), '终态文案要含「重新登录」')
+})
+
+test('🔴 lobsterai 必须挂上 refresh（同型缺陷）', () => {
+  const src = readFileSync('src/providers/lobsterai.ts', 'utf8')
+  assert.ok(/^async function refresh\(/m.test(src), '应有 refresh 函数')
+  assert.ok(/^  refresh,$/m.test(src), '⚠️ 必须挂到 provider 对象上')
+  assert.ok(src.includes("'/api/auth/refresh'"), '端点应为 /api/auth/refresh')
+  // ⚠️ 续期**不带 Authorization**（参考实现同款）：带过期 Bearer 只会多一个被拒理由
+  const i = src.indexOf('async function refresh(')
+  // ⚠️ 窗口要够宽 —— 函数含大段「为什么」注释，3000 字符会截在说明里
+  //（我第一版就是 3000，导致「必须保留旧 extras」误报失败）。
+  const block = src.slice(i, i + 6000)
+  assert.ok(!/headers:\s*\{[^}]*Authorization/.test(block), '⚠️ 续期不得带 Authorization')
+  // ⚠️ keyfrom 必须用凭据里的**存储值**，不取当前时刻（对齐 Go 的 KeyfromBody）
+  assert.ok(/firstKeyfrom: credential\.extras\['first_keyfrom'\]/.test(block),
+    '⚠️ firstKeyfrom 要用存储值')
+  assert.ok(/latestKeyfrom: credential\.extras\['latest_keyfrom'\]/.test(block),
+    '⚠️ latestKeyfrom 要用存储值（Go 从不更新它）')
+  // ⚠️ extras 要合并保留（丢了 keyfrom ⇒ 下次续期永远失败）
+  assert.ok(/extras: \{ \.\.\.credential\.extras, \.\.\.next\.extras \}/.test(block),
+    '⚠️ 必须保留旧 extras')
+})
+
+test('⚠️ zcode / opencode / loomy 如实不提供 refresh（上游确实没有续期端点）', () => {
+  // ⚠️ 这三家是**诚实声明**，不是遗漏 —— 与上面两家（真缺陷）性质不同。
+  // 别为了「统一」硬加一个假续期（那会是不实承诺，UI 会显示「可自动续期」）。
+  //
+  // 依据（读了参考实现）：
+  // · zcode 「凭据是静态的，没有 refresh 端点」（`zcode-auth.ts:1765`）；
+  // · opencode 匿名通道凭据是字面量 `'public'`，**无凭据可续期**
+  //   （`opencode-auth.ts:175` 显式 `refreshable: false`）；
+  // · loomy 服务端**没有任何 refresh 端点**（`loomy-auth.ts:11`
+  //   `isLoomyRefreshable()` 恒 false）。
+  for (const [name, why] of [
+    ['zcode', '凭据静态/无 refresh 端点'],
+    ['opencode', '匿名通道无凭据可续期'],
+    ['loomy', '服务端无 refresh 端点'],
+  ] as const) {
+    const src = readFileSync(`src/providers/${name}.ts`, 'utf8')
+    assert.ok(!/^  refresh,$/m.test(src), `${name} 不应挂 refresh（${why}）`)
+  }
+  // 且 zcode 要**明说**不可续期（否则后人会以为是漏了）
+  const zcode = readFileSync('src/providers/zcode.ts', 'utf8')
+  assert.ok(/不可续期/.test(zcode), 'zcode 必须显式说明「不可续期」')
+})

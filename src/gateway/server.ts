@@ -1215,7 +1215,24 @@ export async function describeNoAccount(
 export function isAuthLikeFailure(status: number, detail: string): boolean {
   // 状态码：401/403 是标准鉴权失败；400 也可能（CodeArts 就是这样）
   if (status === 401 || status === 403) return true
-  return /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|42400/i.test(
+  // ⚠️ 除了状态码，**内容**也要判（CodeArts 的 `APIG.0602` 走 HTTP 400）。
+  //
+  // ## 🔴 实测缺陷：`invalid.?token` 漏掉了 `invalid access token`
+  //
+  // 原判据是 `invalid.?token` —— `.?` 只允许**一个**字符，
+  // 而 minimax 的真实报错是 `invalid access token`（中间隔了 `access`，6 个字符）
+  // ⇒ **匹配失败** ⇒ 续期分支根本不进 ⇒ 表现为
+  // 「这个号用几分钟就 401，然后永远是 401」。
+  //
+  // 修法：改用 `invalid[\W_]+(?:\w+[\W_]+){0,2}?token` —— 允许中间夹最多两个词
+  //（覆盖 `invalid access token` / `invalid api key token` 这类），
+  // 同时**不放宽到任意长度**（`invalid.*token` 会误伤
+  // 「invalid model, but the token is fine」这类非鉴权错误）。
+  //
+  // ⚠️ 教训：用正则匹配**英文短语**时，`.` 与 `.?` 的跨度极易写窄，
+  // 而症状是「续期静默不触发」（不是报错）。故这里同时给
+  // 「状态码」与「关键字」两条独立通路，任一条命中即可。
+  return /auth_error|unauthor|forbidden|invalid[\W_]+(?:\w+[\W_]+){0,2}?token|token[\W_]+(?:\w+[\W_]+){0,2}?expir|expired|200003|APIG\.0602|42400/i.test(
     detail,
   )
 }

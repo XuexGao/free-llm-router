@@ -48,6 +48,13 @@ import {
 
 /** 上游 API 基址（`lobsterai-product.ts:63`，与 `sigin.py:10` 一致）。 */
 export const LOBSTERAI_API_BASE = 'https://lobsterai-server.youdao.com'
+
+/**
+ * 续期路径（`POST /api/auth/refresh`，**不带 Authorization**）。
+ *
+ * 依据：参考实现 `src/lobsterai.ts:34` / `lobsterai-auth.ts:524`。
+ */
+export const LOBSTERAI_REFRESH_PATH = '/api/auth/refresh'
 /** 对话端点（`lobsterai.ts:45`，OpenAI 兼容、**仅 SSE**）。 */
 export const LOBSTERAI_CHAT_PATH = '/api/proxy/v1/chat/completions'
 /** 可用模型端点（`lobsterai.ts:36`）。 */
@@ -668,6 +675,128 @@ async function requestJson(
  * 明细在 `creditItems[]`：`creditsRemaining` 是剩余量，`label` 才是人看的包名
  * （`type` 是机器分类码 `campaign`）。
  */
+/**
+ * 用 `refresh_token` 续期。
+ *
+ * ## 🔴 为什么必须有它（同型缺陷第 2 次）
+ *
+ * 上线实测：`lobsterai` 的凭据**带 `refresh_token`**，但 provider 上
+ * **没有挂 `refresh` 方法** ⇒ 网关在 401 时按
+ * `provider.refresh !== undefined` 决定要不要续期 —— 它是 `undefined`，
+ * 于是**不续期、直接失败**。表现为「这个号用一会儿就废了」，
+ * 而账号状态看起来完全正常。
+ *
+ * ⚠️ 这与 minimax 那次是**同一个缺陷**（见 `types.ts:186-193` 记录的第 1 次
+ * 与 minimax `refresh` 的注释）。故两处都补了单测。
+ *
+ * ## 请求形状（逐项取自参考实现）
+ *
+ * - 端点 `POST https://lobsterai-server.youdao.com/api/auth/refresh`
+ *   （`lobsterai.ts:34`、`lobsterai-auth.ts:524`）；
+ * - ⚠️ **不带 `Authorization`** —— 续期只认 body 里的 `refreshToken`。
+ *   带一个过期 Bearer 只会给上游制造额外的拒绝理由；
+ * - 体 = keyfrom 载荷 + `refreshToken`（`lobsterai.ts:333-341`）：
+ *   `firstKeyfrom` / `latestKeyfrom` / `version`，外加 `uuid` / `userId`（有才发）。
+ *
+ * ⚠️ `firstKeyfrom` 与 `latestKeyfrom` 用**凭据里存储的原值**，**不取当前时刻** ——
+ * 严格对齐 Go 的 `KeyfromBody()`（`auth.go:37-50`）：它读的就是
+ * `a.LatestKeyfrom`，而 `RefreshToken`（`client.go:137-145`）**从不更新该字段**。
+ * 发当前时刻会让「同一份凭据每次续期体都不同」，而上游可能按它判重。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  if (refreshToken === '') {
+    // ⚠️ 文案必须含连续的「重新登录」四个字：调用方按该子串判定**终态**。
+    throw new ProviderError({
+      provider: 'lobsterai',
+      message: 'LobsterAI 凭据缺少 refresh_token，无法自动续期，请重新登录（或重新导出凭据）',
+    })
+  }
+
+  const clientVersion = await resolveClientVersion(signal)
+  // ⚠️ 缺 keyfrom 会让上游认不出这是哪个客户端 —— 但**不阻断**续期：
+  // 有的凭据本就不带（老版本导出），发空串让它按自己的规则判。
+  const body: Record<string, unknown> = {
+    firstKeyfrom: credential.extras['first_keyfrom'] ?? '',
+    latestKeyfrom: credential.extras['latest_keyfrom'] ?? '',
+    version: clientVersion,
+    refreshToken,
+  }
+  const uuid = credential.extras['uuid'] ?? ''
+  if (uuid !== '') body.uuid = uuid
+  const userId = credential.extras['user_id'] ?? ''
+  if (userId !== '') body.userId = userId
+
+  let res: Response
+  try {
+    res = await fetch(`${LOBSTERAI_API_BASE}${LOBSTERAI_REFRESH_PATH}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': LOBSTERAI_USER_AGENT,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    // ⚠️ 传输层失败**不能**判为终态 —— 网络抖动不该让用户重新登录。
+    throw new ProviderError({
+      provider: 'lobsterai',
+      retryable: true,
+      message: `LobsterAI 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text) as unknown
+  } catch {
+    throw new ProviderError({
+      provider: 'lobsterai',
+      httpStatus: res.status,
+      message: `LobsterAI 续期响应不是 JSON（HTTP ${res.status}）：${text.slice(0, 160)}`,
+    })
+  }
+
+  // ⚠️ 判据：401/403 = 会话死亡 ⇒ **终态**（重试无意义，必须重新登录）。
+  // 其余失败按可重试处理（瞬时 5xx 被包成业务码的情形很常见）。
+  if (!res.ok) {
+    const terminal = res.status === 401 || res.status === 403
+    throw new ProviderError({
+      provider: 'lobsterai',
+      httpStatus: res.status,
+      retryable: !terminal,
+      message: terminal
+        ? `LobsterAI 登录态已失效（HTTP ${res.status}），请重新登录`
+        : `LobsterAI 续期失败（HTTP ${res.status}）：${text.slice(0, 160)}`,
+    })
+  }
+
+  // 复用既有解析器：它与导入路径共用一套字段口径，避免两处漂移。
+  const next = parseCredential(parsed)
+  if (next === undefined || next.accessToken === '') {
+    // 拿到 2xx 却没有令牌 = **无法续期**（需重新登录），不是可重试的瞬时故障。
+    throw new ProviderError({
+      provider: 'lobsterai',
+      message: 'LobsterAI 续期响应缺少 access_token，请重新登录',
+    })
+  }
+
+  // ⚠️ 保留旧凭据里解析器没回填的字段（尤其 extras 的 keyfrom / uuid）——
+  // 丢了它们会让「本次续期成功」变成「下次续期永远失败」。
+  return {
+    ...credential,
+    accessToken: next.accessToken,
+    // ⚠️ 新 refresh_token 缺失/为空时**保留旧值**（最容易踩的坑）。
+    refreshToken: next.refreshToken !== '' ? next.refreshToken : credential.refreshToken,
+    expiresAt: next.expiresAt > 0 ? next.expiresAt : credential.expiresAt,
+    nickname: next.nickname !== '' ? next.nickname : credential.nickname,
+    extras: { ...credential.extras, ...next.extras },
+  }
+}
+
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const result = await requestJson(
     `${LOBSTERAI_API_BASE}${LOBSTERAI_PROFILE_SUMMARY_PATH}`,
@@ -918,6 +1047,7 @@ export const lobsteraiProvider: Provider = {
   chat,
   balance,
   checkin,
+  refresh,
   /**
    * 换号判据：429 / 402 值得换号；**401/403 也值得换号** ——
    * LobsterAI 的 access_token 是 JWT，过期或失效时回 401，而账号池里另一个

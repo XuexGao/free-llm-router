@@ -66,6 +66,9 @@ import {
 /** 供应商 id（注册表键、`provider/model` 前缀）。 */
 const ID = 'minimax'
 
+/** 单次续期超时（对齐参考实现 `MINIMAX_OAUTH_TIMEOUT_MS`）。 */
+const MINIMAX_REFRESH_TIMEOUT_MS = 30_000
+
 /** API 主机（目录 / 签到 / 积分 / 推理都挂它下面）。 */
 const API_HOST = 'https://agent.minimax.cn'
 
@@ -1523,6 +1526,125 @@ async function requestEnvelope(
  * **字符串**（`"800.00"`），故用宽容解析。`details` 缺失 ⇒ **0**（真的为 0），
  * 与「查询失败」（抛错）是**两回事**，不要合并。
  */
+/**
+ * 用 `refresh_token` 续期（OAuth `refresh_token` grant）。
+ *
+ * ## 🔴 为什么必须有它（实测缺陷）
+ *
+ * 上线实测：minimax 起初能正常对话，**几分钟后**所有请求变成
+ * `http=401 invalid access token`，而账号状态看起来完全正常。
+ *
+ * 根因：**该 provider 此前完全没有 `refresh` 方法**。
+ * 而 `ProviderCredential.refreshToken` 明明有值（导入的凭据里带着）。
+ * ⇒ 网关 `isAuthLikeFailure()` 判定 401 后，按
+ * `provider.refresh !== undefined` 决定要不要续期 —— 它是 `undefined`，
+ * 于是**不续期、直接失败**。表现为「这个号用一会儿就废了」。
+ *
+ * ⚠️ 这是本项目第 2 次踩到「续期写好了却没人调」的同型缺陷
+ *（见 `types.ts:186-193` 记录的第 1 次）。故这次连**单测**一起补上。
+ *
+ * ## 请求形状（逐项取自参考实现）
+ *
+ * - 端点 `POST https://account.minimax.cn/oauth2/token`
+ *   （`minimax-oauth.ts:309`）；
+ * - `Content-Type: application/x-www-form-urlencoded`（**不是 JSON**）；
+ * - 体：`grant_type=refresh_token` + `refresh_token` + `client_id`
+ *   + `scope` + `audience`（`minimax-oauth.ts:99-110`）。
+ *
+ * ⚠️ 四个常量必须**逐字一致**：`client_id` 是官方客户端硬编码值，
+ * 换一个上游回 `invalid_client`；`scope` / `audience` 同理。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const refreshToken = credential.refreshToken.trim()
+  if (refreshToken === '') {
+    // ⚠️ 文案必须含连续的「重新登录」四个字：调用方按该子串判定**终态**
+    //（不该重试、该让用户重新登录）。
+    throw new ProviderError({
+      provider: ID,
+      message: 'MiniMax 凭据缺少 refresh_token，无法自动续期，请重新登录（或重新导出凭据）',
+    })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${ACCOUNT_HOST}${TOKEN_PATH}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: MINIMAX_CLIENT_ID,
+        scope: MINIMAX_SCOPE,
+        audience: MINIMAX_AUDIENCE,
+      }).toString(),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(MINIMAX_REFRESH_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    // ⚠️ 传输层失败**不能**判为终态 —— 网络抖动不该让用户重新登录。
+    throw new ProviderError({
+      provider: ID,
+      retryable: true,
+      message: `MiniMax 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await res.text().catch(() => '')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text) as unknown
+  } catch {
+    parsed = undefined
+  }
+
+  if (!res.ok) {
+    const record = asRecord(parsed) ?? {}
+    const code = readString(record, ['error', 'error_code']) ?? `HTTP ${res.status}`
+    // `invalid_grant` = refresh_token 本身失效 ⇒ **终态**（重试无意义）
+    const terminal = code.includes('invalid_grant') || res.status === 400 || res.status === 401
+    throw new ProviderError({
+      provider: ID,
+      httpStatus: res.status,
+      retryable: !terminal,
+      message: terminal
+        ? `MiniMax 的 refresh_token 已失效（${code}），请重新登录`
+        : `MiniMax 续期失败（${code}）`,
+    })
+  }
+
+  const record = asRecord(parsed) ?? {}
+  const accessToken = readString(record, ['access_token', 'accessToken'])
+  if (accessToken === undefined || accessToken === '') {
+    // 拿到 2xx 却没有令牌 = **无法续期**（需重新登录），而不是可重试的瞬时故障。
+    throw new ProviderError({
+      provider: ID,
+      message: 'MiniMax 续期响应缺少 access_token，请重新登录',
+    })
+  }
+
+  // ⚠️ 新 refresh_token 缺失/为空时**保留旧值** —— 最容易踩的坑：
+  // 丢掉它会让「本次续期成功」变成「下次续期永远失败」。
+  const nextRefreshRaw = readString(record, ['refresh_token', 'refreshToken'])
+  const nextRefresh = nextRefreshRaw !== undefined && nextRefreshRaw.length > 0
+    ? nextRefreshRaw
+    : credential.refreshToken
+
+  // 过期时间：`expires_in`（秒）→ 绝对毫秒。缺了就**保留旧值**（绝不编造）。
+  const expiresIn = readNumber(record, ['expires_in', 'expiresIn'])
+  const expiresAt = expiresIn !== undefined && expiresIn > 0
+    ? Date.now() + expiresIn * 1000
+    : credential.expiresAt
+
+  return {
+    ...credential,
+    accessToken,
+    refreshToken: nextRefresh,
+    expiresAt,
+  }
+}
+
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const token = accessTokenOf(credential)
   const result = await requestEnvelope(`${API_HOST}${CREDIT_DETAILS_PATH}`, token, { method: 'GET' }, signal)
@@ -1681,6 +1803,7 @@ export const minimaxProvider: Provider = {
   chat,
   balance,
   checkin,
+  refresh,
   /**
    * 该失败是否值得**换号重试**。
    *
