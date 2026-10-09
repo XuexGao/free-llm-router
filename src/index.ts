@@ -61,6 +61,7 @@ import type { AccountState } from './pool/state.js'
 import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
+import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions } from './gateway/server.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
@@ -2648,6 +2649,20 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
+    return result.response
+  }
+
+  // ── OpenAI **Responses API**（新一代客户端：Codex CLI 等） ──
+  //
+  // ⚠️ **与 `/v1/chat/completions` 并存**，不做「格式开关」：
+  // 客户端用哪套协议由它自己请求的 URL 决定。做成互斥开关只会让
+  // 「另一个协议的客户端在切换后突然失效」，而网关这边没有任何互斥的理由 ——
+  // 两者共用同一份 provider 路由、账号池与图片入站。
+  // 依据：参考实现 `openai-gateway/responses.ts:12-16`。
+  if (path === '/v1/responses' && request.method === 'POST') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const result = await handleResponses(request, env, realm, ctx)
+    // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
     return result.response
   }
 
