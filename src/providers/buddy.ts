@@ -31,7 +31,7 @@
  */
 
 import { type Env } from '../env.js'
-import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
+import { cliChatHeaders, deriveDeviceId, randomHex32, referenceChatHeaders } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
@@ -306,15 +306,20 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
       // X-Conversation-Request-ID…），**在国际版端点上不被认可**。
       //
       // 唯一保留的额外头是 `Authorization`（参考实现也发）。
-      headers: referenceChatHeaders({
+      headers: cliChatHeaders({
         uid: credential.uid,
         accessToken: credential.accessToken,
         variant: config.id,
+        sessionId:sessionId,
+        conversationId:randomHex32(),
+        conversationRequestId:randomHex32(),
+        machineId:machineId
       }),
       body,
       signal: request.signal,
     })
   }
+  
 
   async function balance(credential: ProviderCredential): Promise<ProviderBalance> {
     // ⚠️ `fetchBalance` 内部按 `env` 决定域，国际版需临时覆盖。
