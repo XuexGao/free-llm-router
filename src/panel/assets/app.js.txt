@@ -2073,7 +2073,11 @@ function renderModalAdd() {
 
   const ta = document.createElement('textarea')
   ta.id = 'modal-import-body'; ta.rows = 6
-  ta.placeholder = '{"accessToken":"...","uid":"..."}'
+  let taPlaceholder = '{"accessToken":"...","uid":"..."}'
+  if(modalProviderId === "opencode"){
+    taPlaceholder = '{"api_key":"oc_sk_xxxxx"}'
+  }
+  ta.placeholder = taPlaceholder
   // ⚠️ 必须给可访问名：这个 textarea **没有 `<label>`**（它由 JS 动态插进弹窗，
   // 没有稳定的 HTML 位置可挂 label）。没有 `aria-label` 时屏幕阅读器
   // 只会念「编辑框」，用户不知道要粘什么进去（实测可访问性扫描报出此项）。
