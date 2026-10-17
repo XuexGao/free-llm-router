@@ -85,18 +85,48 @@ openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY
 
 ## 绑定 GitHub 自动部署（可选）
 
-Dashboard → Workers & Pages → `workbuddy-gateway` → **Settings** → **Build** →
+Dashboard → Workers & Pages → `free-llm-router` → **Settings** → **Build** →
 Connect to Git → 选 `XuexGao/free-llm-router`。
 
-> ⚠️ 仓库已从 `workbuddy-serverless` 改名为 `free-llm-router`（GitHub 会自动重定向旧地址，
-> 但**建议改成新名** —— 否则 Dashboard 里可能一直显示旧名）。
->
-> ⚠️ **Worker 名仍是 `workbuddy-gateway`，不要改** —— 它是 Worker 在 Cloudflare 上的
-> 身份，而 Durable Object 存储**按 Worker 隔离**。改名等于部署新 Worker，
-> 账号池里的全部账号会读不到。详见 `wrangler.jsonc` 开头的说明。
+> ⚠️ **Worker 名是 `free-llm-router`，必须与 `wrangler.jsonc` 的 `name` 一致** ——
+> 它是 Worker 在 Cloudflare 上的身份，而 Durable Object 存储**按 Worker 隔离**。
+> 在这里改名的后果见 `wrangler.jsonc` 开头的说明（**会新建一个空 Worker，
+> 账号池里的全部账号读不到**）。改名请在网页端做，然后同步那一行。
 
-- Build command：`npm install`
+- Build command：`npm ci`（**不要用 `npm install`**，理由见下）
 - Deploy command：`npx wrangler deploy`
+
+### ⚠️ 构建环境用 `npm ci` —— 一次真实的构建失败（2026-10-17）
+
+Cloudflare 的构建默认执行 `npm clean-install`（即 `npm ci`），
+它在 **npm 10.9.2** 下会做**严格的 peer 依赖校验**：
+
+```
+npm error code ERESOLVE
+npm error While resolving: wrangler@4.147.0
+npm error Found: @cloudflare/workers-types@4.20260702.1
+npm error Could not resolve dependency:
+npm error peerOptional @cloudflare/workers-types@"^5.20261001.1" from wrangler@4.147.0
+npm error Conflicting peer dependency: @cloudflare/workers-types@5.20261016.1
+```
+
+**根因**：`wrangler@4.147.0` 把 `@cloudflare/workers-types` 的 peer 要求提到了
+**主版本 `^5`**，而项目当时锁的是 `^4` ⇒ **主版本不相容**。
+
+⚠️⚠️ **两个值得记住的点**：
+
+1. **它标着 `peerOptional`，但 `npm ci` 照样报错** ——
+   「optional」不等于「不校验」。我一度因为看到 `optional: true` 而以为无关。
+2. **本地 `npm ci` 通过，Cloudflare 却失败** —— 本地是 **npm 11**（行为更宽松），
+   Cloudflare 是 **npm 10.9.2**。
+   ⇒ **验证构建问题的唯一可靠办法是用同款 npm 版本复现**：
+   ```bash
+   npx -y npm@10.9.2 ci        # 与 Cloudflare 构建环境一致
+   ```
+
+**修法**：把 `@cloudflare/workers-types` 升到 `^5`（`wrangler` 要求的主版本）。
+升级后 typecheck 0 错误、单测全过 —— 说明 v5 对本项目**无破坏性变更**
+（它只经 `tsconfig.json` 的 `types` 数组全局引入，代码里没有直接 import）。
 
 ⚠️ **secret 不会随 Git 部署带入**，需在 **Settings → Variables and Secrets** 手工加。
 
