@@ -27,7 +27,7 @@
 import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
-import { prepareChatBody, sanitizeChatBody } from './payload.js'
+import { prepareChatBody, requestHasImage, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
@@ -1734,9 +1734,37 @@ async function handleAggregateChat(input: {
     }
   }
 
+  // ## 🔴 带图请求只发给**支持图片**的渠道
+  //
+  // 用户报「为什么自动 DeepSeek 模型不支持图像识别」。根因两层：
+  //   ① 聚合目录此前不发 `supportsImage` ⇒ 客户端默认不支持（已修）；
+  //   ② 即使发了，`codearts` 的 DeepSeek **确实不支持图片** ——
+  //      若按「全部候选都支持」的保守口径，整个规范名仍是不支持。
+  //
+  // ⚠️ 把口径放松成「任一支持」是**错的**：聚合随机挑渠道，带图请求有概率
+  // 落到不支持的那家并被上游拒绝 ⇒ **随机失败**比明确不支持更糟。
+  //
+  // ⇒ 正确做法在这里**按请求实际内容**过滤候选：
+  //   带图 ⇒ 只留 `supportsImage` 的；纯文本 ⇒ 不过滤（全部都能处理）。
+  //   这样目录能如实报「支持」（确实有渠道能处理），且不会随机失败。
+  const hasImage = requestHasImage(rawBody)
+  const routed = hasImage ? filtered.filter((c) => c.supportsImage === true) : filtered
+  if (hasImage && routed.length === 0) {
+    // ⚠️ 如实说清「为什么不给用」，而不是笼统报「没有候选」——
+    // 用户的下一步动作不同（换模型 vs 重新登录）。
+    return {
+      response: jsonError(
+        400,
+        `聚合模型「${model}」的所有候选渠道都不支持图片输入。`
+          + '请改用明确支持图片的渠道（如 `trae/` 或 `loomy/` 前缀的模型）。',
+        'image_not_supported',
+      ),
+    }
+  }
+
   // 探测到期时刻并做临期优先排序。
-  const expiry = await probeExpiries(env, realm, filtered, request.signal)
-  const ranked = rankCandidates(filtered, (c) => expiry.get(`${c.provider}\u0000${c.realId}`) ?? EXPIRY_UNUSABLE)
+  const expiry = await probeExpiries(env, realm, routed, request.signal)
+  const ranked = rankCandidates(routed, (c) => expiry.get(`${c.provider}\u0000${c.realId}`) ?? EXPIRY_UNUSABLE)
 
   if (ranked.length === 0) {
     // ⚠️ 如实区分「查不到额度」与「没有候选」—— 用户的下一步动作不同。

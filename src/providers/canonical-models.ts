@@ -105,11 +105,37 @@ export const EXCLUDED_ALIASES: ReadonlySet<string> = new Set([
  * 普通字面量对 `constructor` 会返回 `Object` 构造函数。
  *
  * 目前只有一条：lobsterai 的 `deepseek-flash` 实际就是 `deepseek-v4-1-flash`。
- * ⚠️ qoder 的 `dfmodel` 与 `qfmodel` **故意不登记** —— 无法确证它们对应哪个
- * 真实模型，猜错会让用户拿到一个他没选的模型。
+ * ⚠️ qoder 的 `qfmodel`（Qwen3.8-Flash）**不登记** —— 它的展示名与 V4 系列无关，
+ * 登记只会把两个不同厂商的模型混在一起。
+ *
+ * ⚠️ qoder 的 `dfmodel` 现在**登记**了（用户明确要求「所有 DeepSeek-Flash 都归类
+ * 为 DeepSeek-V4.1-Flash」，而它的展示名**正是** `DeepSeek-Flash`）。
+ * 诚实记录一个限制：我用真实对话问过它的底层模型，它只答自己是「Qoder」
+ *（产品名，不是模型名），**无法用对话验证它究竟是不是 V4.1-Flash**。
+ * ⇒ 这条映射的依据是**用户的要求 + 展示名**，不是我的推断。
  */
 export const CANONICAL_OVERRIDES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   lobsterai: { 'deepseek-flash': 'deepseek-v4-1-flash' },
+
+  // ## 用户要求：所有 DeepSeek 的 Flash 变体都归到 `DeepSeek-V4.1-Flash`
+  //
+  // ⚠️ 补丁的键用的是**原始的 `realId`**（`canonicalKeyFor` 先查补丁、后归一化），
+  // 故这里写原始 id，不是 `normalizeModelKey` 处理后的形态。
+  //
+  // | 渠道 | 原始 realId | 不经补丁会得到的键 | 原因 |
+  // |---|---|---|---|
+  // | raccoon | `sn-deepseek-v4-1-flash-1017` | `deepseek-v4-1-flash-1017` | 末尾 `-1017` 是**渠道版本号**，字面推导救不回来 |
+  raccoon: {
+    'sn-deepseek-v4-1-flash-1017': 'deepseek-v4-1-flash',
+    // ⚠️ 同时登记去掉 `sn-` 的形态：`normalizeModelKey` 会剥 `sn-`，
+    // 而补丁查的是**原值**，两种写法在目录里都见过。
+    'deepseek-v4-1-flash-1017': 'deepseek-v4-1-flash',
+  },
+
+  // qoder 走 `name` 通道（见 `PRIMARY_CHANNEL`），故键是**原始 realId** `dfmodel`
+  // （补丁在归一化之前查）。它的展示名 `DeepSeek-Flash` 归一后是 `deepseek-flash`，
+  // 与 `deepseek-v4-1-flash` 是两个键 ⇒ 必须在这里并掉。
+  qoder: { dfmodel: 'deepseek-v4-1-flash' },
 }
 
 /**

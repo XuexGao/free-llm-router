@@ -3438,6 +3438,19 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         priceFactor: cheapestOf(
           virtuals.flatMap((v) => v.candidates),
         ),
+        // ## 🔴 自动模型必须暴露图片能力（用户报「自动 DeepSeek 不支持图像识别」）
+        //
+        // ⚠️ 根因是**我们没往外发这个字段**，不是能力缺失：
+        // 聚合条目此前只有 id/name/price，客户端读不到 `supportsImage`
+        // 就按 OpenAI 惯例默认「不支持」⇒ 面板和客户端都显示不能传图。
+        // 而底层渠道（实测 trae / qoder 的 DeepSeek）**是支持的**。
+        //
+        // ⚠️ `auto` 越多个规范名，口径越保守（`every`）——
+        // 与 `imageCapableOf` 不同：后者是「同一规范名的多个渠道」，
+        // 而 auto 是「**跨规范名**」，候选池大得多，放松会更容易踩到不支持的。
+        // 路由侧仍会按实际请求再过滤一次（见 `requestHasImage`），故这里是双保险。
+        supportsImage: virtuals.length > 0
+          && virtuals.every((v) => v.supportsImage),
         providerName: '聚合（跨渠道）',
         realm: '*',
       })
@@ -3449,6 +3462,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
           name: v.name || v.key,
           priceFactor: cheapestOf(v.candidates),
+          // ⚠️ 用 `VirtualModel.supportsImage`（已按「全部候选都支持」的
+          // 保守口径算好），不要在这里再各算一遍 —— 两处判据分叉必然
+          // 出现「目录说支持、实际却随机失败」。
+          supportsImage: v.supportsImage,
           providerName: '聚合（跨渠道）',
           realm: '*',
         })

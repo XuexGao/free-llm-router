@@ -1619,3 +1619,87 @@ test('🔴 裸模型名别名：官方拼写应路由到聚合（用户要求）
   assert.ok(/rawModel\.includes\('\/'\)/.test(gw),
     '⚠️ 别名只对**裸名**生效（带前缀的显式指定不得被改写）')
 })
+
+test('🔴 所有 DeepSeek 变体必须归到 deepseek-v4-1-flash（用户要求）', () => {
+  // 用户原话：「把所有 DeepSeek-V4.1-flash 和 DeepSeek-Flash 都归类为
+  // DeepSeek-V4.1-Flash」。
+  //
+  // 实测（修复前）各渠道推导出的键：
+  //   qoder    dfmodel            → deepseek-flash            ❌ 没并
+  //   trae     deepseek-v4.1-flash→ deepseek-v4-1-flash      ✅
+  //   codearts deepseek-v4.1-flash→ deepseek-v4-1-flash      ✅
+  //   raccoon  sn-…-flash-1017    → deepseek-v4-1-flash-1017 ❌ 没并
+  const cm = readFileSync('src/providers/canonical-models.ts', 'utf8')
+  // ⚠️ 必须定位**声明**，不是任何一次提及：`indexOf('CANONICAL_OVERRIDES')`
+  // 命中的是文件头那句说明（第 496 行），窗口自然覆盖不到真正的补丁内容。
+  // ⇒ 用 `export const` 声明作为锚点（本项目已多次踩「锚点选错」的坑）。
+  const patchAt = cm.indexOf('export const CANONICAL_OVERRIDES')
+  assert.ok(patchAt > 0, '应能定位补丁声明')
+  const seg = cm.slice(patchAt, patchAt + 1800)
+
+  // raccoon 的 -1017 是**渠道版本号**，字面推导救不回来 ⇒ 必须显式补丁
+  assert.ok(/sn-deepseek-v4-1-flash-1017/.test(seg),
+    '⚠️ raccoon 的 -1017 变体必须显式归并')
+  // qoder 的 dfmodel 展示名正是 DeepSeek-Flash ⇒ 也必须并
+  assert.ok(/qoder:\s*\{\s*dfmodel:/.test(seg),
+    '⚠️ qoder 的 dfmodel（DeepSeek-Flash）必须归并')
+
+  // ⚠️ qfmodel（Qwen3.8-Flash）**不该**被并进来 —— 那是另一个厂商的模型
+  assert.ok(!/qfmodel:\s*'deepseek/i.test(seg),
+    '⚠️ qoder 的 qfmodel 是 Qwen，不得归到 DeepSeek')
+
+  // ⚠️ 补丁键必须是**原始 realId**（canonicalKeyFor 先查补丁、后归一化）
+  assert.ok(/dfmodel/.test(seg), '补丁键应是原始 id 形态')
+})
+
+test('🔴 聚合模型必须暴露 supportsImage（否则客户端默认不支持传图）', () => {
+  // 用户报「为什么自动 DeepSeek 模型不支持图像识别」。
+  //
+  // ⚠️ 根因：聚合条目此前**只发 id/name/price**，没有 `supportsImage`。
+  // 客户端按 OpenAI 惯例读不到该字段 ⇒ 默认「不支持」⇒ 面板显示不能传图。
+  // 而底层渠道（实测 trae / qoder 的 DeepSeek）**是 supportsImage: true 的**。
+  // ⇒ 是**我们没往外说**，不是能力缺失。
+  const agg = readFileSync('src/gateway/aggregate.ts', 'utf8')
+  const idx = readFileSync('src/index.ts', 'utf8')
+
+  // ① 候选要记录**上游真实能力**，不许推断
+  assert.ok(/supportsImage: m\.supportsImage === true/.test(agg),
+    '⚠️ 候选必须取上游真实能力位（不得按同族推断）')
+
+  // ② 汇总口径必须是「全部候选都支持」（否则带图请求会随机落到不支持的渠道）
+  assert.ok(/export function imageCapableOf/.test(agg), '应有 imageCapableOf')
+  // ⚠️ 目录用 `some`（任一渠道支持即可），但**必须**配路由侧过滤，
+  // 否则会变成「有时能用、有时失败」—— 两者成对，一起断言。
+  const fnAt = agg.indexOf('export function imageCapableOf')
+  const fnSeg = agg.slice(fnAt, fnAt + 900)
+  assert.ok(/some\(/.test(fnSeg), '⚠️ 目录口径应为 some（任一渠道支持即可）')
+  // ⚠️ 关键：路由侧必须按请求内容过滤，这条不成立时 some 就是错的。
+  // ⚠️ 要查 **server.ts** —— 聚合的选渠道逻辑在那里，不在 index.ts。
+  // （我第一版查了 index.ts，于是假失败：代码明明在，换个文件就找不到。）
+  const srv = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/requestHasImage\(rawBody\)/.test(srv),
+    '⚠️ 必须按请求实际内容判断是否带图')
+  assert.ok(/c\.supportsImage === true/.test(srv),
+    '⚠️ 带图请求必须只发给支持图片的候选（否则随机失败）')
+
+  // ③ /v1/models 的两个聚合分支都要真的发出去
+  assert.ok(/supportsImage: v\.supportsImage/.test(idx), '⚠️ 虚拟模型条目要发 supportsImage')
+  assert.ok(/supportsImage: virtuals\.length > 0/.test(idx), '⚠️ auto 条目也要发')
+})
+
+test('⚠️ requestHasImage：只认 content 数组里的 image_url 部件', () => {
+  // 路由侧要靠它决定「是否只发给支持图片的渠道」，判错的两个方向都危险：
+  //   · 漏判（有图却当无图）⇒ 带图请求落到 codearts 之类不支持的家 ⇒ 上游报错
+  //   · 误判（无图却当有图）⇒ 白白缩掉一半候选，纯文本请求反而更容易失败
+  const src = readFileSync('src/gateway/payload.ts', 'utf8')
+  const i = src.indexOf('export function requestHasImage')
+  assert.ok(i > 0)
+  const seg = src.slice(i)
+  // ⚠️ content 可能是**字符串**（纯文本）—— 不是数组，不该判为带图
+  assert.ok(seg.includes('Array.isArray(content)'),
+    '⚠️ 必须先确认 content 是数组（字符串形态不可能带图）')
+  assert.ok(/rec\.type === 'image_url'/.test(seg),
+    '⚠️ 部件判据是 type === image_url')
+  // ⚠️ 绝不按 URL 下载（本项目的 SSRF 红线）
+  assert.ok(!/fetch\(/.test(seg), '⚠️ 不得按 URL 下载图片')
+})

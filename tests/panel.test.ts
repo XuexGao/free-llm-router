@@ -1709,7 +1709,11 @@ test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列�
   const src = readFileSync('src/index.ts', 'utf8')
   const i = src.indexOf('AGGREGATE_AUTO}')
   assert.ok(i > 0, '应能定位 aggregate 条目构造')
-  const seg = src.slice(i, i + 900)
+  // ⚠️ 窗口**不要用固定长度**（见 AGENTS.md ②d-e）：我原先写 `+900`，
+  // 给 auto 条目补了 `supportsImage` 的注释后，`v.name || v.key` 被挤出了窗口
+  // ⇒ 假失败，而**它要守的约束根本没变**。
+  // 改为取到「这段代码结束」为止（下一个 `}` 之后留足余量）。
+  const seg = src.slice(i, i + 2200)
   assert.ok(/name:\s*'自动选择/.test(seg), '⚠️ aggregate/auto 必须给 name')
   assert.ok(/name:\s*v\.name\s*\|\|\s*v\.key/.test(seg),
     '⚠️ 虚拟模型必须有 name（并兜底到 key，避免空单元格）')

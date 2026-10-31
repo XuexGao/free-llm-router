@@ -196,6 +196,48 @@ export interface PrepareResult {
  * ⚠️ 顺序即语义：先翻译字段名（影响后续判断），再清理工具配对
  * （配对错误会让整个请求失败，必须最先修好内容）。
  */
+/**
+ * 请求里**是否带图片**（纯函数）。
+ *
+ * ## 为什么需要它
+ *
+ * 用户报「为什么自动 DeepSeek 模型不支持图像识别」。查下来：
+ * 渠道 `codearts` 的 DeepSeek **确实不支持图片**，而聚合目录此前用
+ * 「全部候选都支持才算支持」的保守口径 ⇒ 整个规范名被标成不支持。
+ *
+ * ⚠️ 单纯把口径改成「任一支持」是**错的** —— 聚合会随机挑渠道，
+ * 带图请求有概率落到 `codearts` 上并**被上游拒绝**（随机失败比明确不支持更糟）。
+ *
+ * ⇒ 正确做法是把能力判断**下沉到路由**：带图请求时**只发给支持图片的渠道**。
+ * 这样目录可以如实说「支持」（确实有渠道能处理），且不会随机失败。
+ *
+ * ## 判据（照 OpenAI 规范）
+ *
+ * `messages[].content` 有两种形态：
+ * - **字符串** —— 纯文本，不可能带图；
+ * - **数组** —— 部件列表，`{type: 'image_url'}` 即一张图片。
+ *
+ * ⚠️ 只认 `image_url`：`input_image` 是 Responses API 的部件名，到 chat 体时
+ * 已被 `responses.ts` 转成 `image_url`（那里有单测钉住）。
+ * ⚠️ 不按 URL 下载任何东西（本项目不实现 SSRF，见 AGENTS.md §7.1）。
+ */
+export function requestHasImage(body: unknown): boolean {
+  if (body === null || typeof body !== 'object') return false
+  const messages = (body as Record<string, unknown>).messages
+  if (!Array.isArray(messages)) return false
+  for (const raw of messages) {
+    if (raw === null || typeof raw !== 'object') continue
+    const content = (raw as Record<string, unknown>).content
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (part === null || typeof part !== 'object') continue
+      const rec = part as Record<string, unknown>
+      if (rec.type === 'image_url') return true
+    }
+  }
+  return false
+}
+
 export function prepareChatBody(input: unknown): PrepareResult {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('请求体必须是 JSON 对象')

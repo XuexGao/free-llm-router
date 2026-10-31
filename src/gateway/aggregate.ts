@@ -52,6 +52,15 @@ export interface AggregateCandidate {
   realName: string
   /** 价格倍率（越小越便宜；`Infinity` = 未知）。 */
   price: number
+  /**
+   * 该渠道**是否支持图片输入**（逐模型，来自上游的真实能力位）。
+   *
+   * ⚠️ 聚合目录必须把它暴露给客户端：不带这个字段时客户端默认「不支持」，
+   * 于是用户看到「自动 DeepSeek 不支持图像识别」—— 而实际上**底层渠道是支持的**
+   *（实测 trae 与 qoder 的 DeepSeek 都是 `supportsImage: true`）。
+   * 这是**我们自己没往外说**，不是能力缺失。
+   */
+  supportsImage: boolean
 }
 
 /** 一个虚拟模型（规范名 + 它在各渠道的候选）。 */
@@ -59,6 +68,15 @@ export interface VirtualModel {
   key: string
   name: string
   candidates: AggregateCandidate[]
+  /**
+   * 该规范名**是否能安全接图片**（聚合口径，见 `imageCapableOf`）。
+   *
+   * ⚠️ 与单个候选的 `supportsImage` **不是一个意思**：
+   * 聚合会在候选里**随机挑渠道**，只要有一个候选不支持图片，
+   * 带图请求就可能落到那个渠道上并被上游拒绝。
+   * ⇒ 这里取的是**保守值**（全部候选都支持才算支持）。
+   */
+  supportsImage: boolean
 }
 
 /** 某供应商的目录（构建虚拟模型的输入）。 */
@@ -126,6 +144,9 @@ export function buildVirtualModels(catalogs: readonly ProviderCatalog[]): Virtua
         realId: m.id,
         realName: name,
         price: priceFactorFromName(name),
+        // ⚠️ 直接取上游的 `ProviderModel.supportsImage`（逐模型、上游真实下发），
+        // 不做任何推断 —— 本项目已多次吃过「按同族推断能力」的亏。
+        supportsImage: m.supportsImage === true,
       })
       groups.set(hit.key, list)
     }
@@ -140,7 +161,12 @@ export function buildVirtualModels(catalogs: readonly ProviderCatalog[]): Virtua
     candidates.sort((a, b) => (a.provider === b.provider
       ? a.realId.localeCompare(b.realId)
       : a.provider.localeCompare(b.provider)))
-    out.push({ key, name: canonicalDisplayName(key), candidates })
+    out.push({
+      key,
+      name: canonicalDisplayName(key),
+      candidates,
+      supportsImage: imageCapableOf(candidates),
+    })
   }
   out.sort((a, b) => (b.candidates.length - a.candidates.length
     || a.key.localeCompare(b.key)))
@@ -184,6 +210,33 @@ export function rankCandidates(
     .filter((x) => x.expiry !== EXPIRY_UNUSABLE)
     .sort((a, b) => (a.expiry === b.expiry ? a.c.price - b.c.price : a.expiry - b.expiry))
     .map((x) => x.c)
+}
+
+/**
+ * 聚合口径的**图片能力**：**任一**候选支持即可（配合路由侧过滤）。
+ *
+ * ## ⚠️ 为什么是 `some` 而不是 `every`（这里我改过一次）
+ *
+ * 最初写的是 `every`（保守），理由是「聚合会在候选里挑渠道，只要有一个不支持，
+ * 带图请求就可能落到它上面并随机失败」。
+ *
+ * ⚠️ 但那样做的**实际后果**是：`codearts` 的 DeepSeek 不支持图片，
+ * 于是整个 `deepseek-v4-1-flash` 被标成「不支持」——
+ * **用户的需求完全没被解决**（他还是不能传图）。
+ *
+ * ⇒ 真正的解法是把能力判断**下沉到路由**（见 `server.ts` 里
+ * `requestHasImage` 那段）：带图请求**只发给支持图片的候选**。
+ * 这样：
+ * - 目录如实报 `true`（**确实有渠道能处理**带图请求）；
+ * - 带图请求**不会**落到不支持的渠道（不会随机失败）。
+ *
+ * ⚠️ 两者**必须成对**：若只改这里是 `some` 而不在路由侧过滤，
+ * 就会退回「有时能用、有时失败」—— 那正是我最初担心的形态。
+ * 单测同时钉住这两个条件。
+ */
+export function imageCapableOf(candidates: readonly AggregateCandidate[]): boolean {
+  if (candidates.length === 0) return false
+  return candidates.some((c) => c.supportsImage)
 }
 
 /**
