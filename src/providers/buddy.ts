@@ -31,7 +31,7 @@
  */
 
 import { type Env } from '../env.js'
-import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
+import { cliChatHeaders, deriveDeviceId, randomHex32 } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
@@ -298,18 +298,23 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
 
     return await fetch(`${bases.chat}/v2/chat/completions`, {
       method: 'POST',
-      // ⚠️ **chat 用参考实现口径的头**（11 个），不是 Go 侧那套。
+      // ⚠️ **chat 用 CLI 口径的头**（含会话头族），修复国际版 400 冷却问题。
       //
-      // 实测对比：用户「在 DSH 用参考插件几乎没失败过」，而我们一直回 11128。
-      // 逐行对比后确认两套头差异很大（见 `referenceChatHeaders` 的对照表）——
-      // 我们多发了一批 Go 侧口径的头（Origin/Referer/X-Machine-ID/
-      // X-Conversation-Request-ID…），**在国际版端点上不被认可**。
+      // 实测对比：国际版上游（`www.workbuddy.ai`）要求携带
+      // `X-Conversation-Request-ID` / `X-Conversation-Message-ID` /
+      // `X-Conversation-ID` 会话头族，缺失会回 HTTP 400
+      //（conversation 相关字段缺失），并被账号池误判为渠道异常而冷却。
       //
-      // 唯一保留的额外头是 `Authorization`（参考实现也发）。
-      headers: referenceChatHeaders({
+      // 参考实现（`deepseek-harness-codearts`）正是用这组头，故切换为
+      // `cliChatHeaders`，并用 `randomHex32()` 为 conversation ID 生成随机值。
+      headers: cliChatHeaders({
         uid: credential.uid,
         accessToken: credential.accessToken,
         variant: config.id,
+        sessionId: sessionId,
+        conversationId: randomHex32(),
+        conversationRequestId: randomHex32(),
+        machineId: machineId,
       }),
       body,
       signal: request.signal,
