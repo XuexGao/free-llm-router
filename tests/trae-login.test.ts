@@ -661,7 +661,19 @@ test('⚠️ 面板必须把 trae 标成「浏览器登录」（否则用户去�
   const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
   assert.ok(/LOGIN_KIND_LABEL\s*=\s*\{[^}]*trae:\s*'浏览器登录'/.test(js),
     'LOGIN_KIND_LABEL 必须含 trae: 浏览器登录')
-  assert.ok(/providerId === 'trae'/.test(js), 'loginWaitHint 必须覆盖 trae（回跳式流程的等待文案不同）')
+  // ⚠️ 2026-11-21：`loginWaitHint` 不再按 providerId 硬编码 trae ——
+  // 它改为查 `MANUAL_CALLBACK_PROVIDERS`（trae / lobsterai / gemini / raccoon 共用
+  // 同一句「请把地址栏链接粘回来」）。
+  // ⚠️ 原断言的**实质要求**仍然成立：trae 的等待文案必须覆盖到它
+  //（否则用户会一直等一个不会发生的跳转）。
+  assert.ok(
+    /MANUAL_CALLBACK_PROVIDERS\s*=\s*new Set\(\[[^\]]*'trae'/.test(js),
+    'trae 必须在 MANUAL_CALLBACK_PROVIDERS 里（等待文案据此分支）',
+  )
+  assert.ok(
+    /loginWaitHint\(providerId\)\s*\{[\s\S]{0,200}MANUAL_CALLBACK_PROVIDERS\.has\(providerId\)/.test(js),
+    'loginWaitHint 必须用该集合判断，而不是硬编码单个 provider',
+  )
 })
 
 test('⚠️ 零 node: 导入（Workers 只能跑纯 Web 标准）', () => {

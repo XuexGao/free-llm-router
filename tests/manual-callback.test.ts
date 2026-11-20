@@ -98,3 +98,87 @@ test('gemini 回调解析：code / state / error 三态都要认', () => {
   assert.equal(denied.error, 'access_denied')
   assert.equal(denied.code, '')
 })
+
+// ─────────────── 面板：输入框不能被轮询刷掉（真实缺陷） ───────────────
+
+test('🔴 轮询不得用 textContent 清空登录提示节点（否则输入框会消失）', async () => {
+  // ## 用户报障（2026-11-21）
+  //
+  // > 「这些回调都有问题吧，我刚登录好连接就刷新了，输入框也莫名其妙消失了，
+  // >   你这人我怎么登录」
+  //
+  // ## 根因
+  //
+  // `renderLoginPrompt` 的 **authUrl 分支**用
+  // `el.textContent = '…'` 铺正文，然后在其后 append 链接与
+  // 「粘贴回调链接」输入框。而它**从未设置 `el._loginStatus`**。
+  //
+  // 于是 3 秒后第一次轮询走进兜底分支 `else out.textContent = …`
+  // —— `textContent` 赋值**会清空该节点的全部子元素** ⇒ 链接、输入框、
+  // 提交按钮一起消失，只剩一行「等待授权中…」。
+  //
+  // 而那个输入框恰恰是这条登录流程**唯一**能完成的方式 ⇒ 用户彻底卡死。
+  const { readFileSync } = await import('node:fs')
+  const raw = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+
+  // ① 定位 `renderLoginPrompt` 的**完整函数体**。
+  //
+  // ⚠️ 不能用 `indexOf('\n}', start)` 找结尾 —— 函数里有嵌套块，
+  // 那样会**提前截断**，断言变成「只检查了前半段」的假绿。
+  // 改用「下一个顶层声明」作边界。
+  const start = raw.indexOf('function renderLoginPrompt')
+  assert.ok(start >= 0, '应有 renderLoginPrompt')
+  const endCandidates = [
+    raw.indexOf('const MANUAL_CALLBACK_PROVIDERS', start),
+    raw.indexOf('const MANUAL_CALLBACK_HINTS', start),
+    raw.indexOf('function renderManualCallbackInput', start),
+  ].filter((i) => i > 0)
+  assert.ok(endCandidates.length > 0, '应能找到 renderLoginPrompt 之后的顶层声明')
+  const body = raw.slice(start, Math.min(...endCandidates))
+
+  // ② ⚠️ **必须先剥注释**：本项目的注释习惯是逐字引用缺陷代码
+  //（这里就有 `el.textContent = …` 的原文），不剥会产生假失败/假绿。
+  // 与 `gateway.test.ts` / `panel.test.ts` 的 `stripComments` 同一口径。
+  const code = body
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+
+  // ③ 🔴 函数体内**不得**给 `el.textContent` 赋值 —— 唯一例外是
+  //    「服务端没返回任何登录方式」那个**终态**分支（它之后不会再有轮询）。
+  const assignments = [...code.matchAll(/\bel\.textContent\s*\+?=\s*([^\n]*)/g)]
+    .map((m) => m[0].trim())
+    .filter((line) => !line.includes('服务端未返回可用的登录方式'))
+  assert.deepEqual(
+    assignments,
+    [],
+    '⚠️ renderLoginPrompt 里不得给 el.textContent 赋值 —— 它会在下一次轮询时'
+      + '清空整个节点（链接与输入框一起消失）。改用独立的状态节点 + el._loginStatus',
+  )
+
+  // ③ 而 link 分支**必须**设置 `_loginStatus`（漏了就落进兜底分支）
+  assert.ok(
+    body.includes('el._loginStatus = status'),
+    '链接分支必须设置 el._loginStatus（否则轮询会走「清空节点」的兜底）',
+  )
+})
+
+test('🔴 轮询兜底不得再写 textContent（找不到状态节点就地补一个）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+
+  // 定位弹窗登录的轮询回调（`startModalLogin` 里的 setInterval）
+  const start = js.indexOf('async function startModalLogin')
+  assert.ok(start >= 0)
+  const body = js.slice(start, start + 4000)
+
+  // ⚠️ 兜底分支曾经写 `out.textContent = r.body.message` —— 那正是清空元凶。
+  assert.ok(
+    !/out\.textContent\s*=\s*r\.body\.message/.test(body),
+    '轮询兜底不得用 out.textContent 覆盖整块内容（会清掉输入框）',
+  )
+  // 正确做法：找不到 `_loginStatus` 时**就地补一个**节点
+  assert.ok(
+    /out\._loginStatus\s*===\s*undefined/.test(body) && /out\.appendChild\(fallback\)/.test(body),
+    '兜底应「就地补一个状态节点」，而不是覆盖整个容器',
+  )
+})

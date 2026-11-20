@@ -1646,6 +1646,15 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // `state` 用 32 字节 CSPRNG（不是 randomUUID）：它是这条免鉴权路径上
     // **唯一**的能力凭证 —— 谁拿到 state，谁就能把浏览器的回跳绑到该会话。
     // 它同时用于「回调 URL 的路径段」与「登录会话主键」，两者必须是**同一个值**。
+    // ## ⚠️ 2026-11-21：本分支**已不可达**（用户要求关掉华为登录）
+    //
+    // 上方 `capabilities.login` 已翻成 `false`，而本端点开头有一道
+    // 「不支持登录的供应商」拦截 ⇒ 走不到这里。
+    //
+    // **代码保留**的理由：协议实现本身是对的（URL 构造 + ticket 契约 +
+    // 三种回传形态的解析 + 续期），只是上游不允许把回调放到远程。
+    // 若华为将来支持设备码或远程回调，把 `capabilities.login` 翻回 `true`
+    // 即可恢复，不需要重写。
     if (providerId === 'codearts') {
       const ticketId = crypto.randomUUID()
       const state = generateCodeArtsLoginState()

@@ -415,7 +415,7 @@ test('⚠️ 服务端万一同时下发续期材料，必须透传（否则可�
 
 // ─────────────────── ⑦ 能力声明 ───────────────────
 
-test('✅ codearts 可登录，但**只能**走「手动粘贴回调链接」（死循环那条路依然不通）', () => {
+test('❌ codearts 登录入口已关掉（用户实测走不通）—— 但供应商本身保留', () => {
   // ## 被用户两次真实登录推翻的结论（2026-10-04）
   //
   // 用户登录后被送到**华为自己的中间页**（不是我们的回调）：
@@ -439,8 +439,35 @@ test('✅ codearts 可登录，但**只能**走「手动粘贴回调链接」（
   // 上面那些事实**一个字没变**（跳转链照样死循环、`auth_callback_url` 照样不被读）。
   // 变的是结论：登录**确实会在用户浏览器里完成一次**，而那一刻地址栏带着
   // `?secret=…`。让用户把它粘回来即可，不需要本地端口。
+  // ## 2026-11-21：用户实测两次都走不通，要求关掉
+  //
+  // > 「而且华为还是不行，去掉吧」
+  //
+  // ⚠️ 关掉的是**入口**，不是供应商 —— 已导入的账号必须照常可用。
   const provider = findProvider('codearts')
-  assert.equal(provider?.capabilities.login, true, 'codearts 应声明可登录（手动回调路径）')
+  assert.notEqual(provider, undefined, '⚠️ 供应商本身必须**保留**（已导入的账号还要能用）')
+  assert.equal(provider?.capabilities.login, false, 'codearts 不应声称可从本服务登录')
+
+  // ⚠️ `login: false` **必须**给出可读原因（`types.ts` 的诚实纪律）。
+  // 而且要说明**为什么「粘贴回调链接」也救不了它** —— 否则用户会问
+  // 「别的家都能粘，为什么华为不行」。
+  const reason = provider?.capabilities.loginBlockedReason ?? ''
+  assert.ok(reason.includes('127.0.0.1'), '原因要点明回调只认本机端口')
+  assert.ok(reason.length > 40, '原因要足够具体（不能只说「不支持」）')
+
+  // ⚠️ 而**能力**不能连带关掉：对话/签到/余额/续期都还在。
+  assert.equal(provider?.capabilities.chat, true, '已导入的 codearts 账号必须仍能对话')
+  assert.equal(provider?.capabilities.checkin, true, '签到能力不受登录入口影响')
+  assert.equal(typeof provider?.refresh, 'function', '续期不受登录入口影响')
+
+  // ⚠️ 前端也不得再为它渲染「粘贴回调链接」输入框（用户没有可粘的东西）。
+  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+  const setMatch = /const MANUAL_CALLBACK_PROVIDERS = new Set\(\[([^\]]*)\]\)/.exec(js)
+  assert.ok(setMatch !== null, '应有 MANUAL_CALLBACK_PROVIDERS')
+  assert.ok(
+    !setMatch[1].includes('codearts'),
+    '⚠️ codearts 不得出现在「手动回调」名单里（它走不到回调页，粘不了）',
+  )
 
   // ⚠️ 判据必须打在**真实接线**上：只翻 `login: true` 而没有入口，
   // 用户点「登录」会得到「不支持从本服务发起登录」—— 那是空头承诺。

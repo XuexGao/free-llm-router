@@ -454,20 +454,41 @@ async function loadAccounts() {
 let loginTimer = null
 
 /**
+ * 需要「手动粘贴回调链接」的供应商。
+ *
+ * ⚠️ 判据是「**上游把回调打向 127.0.0.1**」，与「能不能登录」无关。
+ *
+ * ⚠️ **codearts 不在这里**（2026-11-21）：华为的跳转链**走不到回调页**
+ * ——地址栏里始终是登录页，用户没有可粘的东西 ⇒「粘贴回调链接」对它无效，
+ * 入口已整体关掉（见 `codearts.ts` 的 `capabilities.login`）。
+ * 其余四家的回调确实会在浏览器里完成一次，故保留。
+ *
+ * ⚠️ 声明放在使用它的函数**之前**（本文件是模块顶层执行，虽然函数体内引用
+ * 不会触发 TDZ，但放在前面读起来不会有「这变量哪来的」的疑问）。
+ */
+const MANUAL_CALLBACK_PROVIDERS = new Set(['trae', 'lobsterai', 'gemini', 'raccoon'])
+
+/**
  * 登录等待文案的**流程相关**后缀。
  *
  * ⚠️ 不同家的完成方式是**相反**的，不能共用一句文案：
- * - 设备码（buddy / workbuddy / qoder / zcode / cline）：用户在别处确认，本页等着即可；
- * - 浏览器回跳（codearts / trae）：上游会把浏览器打到**本服务**的提示页，
- *   而凭据要由**本面板的轮询**写入，所以用户必须回到本页
- *   （提示页上也没有写凭据的入口）。
+ * - 设备码（buddy / workbuddy / qoder / zcode / cline / minimax）：用户在别处确认，
+ *   本页等着即可；
+ * - **手动粘贴回调**（trae / lobsterai / gemini / raccoon）：浏览器会停在
+ *   `127.0.0.1`（打不开），用户必须把**地址栏那段链接**粘回本页的输入框。
+ *
+ * ## 2026-11-21 更正两处
+ *
+ * 1. **trae 不再是「回跳到本服务」**了 —— 它现在走手动粘贴（这条链在
+ *    `127.0.0.1` 上必然失败）。原来那句「浏览器会跳到本服务的提示页」
+ *    会让用户一直等一个**不会发生**的跳转。
+ * 2. **codearts 整条移除** —— 用户实测走不通，入口已关掉（见
+ *    `codearts.ts` 的 `capabilities.login`）。
  */
 function loginWaitHint(providerId) {
-  if (providerId === 'codearts') {
-    return '\n\n（完成华为登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
-  }
-  if (providerId === 'trae') {
-    return '\n\n（完成 TRAE 登录后浏览器会跳到本服务的提示页，请回到本面板等待，凭据会自动保存）'
+  if (MANUAL_CALLBACK_PROVIDERS.has(providerId)) {
+    return '\n\n（若浏览器停在「无法访问此网站」，请把地址栏里的整段链接'
+      + '粘到下面的输入框并提交 —— 那是这条登录唯一的完成方式）'
   }
   return ''
 }
@@ -604,12 +625,45 @@ function renderLoginPrompt(el, body, providerId) {
     el.textContent = '服务端未返回可用的登录方式（请刷新页面重试）。'
     return
   }
-  el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
+  /**
+   * ## 🔴 这里**必须用 DOM 节点**，不能写 `el.textContent = …`（真实缺陷）
+   *
+   * 我第一版就是直接给 `el` 赋 `textContent`，然后**在它后面** append 链接与
+   * 「粘贴回调链接」输入框。
+   *
+   * 后果（用户报障「刚登录好连接就刷新了，输入框也莫名其妙消失了」）：
+   *
+   * 1. 赋值发生在**渲染时**，那时 DOM 是对的；
+   * 2. 但轮询（3 秒一轮）走的是
+   *    `if (out._loginStatus) … else out.textContent = r.body.message`；
+   * 3. 而本分支**从来没设过 `_loginStatus`** ⇒ 每次都落进 else 分支；
+   * 4. `el.textContent = …` **会清空该节点的所有子元素** ⇒ 链接、输入框、
+   *    提交按钮**全部消失**，只剩一行「等待授权中…」。
+   *
+   * ⇒ 与扫码 / 用户码两条分支**同一口径**：文本放进一个**独立的状态节点**，
+   * 轮询只改那个节点的 `textContent`，其余 UI 原样留在页面上。
+   */
+  const lead = document.createElement('div')
+  lead.textContent = '请在浏览器打开以下链接完成授权：'
+  el.appendChild(lead)
+
+  const urlBox = document.createElement('div')
+  urlBox.className = 'auth-url'
+  // ⚠️ 用 textContent 放 URL（不拼 innerHTML —— 上游返回值不能当 HTML）
+  urlBox.textContent = authUrl
+  el.appendChild(urlBox)
+
   const a = document.createElement('a')
   a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
   a.textContent = '打开授权页面'
-  el.appendChild(document.createElement('br'))
   el.appendChild(a)
+
+  const status = document.createElement('div')
+  status.className = 'login-status'
+  status.textContent = '等待授权中…' + loginWaitHint(providerId)
+  el.appendChild(status)
+  // ⚠️ 轮询据此只更新状态文字 —— 链接与输入框必须留在页面上。
+  el._loginStatus = status
 
   // ── 「手动粘贴回调链接」（仅回调落在 127.0.0.1 的家）──
   //
@@ -629,20 +683,11 @@ function renderLoginPrompt(el, body, providerId) {
   }
 }
 
-/**
- * 需要「手动粘贴回调链接」的供应商。
- *
- * ⚠️ 判据是「**上游把回调打向 127.0.0.1**」，与「能不能登录」无关 ——
- * 浏览器回跳落到**本服务**的家（codearts）不需要它。
- */
-const MANUAL_CALLBACK_PROVIDERS = new Set(['trae', 'codearts', 'lobsterai', 'gemini', 'raccoon'])
 
 /** 各家「手动回调」的提示语（按参数名区分，用户才知道该找什么）。 */
 const MANUAL_CALLBACK_HINTS = {
   trae: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
     + '请把地址栏里的整段链接复制粘贴到这里（它带着 refreshToken 等登录凭证）：',
-  codearts: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
-    + '请把地址栏里的整段链接复制粘贴到这里（它带着 secret 参数）：',
   lobsterai: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
     + '请把地址栏里的整段链接复制粘贴到这里（它带着 authCode 参数）：',
   gemini: '如果浏览器停在「无法访问此网站 / localhost」，'
@@ -654,7 +699,6 @@ const MANUAL_CALLBACK_HINTS = {
 /** 各家回调链接的样式（仅作占位提示，不参与解析）。 */
 const MANUAL_CALLBACK_PLACEHOLDERS = {
   trae: 'http://127.0.0.1:18080/authorize?refreshToken=…',
-  codearts: 'http://127.0.0.1:端口/authentication?secret=…',
   lobsterai: 'http://127.0.0.1:18081/auth/callback?authCode=…',
   gemini: 'http://localhost:8845/oauth-callback?code=4/0A…',
   raccoon: 'http://127.0.0.1:18082/auth/callback?code=…',
@@ -1531,7 +1575,7 @@ const CAPS = [
 // - `minimaxintl` 与 `minimax` 同形（设备码 + PKCE），故同标签。
 const LOGIN_KIND_LABEL = { 
   loomy: '短信验证码登录', cline: '用户码登录', minimax: '用户码登录', minimaxintl: '用户码登录',
-  codearts: '浏览器登录', trae: '浏览器登录', lobsterai: '浏览器登录', gemini: '浏览器登录', raccoon: '浏览器登录',
+  trae: '浏览器登录', lobsterai: '浏览器登录', gemini: '浏览器登录', raccoon: '浏览器登录',
 }
 
 /** 缓存的供应商目录（弹窗要用）。 */
@@ -2282,7 +2326,14 @@ async function startLoomyWechatLogin(out) {
   let tries = 0
   modalLoginTimer = setInterval(async () => {
     tries += 1
-    if (tries > 100) { clearInterval(modalLoginTimer); out.textContent += '\n授权超时。'; return }
+    if (tries > 100) {
+      clearInterval(modalLoginTimer)
+      // ⚠️ 不能 `out.textContent +=` —— 那会**清空子元素**（链接与输入框），
+      // 与轮询兜底是同一个坑（见下方那段说明）。
+      if (out._loginStatus) out._loginStatus.textContent = '授权超时，请重新发起登录。'
+      else out.textContent = '授权超时，请重新发起登录。'
+      return
+    }
     const r = await api('/admin/providers/login/poll?state=' + encodeURIComponent(state))
     if (!r.ok) return
     const status = out._loginStatus
@@ -2451,7 +2502,14 @@ async function startModalLogin(providerId, out) {
   let tries = 0
   modalLoginTimer = setInterval(async () => {
     tries += 1
-    if (tries > 100) { clearInterval(modalLoginTimer); out.textContent += '\n授权超时。'; return }
+    if (tries > 100) {
+      clearInterval(modalLoginTimer)
+      // ⚠️ 不能 `out.textContent +=` —— 那会**清空子元素**（链接与输入框），
+      // 与轮询兜底是同一个坑（见下方那段说明）。
+      if (out._loginStatus) out._loginStatus.textContent = '授权超时，请重新发起登录。'
+      else out.textContent = '授权超时，请重新发起登录。'
+      return
+    }
     const pollPath = providerId === 'buddy' ? '/admin/login/poll' : '/admin/providers/login/poll'
     const r = await api(pollPath + '?state=' + encodeURIComponent(state))
     if (r.ok && r.body && r.body.done) {
@@ -2464,10 +2522,25 @@ async function startModalLogin(providerId, out) {
       out.textContent = (r.body.message || '登录失败') + '\n可改用「粘贴凭据导入」，或稍后重试。'
     } else if (r.ok && r.body && r.body.message) {
       // 扫码流程只更新状态文字（二维码必须留在页面上，不能被文字覆盖掉）
-      if (out._loginStatus) out._loginStatus.textContent = r.body.message
-      else if (typeof res.body.authUrl === 'string') {
-        out.textContent = '请在浏览器打开以下链接完成授权：\n' + res.body.authUrl + '\n\n' + r.body.message
-      } else out.textContent = r.body.message
+      //
+      // ## 🔴 兜底**绝不能**再写 `out.textContent`（真实缺陷，用户报障）
+      //
+      // 我第一版这里有两级兜底：
+      //   `if (out._loginStatus) … else if (authUrl) out.textContent = '链接…' else out.textContent = msg`
+      // 而「手动粘贴回调链接」那一支**当时没设 `_loginStatus`** ⇒ 走第二级
+      // ⇒ `textContent` 赋值**清空了整个节点**（链接、输入框、提交按钮全没了）。
+      // 用户看到的正是「刚登录好连接就刷新了，输入框也莫名其妙消失了」——
+      // 而那个输入框恰恰是这条登录流程**唯一**能完成的方式。
+      //
+      // ⇒ 兜底改为「**找不到状态节点就地补一个**」，永远不碰其它子元素。
+      // 这样即使将来新增分支又忘了设 `_loginStatus`，页面也不会被清空。
+      if (out._loginStatus === undefined || out._loginStatus === null) {
+        const fallback = document.createElement('div')
+        fallback.className = 'login-status'
+        out.appendChild(fallback)
+        out._loginStatus = fallback
+      }
+      out._loginStatus.textContent = r.body.message
     }
   }, 3000)
 }
