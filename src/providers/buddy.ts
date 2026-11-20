@@ -357,11 +357,24 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
    * 每日签到。
    *
    * ✅ **国内版与国际版都会走到这里**（两站端点同形，只有 billing base 不同）。
-   * ⚠️ 国际版的每日奖励挂在**活动**上：活动关闭时上游回 `41000`，
-   * 此时本方法会如实返回「无收益」而不是谎报成功。
    *
-   * 幂等由上游业务码保证（已签到返回 `10001`/`1001`，映射为 `alreadyDone`）——
-   * 故重复点击是安全的。
+   * ## ⚠️ 四种结果必须分开报（都是「正常」，只有最后一种是异常）
+   *
+   * | 上游 | 本方法的返回 | 用户看到的 |
+   * |---|---|---|
+   * | `code 0` + 有 credit | `gained > 0` | 签到成功，获得 N |
+   * | `10001`/`1001`/`14001` | `alreadyDone: true` | 今日已签到 |
+   * | **`41000`/`40901`/`1002`/`1003`** | **`inactive` 语义** | **当前无领取资格（活动未开）** |
+   * | 其它非 0 / HTTP 错误 | **抛错** | 签到失败 + 原因 |
+   *
+   * ⚠️ 第三行此前被归成**失败**（落到 `classify()` ⇒ `unknown` ⇒ 抛错）——
+   * 而国际版的每日奖励**挂在活动上**，活动没开时天天回 `41000`。
+   * 后果：面板天天显示「签到失败」，自动签到还会反复重试。
+   * 这条 bug 藏住的原因是任务注释写着「会如实返回无收益」，
+   * 而代码其实抛错了 —— **注释与代码不一致**。
+   *
+   * ⚠️ `inactive` **不能**折成 `alreadyDone: true`：那是在骗用户「今天领过了」。
+   * 两者都 `gained: 0`，但话术完全不同。
    */
   async function checkin(credential: ProviderCredential): Promise<CheckinResult> {
     const effectiveEnv =
@@ -369,11 +382,19 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
         ? (env as Env)
         : ({ ...(env ?? {}), UPSTREAM_BILLING_BASE: bases.billing } as Env)
     const r = await dailyCheckin({ uid: credential.uid, accessToken: credential.accessToken }, effectiveEnv)
-    return {
-      alreadyDone: r.alreadyDone,
-      gained: r.credit,
-      detail: r.alreadyDone ? '今日已签到（幂等命中）' : `签到成功，获得 ${r.credit}`,
+
+    if (r.inactive === true) {
+      return {
+        alreadyDone: false,
+        gained: 0,
+        // ⚠️ 文案要说清「这不是故障」，否则用户会以为签到坏了
+        detail: `当前无领取资格（活动未开始或已结束）：${r.inactiveReason ?? ''}`.trim(),
+      }
     }
+    if (r.alreadyDone) {
+      return { alreadyDone: true, gained: 0, detail: '今日已签到（幂等命中）' }
+    }
+    return { alreadyDone: false, gained: r.credit, detail: `签到成功，获得 ${r.credit}` }
   }
 
   /**

@@ -1927,9 +1927,33 @@ export const codeartsProvider: Provider = {
   shouldRotate(status: number, detail?: string): boolean {
     if (status === 429 || status === 402 || status === 401 || status === 403) return true
     if (status === 400 && detail !== undefined) {
-      return /TM\.00001041|并发会话|peak\s+usage|try\s+again\s+after|high\s+demand|too\s+many\s+requests/i.test(
-        detail,
-      )
+      // ① 并发会话满（瞬时，与账号健康无关）—— 见上方注释。
+      if (/TM\.00001041|并发会话|peak\s+usage|try\s+again\s+after|high\s+demand|too\s+many\s+requests/i.test(detail)) {
+        return true
+      }
+      // ② **积分耗尽** —— 必须换号（另一个账号可能还有余额）。
+      //
+      // ## 🔴 缺这一条会让「换号」整块**静默失效**（真实缺陷）
+      //
+      // 实测（参考实现 2026-11-15，2 账号 × 6 模型逐格直连 snap-access）：
+      // 积分耗尽回的是 **HTTP 400** + `{"error_code":"TM.00001050","error_msg":"您的积分已耗尽…"}`
+      // —— 既不是 429 也不是 402。
+      //
+      // 而本函数此前对 400 只认 `TM.00001041` ⇒ 积分耗尽落进 `return false`
+      // ⇒ `gateway` 既不换号、也不写模型级冷却 ⇒ 用户看到「积分用完了却不会切账号」。
+      //
+      // ⚠️⚠️ **必须按完整码值匹配，不能按词干**：`TM.00001050`（积分耗尽）
+      // 与 `TM.000010051`（无权调用该模型）**共享 9 字符词干 `TM.000010`** 后分叉，
+      // 且两码**在同一批请求里同时出现**（同一账号 `glm-5.2` 回 `1051`、
+      // `glm-5.3` 回 `1050`）。
+      // 按词干匹配会把「无权限」判成「没钱」⇒ 对一个永远不会有积分的模型
+      // 把整池账号轮一遍并全部沉底 —— **比不换号更糟**。
+      //
+      // ⇒ 故这里用 `\b` 界的完整码 + 中文文案两条腿（上游可能改码，文案是兜底）。
+      if (/(?:^|[^0-9])TM\.00001050(?:[^0-9]|$)/.test(detail)) return true
+      if (/积分已耗尽|积分耗尽|额度用尽|余额不足|insufficient\s+quota|credit\s+exhausted/i.test(detail)) {
+        return true
+      }
     }
     return false
   },

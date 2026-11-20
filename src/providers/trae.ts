@@ -2069,6 +2069,55 @@ export function fixNicknameMojibake(raw: string, uid: string): string {
 }
 
 /**
+ * 把用户粘进来的回调文本归一成**可被 `new URL()` 解析**的完整 URL。
+ *
+ * ## 🔴 为什么需要它（真实缺陷）
+ *
+ * 用户从地址栏复制时，**不带 scheme** 的形态很常见：
+ *
+ * ```
+ * 127.0.0.1:50000/authorize?refreshToken=…&userInfo=…&userJwt=…
+ * ```
+ *
+ * 旧实现只判 `startsWith('http')`，否则一律前置 `http://127.0.0.1` ——
+ * 于是上面那条被拼成
+ * `http://127.0.0.1127.0.0.1:50000/authorize?…`，
+ * **主机名变成 `127.0.0.1127.0.0.1`**，`URL` 仍能解析（所以不会报错！）
+ * 但 **query 全部丢失** ⇒ 报「回调未携带 refreshToken」。
+ *
+ * ⚠️ 这个缺陷**格外难自查**：用户粘的链接明明完整，提示却说缺参数。
+ *
+ * ## 四种形态（都要认）
+ *
+ * | 输入 | 处理 |
+ * |---|---|
+ * | `http(s)://…` | 原样 |
+ * | `/authorize?...` 或 `/login/trae/callback/…` | 前置回环 origin |
+ * | `host:port/...` | 补 `http://`（**不加**回环前缀） |
+ * | 裸 query（`refreshToken=…`） | 补回环 origin + `/authorize?` |
+ *
+ * ⚠️ 「裸 query」的判据必须是「**不含** `/` 且**不含** `?`」——
+ * 用宽口径 `^[^/?#]+:\d+` 判 authority 会把裸 query 里的
+ * `code=123:456` 当成 host `code=123` + 端口 `456`（参考实现踩过）。
+ */
+export function normalizeTraeCallbackUrl(rawUrl: string): string {
+  const text = rawUrl.trim()
+  // ① 完整 URL
+  if (/^https?:\/\//i.test(text)) return text
+  // ② 相对路径（`/authorize?…` / `/login/trae/callback/…`）
+  if (text.startsWith('/')) return `http://127.0.0.1${text}`
+  // ③ `host:port/...` —— **补 scheme 而不是加回环前缀**
+  //    （否则主机名会被拼坏，见上面的缺陷说明）
+  if (/^[^/?#]+:\d+(?:[/?#]|$)/.test(text)) return `http://${text}`
+  // ④ 裸 query（不含路径分隔符，也没有 `?`）
+  if (!text.includes('/') && !text.includes('?')) {
+    return `http://127.0.0.1/authorize?${text.replace(/^\?/, '')}`
+  }
+  // 兜底：交给 URL 去判（解析失败由调用方报「无法解析」）
+  return `http://127.0.0.1${text}`
+}
+
+/**
  * 解析 TRAE 登录回调 URL，提取凭证字段。
  *
  * ## ⚠️ 老流程**直接回传 token**（没有 `?code=`）
@@ -2095,8 +2144,7 @@ export function fixNicknameMojibake(raw: string, uid: string): string {
 export function parseTraeCallback(rawUrl: string): TraeCallbackParseResult {
   let query: URLSearchParams
   try {
-    // 允许传入相对形式（`/login/trae/callback/x?...`），补全成完整 URL 再解析。
-    query = new URL(rawUrl.startsWith('http') ? rawUrl : `http://127.0.0.1${rawUrl}`).searchParams
+    query = new URL(normalizeTraeCallbackUrl(rawUrl)).searchParams
   } catch {
     return { ok: false, reason: '回调 URL 无法解析', authCodeFlow: false }
   }

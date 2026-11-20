@@ -570,9 +570,26 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
       // ⚠️ 缺字段时给 false 而非 true：谎报支持图片会让请求被上游按体积拒绝
       // （`lobsterai-product.ts` 记录过 12 张原图能过、13 张 500 的实测）。
       supportsImage: record.supportsImage === true,
-      // ⚠️ 倍率为 0 或缺失时**不给该字段**（`undefined` = 上游没提供），
-      // 而不是给 0 —— 那会显示成「免费」，把付费模型说成免费。
-      ...(priceFactor > 0 ? { priceFactor } : {}),
+      // ⚠️ 「限时免费**生效中**」必须让倍率**归零**（真实缺陷修复）。
+      //
+      // ## 为什么要归零，而不是只标 `isFree`
+      //
+      // 官方客户端 asar 的判据是
+      // `costMultiplier = limitedFreeActive ? 0 : readPositiveNumber(...)`
+      // 且 `showCostMultiplier` 多一条 `|| limitedFreeActive === true`
+      // ⇒ 它画的是 **`x0.00`**。
+      //
+      // 而本文件此前只把 `isFree` 置 true、**倍率仍保留原值**（如 `x0.05`）——
+      // 用户会**按原价估成本**，而活动其实是免费的。一旦上游真的办活动，
+      // 界面写的就是错价。
+      //
+      // ⚠️ `limitedFree` vs `limitedFreeActive`：「有这个活动」≠「现在生效」。
+      // 只读前者会把**已结束**的活动也当成免费（反向错价，更糟）。
+      ...(record.limitedFreeActive === true
+        ? { priceFactor: 0 }
+        // ⚠️ 非免费时：倍率为 0 或缺失**不给该字段**（`undefined` = 上游没提供），
+        // 而不是给 0 —— 那会显示成「免费」，把付费模型说成免费。
+        : (priceFactor > 0 ? { priceFactor } : {})),
       // ⚠️ 「免费」判据用上游的 `limitedFreeActive`
       //（`limitedFree` 是「有这个活动」，`Active` 才是「**现在**生效」——
       //  只读前者会把已结束的活动当成免费）。

@@ -32,33 +32,38 @@
  * |---|---|---|---|
  * | 新人注册礼包 | 3000 | 注册时服务端自动发 | 不涉及 |
  * | **桌面端登录奖励** | 3000 | `POST …/login/points/grant` | 见 `grantLoginReward`（**一次性**） |
- * | 每日积分 | 300 | **服务端按日自动发放，无端点** | ❌ 不存在可调用的端点 |
+ * | 每日积分 | 300 | **办公端只读 GET `office/v3/setting_info` 触发** | ✅ `checkin()` |
  *
- * ⚠️ 故 `capabilities.checkin = false`，而**不是** `true`。
- * 依据 `plugin-src/client/credits-capabilities.js:133`：
- * `raccoon: { balance: true, onboardingTasks: true }` —— 登记的是
- * **一次性** `onboardingTasks`，**没有** `dailyCheckin`。
- * 把每日 300 实现成签到按钮会让用户每次点击都必然失败
- * （`src/raccoon-credits.ts:10-18`）。
+ * ## 🔴 「每日积分无端点可触发」是**误判**（2026-11-21 更正）
  *
- * ## ⚠️ 一次性奖励如何如实表达
+ * 旧表的最后一格写的是「服务端按日自动发放，**无端点**」，并据此把
+ * `capabilities.checkin` 定为 `false`。
  *
- * `Provider` 接口**没有** onboarding 方法。两个选择：
+ * **「`/points/v1|v2` 下的 `sign_in` / `check_in` 全 404」这条事实仍然成立**
+ *（本轮复验：`/api/web/points/v1/sign_in` → 404），**但结论下早了**：
+ * 触发器不在 points 前缀下，而在**办公端**的只读 GET 里。
  *
- * - (a) 映射成 `checkin()` 并让 `capabilities.checkin = true` —— ❌ **不行**：
- *   `checkin` 的语义是「每天都有收益」，而该端点幂等一次性（已领过回
- *   `granted:false`）。声明成签到会让面板每天渲染一个必然无收益的按钮。
- * - (b) `checkin: false` + 把 `grantLoginReward` 作为**独立导出函数**暴露，
- *   并在本注释与能力位上写明。✅ **采用这个**。
+ * ⇒ 现在的 `checkin()` 打那次 GET，靠响应里的 `point_grant_popups` 判定
+ * 「本次有没有真的发放」。**`popups` 为空只是「今天此前已结算」，不是失败。**
  *
- * 这样「能力矩阵如实」与「功能可达」两者兼得 —— 与参考项目把它登记为
- * `onboardingTasks`（一个**独立于** `dailyCheckin` 的能力位）是同一口径。
+ * ⚠️ 但**不要**把它描述成「点一下就能签到」：上游没有那个动作，
+ * 我们只是**触发了一次结算**。文案已按这个口径写。
+ *
+ * ## ⚠️ 一次性奖励仍然**不**映射成 `checkin()`
+ *
+ * `checkin()` 现在归**每日**结算（见上），而「桌面端登录奖励」是
+ * **一次性**的（幂等，已领过回 `granted:false`）。两者语义不同，
+ * 混进同一个能力位会让面板每天渲染一个「必然无收益」的按钮。
+ *
+ * ⇒ 一次性奖励仍由本文件导出的 {@link grantLoginReward} 提供，
+ * 不占用 `capabilities.checkin`。
  */
 
 import {
   ProviderError,
   type ChatRequest,
   type Provider,
+  type CheckinResult,
   type ProviderBalance,
   type ProviderCredential,
   type ProviderModel,
@@ -80,6 +85,42 @@ export const RACCOON_LLM_PREFIX = '/api/web/llm/v2'
 export const RACCOON_POINTS_PREFIX = '/api/web/points/v1'
 /** 桌面端端点前缀（含一次性登录奖励）。 */
 export const RACCOON_DESKTOP_PREFIX = '/api/web/desktop/v1'
+
+/**
+ * **办公端**端点前缀 —— 每日积分结算的触发器在这里。
+ *
+ * ## 🔴 「raccoon 没有每日签到」是**误判**（2026-11-21 更正）
+ *
+ * 本文件此前写 `checkin: false`，依据是「`/points/v1|v2` 下 `sign_in` /
+ * `check_in` / `daily` / `claim` / `attendance` 全 404」。
+ *
+ * **那条 404 仍然是事实**（本轮复验：`/api/web/points/v1/sign_in` → 404），
+ * **但结论下早了**：触发器根本不在 points 前缀下，而在**办公端**的
+ * 一个只读 GET 里 —— `GET /api/web/office/v3/setting_info`。
+ *
+ * 实测（本轮，零凭据探测端点存在性）：
+ *
+ * | 端点 | 结果 |
+ * |---|---|
+ * | `GET /api/web/office/v3/setting_info` | **401**（存在，要鉴权） |
+ * | `GET /api/web/points/v1/sign_in` | **404**（不存在） |
+ *
+ * ⇒ 401 = 端点存在。参考实现用真实 token 取证（3 个账号，跨日后首次调用）：
+ * 每号 **+300**、`daily_points` 同步 +300、响应带
+ * `point_grant_popups: [{source:'daily', points:300, expire_at:…}]`；
+ * **紧接着再调一次** ⇒ `popups: []` 且余额不变 ⇒ **按天幂等**。
+ *
+ * ## ⚠️ 它不是「签到接口」，是「每日结算的副作用」
+ *
+ * 语义上必须说清：我们**没有**「签到」这个动作可发。能做的是**打一次只读
+ * GET**，由上游在「当天还没结算」时顺带发放。故：
+ * - 判据只能是 **`point_grant_popups` 非空**（说明本次真的发了）；
+ * - `popups` 为空 **不代表失败**，只代表「今天此前已结算过」⇒ `alreadyDone`。
+ *
+ * ⚠️ 因此**不能**把它登记成「有签到端点」那种语义 —— 见 `capabilities.checkin`
+ * 的实现注释：能力位为 `true`，但说明里写明「由办公端只读接口触发」。
+ */
+export const RACCOON_OFFICE_PREFIX = '/api/web/office/v3'
 
 /**
  * 手机号传输层加密密钥（**公开常量**，`src/raccoon.ts:36-43`）。
@@ -791,6 +832,83 @@ function readNumber(value: unknown): number | undefined {
  * ⚠️ 各池**分开作 package**：它们的有效期与回补规则都不同
  * （每日积分每日刷新、奖励/充值积分长期有效）。
  */
+/**
+ * 每日积分结算（**由办公端的只读 GET 触发**）。
+ *
+ * ## ⚠️ 语义必须说清：我们没有「签到」这个动作可发
+ *
+ * 上游没有 `sign_in` / `check_in` / `daily` / `claim` 这类端点
+ *（实测全 404）。每日 300 是服务端在「当天还没结算」时**顺带**发放的，
+ * 而触发它的是打一次 **只读** 的 `GET /api/web/office/v3/setting_info`。
+ *
+ * ⇒ 判据只能是响应里的 `point_grant_popups`：
+ * - **非空** ⇒ 本次真的发了（`gained` = 各条 `points` 之和）；
+ * - **为空** ⇒ 今天此前已结算过（`alreadyDone: true`），**不是失败**。
+ *
+ * ## ⚠️ 三个不能凭直觉改的点
+ *
+ * 1. **`popups` 为空 ≠ 失败**：把它判成失败，用户会看到「签到失败」而实际
+ *    积分早就到账了 —— 与本项目反复记录的那类「假结论」同型。
+ * 2. **金额取 `popups[].points` 之和，不取余额差**：余额差会被同期其它来源
+ *    （对话消耗、奖励到账）污染，算出来可能是负的。
+ * 3. **不能据此声称「今天已领」以外的信息**：上游不保证发放时刻，
+ *    我们只能说「本次调用有没有触发发放」。
+ *
+ * ⚠️ 该端点**按天幂等**（实测：紧接着再调一次 ⇒ `popups: []`、余额不变），
+ * 故重复点击安全。
+ */
+async function checkin(credential: ProviderCredential, signal: AbortSignal): Promise<CheckinResult> {
+  const envelope = await raccoonRequestOk(
+    credential,
+    `${RACCOON_OFFICE_PREFIX}/setting_info`,
+    { method: 'GET' },
+    signal,
+  )
+  const data = envelope.data
+
+  // `point_grant_popups` 是**唯一**的发放证据。形状异常时如实说，不猜。
+  const rawPopups = data?.point_grant_popups
+  if (rawPopups !== undefined && !Array.isArray(rawPopups)) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 每日结算响应的 `point_grant_popups` 不是数组：形状无法识别'
+        + `（实际类型 ${typeof rawPopups}），不猜结果`,
+    })
+  }
+  const popups = Array.isArray(rawPopups) ? rawPopups : []
+
+  let gained = 0
+  const names: string[] = []
+  for (const raw of popups) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+    const record = raw as Record<string, unknown>
+    const points = readNumber(record.points) ?? 0
+    gained += points
+    // ⚠️ 名称可能缺失：缺失时**不编造**一个有意义的池名，用中性占位。
+    names.push(typeof record.display_name === 'string' && record.display_name !== ''
+      ? record.display_name
+      : '积分发放')
+  }
+
+  if (gained > 0) {
+    return {
+      alreadyDone: false,
+      gained,
+      detail: `每日积分已到账 +${gained}（${names.join('、')}）`,
+    }
+  }
+
+  // `popups` 为空 / 全 0 ⇒ 今天此前已结算。**不报失败**（见函数注释第 1 条）。
+  const toast = typeof data?.point_grant_toast === 'string' ? data.point_grant_toast : ''
+  return {
+    alreadyDone: true,
+    gained: 0,
+    detail: toast !== ''
+      ? `今日已结算过（上游提示：${toast}）`
+      : '今日已结算过（本次调用未触发新的发放）',
+  }
+}
+
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const envelope = await raccoonRequestOk(
     credential,
@@ -1043,25 +1161,25 @@ export const raccoonProvider: Provider = {
      * `Provider` 接口没有 onboarding 方法 ⇒ 该功能由本文件导出的
      * {@link grantLoginReward} 提供。
      */
-    checkin: false,
     /**
-     * ⚠️ 这不是本服务的缺陷，而是**上游产品形态**。
+     * ✅ **可触发每日结算**（2026-11-21 更正）。
      *
-     * 依据 `plugin-src/client/credits-capabilities.js:133`：
-     * `raccoon: { balance: true, onboardingTasks: true }` —— 登记的是**一次性**
-     * `onboardingTasks`，**没有** `dailyCheckin`。
-     * 每日 300 积分由服务端**按日自动发放**（账单 `biz_type: 'daily_grant'`），
-     * 实测注册后 1 分钟即到账 —— 没有可调用的签到端点。
+     * ## ⚠️ 与「签到」不是同一种东西，文案必须说清
+     *
+     * 上游**没有** `sign_in` / `check_in` 这类端点（实测全 404）。每日 300 是
+     * 服务端在「当天还没结算」时**顺带**发放的，触发方式是打一次**只读**
+     * `GET /api/web/office/v3/setting_info`（见 {@link RACCOON_OFFICE_PREFIX}）。
+     *
+     * ⇒ 能力位为 `true`（面板可以有一个按钮，点下去真的能拿到积分），
+     * 但**不能**承诺「像别家那样点一下就签到」—— 见 `checkin()` 的语义说明。
      */
-    checkinBlockedReason:
-      'Raccoon 的每日积分由服务端自动发放（账单类型 daily_grant），没有可调用的签到端点。'
-      + '这是上游产品形态，不是本服务的缺失 —— 你的积分照常每天到账。',
-
+    checkin: true,
   },
   parseCredential,
   listModels,
   chat,
   balance,
+  checkin,
   /**
    * 429（限流）与 402（余额耗尽）值得换号 —— `Provider` 的缺省语义。
    * 另外补上 401/403：raccoon 的 access_token 寿命约 3 小时

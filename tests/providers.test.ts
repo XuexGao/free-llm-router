@@ -399,16 +399,33 @@ test('⚠️ checkin=false 的供应商必须给出可读原因（否则用户�
   assert.deepEqual(missing, [], `这些供应商声明了 checkin=false 却没给原因：${missing.join('、')}`)
 })
 
-test('⚠️ raccoon 的 checkin 必须是 false（上游确实没有该端点）', () => {
-  // 依据参考项目 plugin-src/client/credits-capabilities.js:133：
-  // `raccoon: { balance: true, onboardingTasks: true }` —— 无 dailyCheckin。
-  // 每日 300 是服务端按日自动发放（账单 biz_type: 'daily_grant'）。
+test('✅ raccoon 可触发每日结算（不是「签到」，是只读 GET 的副作用）', () => {
+  // ## 结论已更正（2026-11-21）
+  //
+  // 旧断言是 `checkin === false`，依据「`/points/v1|v2` 下 sign_in/check_in 全 404」。
+  // **那条 404 仍然成立**，但结论下早了：触发器在**办公端**的只读 GET
+  // `office/v3/setting_info` 里（实测本轮：该端点 **401** = 存在要鉴权，
+  // 而 `points/v1/sign_in` 是 **404**）。
+  //
+  // ⚠️ 语义差别必须记住：上游**没有**「签到」这个动作，我们只是**触发了一次
+  // 结算**。故 `gained` 只能取自 `point_grant_popups`，而 popups 为空
+  // **不是失败**（只代表今天此前已结算）。
   const raccoon = findProvider('raccoon')
   assert.notEqual(raccoon, undefined)
-  assert.equal(raccoon?.capabilities.checkin, false, 'raccoon 不该声明支持签到')
+  assert.equal(raccoon?.capabilities.checkin, true, 'raccoon 应可触发每日结算')
+  assert.equal(typeof raccoon?.checkin, 'function', '声明 checkin=true 就必须实现方法')
+
+  // ⚠️ 判据必须是 `point_grant_popups`（唯一的发放证据）
+  const src = readFileSync('src/providers/raccoon.ts', 'utf8')
+  assert.ok(src.includes('point_grant_popups'), '必须读 point_grant_popups 作为发放证据')
+  assert.ok(src.includes('/office/v3'), '必须打办公端的 setting_info（触发器在这里）')
+  // ⚠️ 且 popups 为空**不得**抛错（那会把「今天已结算」误报成失败）
+  const fnStart = src.indexOf('async function checkin(')
+  assert.ok(fnStart > 0)
+  const fn = src.slice(fnStart, src.indexOf('\nasync function balance', fnStart))
   assert.ok(
-    (raccoon?.capabilities.checkinBlockedReason ?? '').includes('自动发放'),
-    '原因里应说明「服务端自动发放」，否则用户仍会困惑',
+    !/popups\.length === 0\)\s*\{\s*throw/.test(fn),
+    'popups 为空时不得抛错',
   )
 })
 

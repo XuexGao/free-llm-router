@@ -21,12 +21,98 @@ import { billingHeaders } from './headers.js'
 
 /** 签到结果。 */
 export interface CheckinResult {
-  /** 是否本次真的签到成功（false 表示之前已签）。 */
+  /** 是否本次真的签到成功（false 表示之前已签，或本次无领取资格）。 */
   claimed: boolean
   /** 幂等命中（今天已签过）。 */
   alreadyDone: boolean
   /** 服务端返回的本次到账积分（可能为 0）。 */
   credit: number
+  /**
+   * **本次无领取资格**（上游明确说了「当前领不了」）—— 与「失败」**不同**。
+   *
+   * ## ⚠️ 为什么必须与失败分开（真实缺陷）
+   *
+   * 国际版（`www.workbuddy.ai`）的每日奖励**挂在活动上**：活动没开时
+   * `/daily-checkin` 回 **`41000`**（活动未开始或已结束），另外还有
+   * **`40901`**（任务不可用）、**`1002`**（无资格）、**`1003`**（活动已结束）。
+   *
+   * 这四个都是**正常状态**，不是故障。把它们归成失败会：
+   * - 在面板上显示「签到失败」，用户以为服务坏了；
+   * - 而自动签到会**反复重试**（`inactive` 与 `failed` 的重试策略不同）。
+   *
+   * ⚠️ 与「幂等命中」也不同：`alreadyDone` 是「今天已领过」，
+   * `inactive` 是「今天压根没有可领的东西」。两者对用户的话术不同。
+   */
+  inactive?: boolean
+  /** `inactive` 时的可读原因（上游原文优先）。 */
+  inactiveReason?: string
+}
+
+/**
+ * 「无领取资格」的业务码 —— **不是失败**。
+ *
+ * 全部来自参考实现 `src/credits.ts:57-73` 的常量表（已用真实账号验证）：
+ *
+ * | 码 | 含义 |
+ * |---|---|
+ * | `1002` | 无领取资格 |
+ * | `1003` | 活动已结束 |
+ * | `41000` | 国际版：活动未开始 / 已结束 |
+ * | `40901` | 国际版：任务不可用 |
+ */
+export const CHECKIN_INACTIVE_CODES: readonly number[] = [1002, 1003, 41000, 40901]
+
+/**
+ * 「今天已签到」的**整句**文案（**只在未知业务码上兜底**）。
+ *
+ * ## 🔴 为什么必须是「整句」，不能是子串（真实缺陷）
+ *
+ * 早期用的是子串正则（`/已签|已领|already/i` 之类）。参考实现用 13 条真实
+ * 失败报文实测：**9 条被误判成「今天已签到」**（独立探针误判 30/42）。
+ *
+ * 后果链比「误判成无资格」**严格更糟**：
+ *
+ * ```
+ * already-claimed
+ *   → 汇总里 alreadyClaimed+1、coversToday+1
+ *   → 自动签到把该家标记为「今天已处理完」
+ *   → 当天**整天不再重试** + 反向告诉用户「已领到」
+ * ```
+ *
+ * 也就是说：一次**真实的失败**被翻成「已成功」，并且让后面的重试全部消失。
+ *
+ * 本项目当前的正则虽已收窄（要求完整 `already checked in`），但仍是**子串**
+ * 匹配 —— 实测这三条会被误判：
+ *
+ * - 「今日已签到记录写入失败」
+ * - 「更新已签到状态失败，请重试」
+ * - 「已签到用户信息同步超时」
+ *
+ * ⇒ 改为**整句锚定**（`^…$`），只认「这句话就是在说已签到」的形态。
+ *
+ * ⚠️ 新增形态时必须**同时**加一条对立面用例（「含该词但实为失败」），
+ * 否则下次又会悄悄放宽成子串。
+ */
+export const ALREADY_CHECKED_IN_TEXT: readonly RegExp[] = [
+  /^(今天|今日)?已(经)?签到(过|了|过了|过的)?[。.!！]?$/i,
+  /^(今天|今日)?已(经)?领取(过|了|过了|过的)?[。.!！]?$/i,
+  /^already\s+(?:checked\s+in|claimed)(\s+today)?[.!]?$/i,
+]
+
+/**
+ * 把上游下发的 `code` 归一成数字。
+ *
+ * ⚠️ **上游有时把它下发成字符串**（`"41000"` / `"0"`）。只认 `number` 会让
+ * 新登记的 41000/40901 **全部失效**（落到 -1 ⇒ 判成失败 ⇒ 一天里反复重试），
+ * 也会把成功的 `"0"` 判成失败。这在本项目是已知的同型缺陷（参考实现为此
+ * 专门写了一条注释）。非数值一律回 `-1`。
+ */
+export function normalizeBusinessCode(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (typeof raw === 'string' && /^-?\d+$/.test(raw.trim())) {
+    return Number.parseInt(raw.trim(), 10)
+  }
+  return -1
 }
 
 /** 余额包（billing 域的 `get-user-resource` 是**双层嵌套**响应）。 */
@@ -130,7 +216,8 @@ export async function dailyCheckin(
     body: '{}',
   })
 
-  const code = res.envelope?.code
+  // ⚠️ 必须归一（上游可能下发字符串 `"41000"`）—— 见 normalizeBusinessCode
+  const code = normalizeBusinessCode(res.envelope?.code)
 
   // 幂等命中：已签到。
   //
@@ -154,9 +241,35 @@ export async function dailyCheckin(
   //    误报「未签」最多让用户多点一次（上游幂等，回业务码，无害）。
   const msg = res.envelope?.msg ?? ''
   const alreadyByCode = code === 10001 || code === 1001 || code === 14001
-  const alreadyByMsg = /已签到|already\s+(?:checked|signed)\s*in/i.test(msg)
+  // ⚠️ **整句**匹配，且只在**未知码**上兜底（已知码已在上面的分支处理完）。
+  //    子串匹配会把「已签到记录写入失败」这类失败报文翻成假成功 —— 见
+  //    `ALREADY_CHECKED_IN_TEXT` 的缺陷说明。
+  const alreadyByMsg = code !== 0 && ALREADY_CHECKED_IN_TEXT.some((p) => p.test(msg.trim()))
   if (alreadyByCode || alreadyByMsg) {
     return { claimed: false, alreadyDone: true, credit: 0 }
+  }
+
+  // ── 「本次无领取资格」—— **不是失败**（真实缺陷修复）──
+  //
+  // 国际版的每日奖励挂在**活动**上：活动没开时回 `41000`，另有 `40901`
+  // （任务不可用）、`1002`（无资格）、`1003`（活动已结束）。
+  // 这四个都是**正常状态**。
+  //
+  // ⚠️ 修复前它们落到下面的 `classify()` ⇒ 被归成 `unknown` ⇒ **抛 UpstreamError**
+  // ⇒ 面板显示「签到失败」、自动签到还会反复重试。
+  // 而任务本身的注释还写着「此时本方法会如实返回无收益而不是谎报成功」——
+  // **注释与代码不一致**，那正是这个缺陷藏住的原因。
+  //
+  // ⚠️ 判据用**码集合**而不是文案：文案由服务端下发、随时可改；
+  // 而码是协议的一部分（参考实现也是按码判的）。
+  if (CHECKIN_INACTIVE_CODES.includes(code)) {
+    return {
+      claimed: false,
+      alreadyDone: false,
+      credit: 0,
+      inactive: true,
+      inactiveReason: msg !== '' ? msg : `当前无领取资格（业务码 ${code}）`,
+    }
   }
 
   if (!res.ok) {

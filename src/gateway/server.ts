@@ -1184,7 +1184,27 @@ async function handleProviderChat(input: {
         }
       }
 
-      const rotate = provider.shouldRotate?.(upstream.status, text) ?? (upstream.status === 429 || upstream.status === 402)
+      // ## ⚠️ 缺省判据必须把「**额度耗尽类业务码**」也算进来（真实缺陷）
+      //
+      // 旧写法是 `?? (status === 429 || status === 402)` —— 只看 HTTP 状态码。
+      // 而腾讯系把「额度耗尽」下发成**业务码 `14018`**（`classify` 会把它归成
+      // `credit_exhausted`），此时 HTTP 可能仍是 **200/400**，于是：
+      //
+      // ⇒ `rotate = false` ⇒ **既不换号、也不继续** ⇒ 用户看到「这个号用不了」
+      //   而其它账号明明还有余额。
+      //
+      // `buddy` / `workbuddy` 两个变体**没有**声明 `shouldRotate`（它们用缺省语义），
+      // 所以这条缺省判据就是它们唯一的换号依据 —— 漏掉业务码等于漏掉全部换号。
+      //
+      // ⇒ 缺省改为「HTTP 429/402 **或** 业务码被归成额度耗尽/限流」。
+      // ⚠️ 仍**不**把 `auth_error` 算进来：401 未必该换号（可能全部账号都过期），
+      //    那是各家 `shouldRotate` 自己的判断（已声明该方法的家不受本改动影响）。
+      const rotateDefault = (): boolean => {
+        if (upstream.status === 429 || upstream.status === 402) return true
+        const cls = classify(upstream.status, text)
+        return cls.kind === 'credit_exhausted' || cls.kind === 'rate_limited'
+      }
+      const rotate = provider.shouldRotate?.(upstream.status, text) ?? rotateDefault()
 
       // ⚠️ **429 不能一律当账号级冷却**（实测缺陷，用户报「一会能用一会不能用」）。
       //
