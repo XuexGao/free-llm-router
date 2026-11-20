@@ -610,6 +610,109 @@ function renderLoginPrompt(el, body, providerId) {
   a.textContent = '打开授权页面'
   el.appendChild(document.createElement('br'))
   el.appendChild(a)
+
+  // ── 「手动粘贴回调链接」（仅回调落在 127.0.0.1 的家）──
+  //
+  // ## 为什么需要它（真实的死路，不是优化）
+  //
+  // TRAE 的 `auth_callback_url` 由它自己拼成 `http://127.0.0.1:<port>/authorize`
+  // —— 浏览器直连**用户本机**端口。Workers 没有监听 socket，那一跳必然失败，
+  // 用户看到的是浏览器的「无法访问此网站」。
+  //
+  // 但**那条地址里带着完整凭证**（refreshToken / userInfo / userJwt）。
+  // 故只要让用户把它粘回来，效果等同于我们收到了回调。
+  //
+  // ⚠️ 只有**确实走这条路**的家才显示这个输入框：
+  // 对设备码家（qoder / cline / minimax）显示它只会让人以为「必须粘贴」。
+  if (MANUAL_CALLBACK_PROVIDERS.has(providerId)) {
+    renderManualCallbackInput(el, providerId)
+  }
+}
+
+/**
+ * 需要「手动粘贴回调链接」的供应商。
+ *
+ * ⚠️ 判据是「**上游把回调打向 127.0.0.1**」，与「能不能登录」无关 ——
+ * 浏览器回跳落到**本服务**的家（codearts）不需要它。
+ */
+const MANUAL_CALLBACK_PROVIDERS = new Set(['trae', 'codearts', 'lobsterai', 'gemini', 'raccoon'])
+
+/** 各家「手动回调」的提示语（按参数名区分，用户才知道该找什么）。 */
+const MANUAL_CALLBACK_HINTS = {
+  trae: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
+    + '请把地址栏里的整段链接复制粘贴到这里（它带着 refreshToken 等登录凭证）：',
+  codearts: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
+    + '请把地址栏里的整段链接复制粘贴到这里（它带着 secret 参数）：',
+  lobsterai: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
+    + '请把地址栏里的整段链接复制粘贴到这里（它带着 authCode 参数）：',
+  gemini: '如果浏览器停在「无法访问此网站 / localhost」，'
+    + '请把地址栏里的整段链接复制粘贴到这里（它带着 code 参数）：',
+  raccoon: '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
+    + '请把地址栏里的整段链接复制粘贴到这里（它带着 code 参数）：',
+}
+
+/** 各家回调链接的样式（仅作占位提示，不参与解析）。 */
+const MANUAL_CALLBACK_PLACEHOLDERS = {
+  trae: 'http://127.0.0.1:18080/authorize?refreshToken=…',
+  codearts: 'http://127.0.0.1:端口/authentication?secret=…',
+  lobsterai: 'http://127.0.0.1:18081/auth/callback?authCode=…',
+  gemini: 'http://localhost:8845/oauth-callback?code=4/0A…',
+  raccoon: 'http://127.0.0.1:18082/auth/callback?code=…',
+}
+
+/**
+ * 渲染「粘贴回调链接」输入框 + 提交按钮。
+ *
+ * ⚠️ 提交成功后**不刷新页面、不清空轮询**：材料只是写回登录会话，
+ * 真正的换取发生在面板既有的轮询里（`ExchangeToken` 会轮换 refreshToken，
+ * 只能有一个交换出口）。故这里只提示「已收到，正在换取」。
+ */
+function renderManualCallbackInput(el, providerId) {
+  const wrap = document.createElement('div')
+  wrap.className = 'manual-callback'
+  const tip = document.createElement('div')
+  tip.className = 'hint'
+  tip.textContent = MANUAL_CALLBACK_HINTS[providerId]
+    || '如果浏览器停在「无法访问此网站 / 127.0.0.1」，'
+      + '请把地址栏里的整段链接复制粘贴到这里（它带着登录凭证）：'
+  wrap.appendChild(tip)
+
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.placeholder = MANUAL_CALLBACK_PLACEHOLDERS[providerId]
+    || 'http://127.0.0.1:端口/回调?凭证参数=…'
+  input.spellcheck = false
+  wrap.appendChild(input)
+
+  const btn = document.createElement('button')
+  btn.textContent = '提交回调链接'
+  const status = document.createElement('div')
+  status.className = 'hint'
+
+  btn.onclick = async () => {
+    const value = input.value.trim()
+    if (value === '') { status.textContent = '请先粘贴链接'; return }
+    // ⚠️ `state` 必须用**本次登录**的那个（本地变量由调用方闭包持有）。
+    const r = await api('/admin/providers/login/submit-callback', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ state: el._loginState, callbackUrl: value }),
+    })
+    if (r.ok && r.body && r.body.ok) {
+      status.textContent = '已收到回调材料，正在换取凭据…（不需要再点别的，等本页自动完成）'
+      btn.disabled = true
+      input.disabled = true
+      return
+    }
+    // ⚠️ 失败要**如实显示服务端原因**（常见：链接粘错、会话过期、上游换了流程）
+    const msg = r.body && r.body.error && r.body.error.message
+      ? r.body.error.message
+      : (r.body && r.body.message) || '提交失败'
+    status.textContent = msg
+  }
+
+  wrap.appendChild(btn)
+  wrap.appendChild(status)
+  el.appendChild(wrap)
 }
 
 // ─────────────────────────── 任务中心 ───────────────────────────
@@ -1414,7 +1517,22 @@ const CAPS = [
  * 也就是说：把 trae 加进来只是让它显示成「浏览器登录」，
  * 真正让它出现在下拉里的是 `trae.ts` 的 `capabilities.login = true`。
  */
-const LOGIN_KIND_LABEL = { codearts: '浏览器登录', trae: '浏览器登录', raccoon: '微信扫码', cline: '用户码登录', loomy: '短信验证码登录' }
+// ⚠️ 这是**展示文案**，不改能力判据 —— 能否登录由 `capabilities.login` 决定
+// （见 `startModalLogin`）。这里只让用户知道点开后会遇到什么形态。
+//
+// ## 2026-11-21 的更正
+//
+// - `codearts` / `trae` / `lobsterai` / `gemini` / `raccoon`：回调都落在
+//   **本机端口**，Workers 收不到 ⇒ 走「**浏览器登录 + 粘贴回调链接**」。
+//   标签写「浏览器登录」是准确的；用户会在弹窗里看到一个输入框
+//   （见 `MANUAL_CALLBACK_PROVIDERS`）—— 那不是跳过了一步，而是那一步必须由人搬。
+// - `raccoon` 原先写「微信扫码」—— **那个扫码页已 404**（实测），
+//   写扫码会让用户拿着一个死二维码到处试。
+// - `minimaxintl` 与 `minimax` 同形（设备码 + PKCE），故同标签。
+const LOGIN_KIND_LABEL = { 
+  loomy: '短信验证码登录', cline: '用户码登录', minimax: '用户码登录', minimaxintl: '用户码登录',
+  codearts: '浏览器登录', trae: '浏览器登录', lobsterai: '浏览器登录', gemini: '浏览器登录', raccoon: '浏览器登录',
+}
 
 /** 缓存的供应商目录（弹窗要用）。 */
 let providerCache = []
@@ -2322,6 +2440,9 @@ async function startModalLogin(providerId, out) {
   if (!res.ok) { out.textContent = JSON.stringify(res.body, null, 2); return }
   const state = res.body.state
   clear(out)
+  // ⚠️ 「手动粘贴回调链接」那条 UI 需要拿到本次登录的 `state` —— 它把回调材料
+  // 写回**这个**会话。挂到 DOM 节点上比串参数到处传更省事（且只有一处消费）。
+  out._loginState = state
   // ⚠️ 必须走**共享**渲染函数：扫码家（raccoon）返回的是 `qrSvg` 而非 `authUrl`。
   // 我第一版这里直接读 `res.body.authUrl` —— 对扫码家就是 `undefined`，
   // 用户看到的就是「商汤登录显示 undefined」。

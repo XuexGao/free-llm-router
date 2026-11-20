@@ -1843,11 +1843,27 @@ export const codeartsProvider: Provider = {
      * 那些都试过了，问题在华为侧的跳转链，不在我们这边。
      * 除非华为支持设备码或远程回调，否则只能「粘贴凭据导入」。
      */
-    login: false,
-    loginBlockedReason:
-      '华为的登录跳转链在服务端会死循环（浏览器被反复送回登录页），'
-      + '而它的回调只认本机 127.0.0.1 端口 —— Worker 收不到。这是上游的协议限制，'
-      + '不是本服务的缺失。请从码道 IDE / 桌面端导出凭据后粘贴导入。',
+    /**
+     * ✅ **可用** —— 走「**手动粘贴回调链接**」（2026-11-21 改）。
+     *
+     * ## ⚠️ 上面那条事实没有变
+     *
+     * 华为的回调**仍然**只落到 `127.0.0.1:<port>/authentication`，而那条
+     * `devcloud → authui/login` 的跳转链**仍然**会把浏览器送回登录页
+     * （对任意 `auth_callback_url` 都逐字节相同 ⇒ 它根本不读那个参数）。
+     * Worker 收不到本机端口。
+     *
+     * ## ⇒ 走的是另一条：让用户把地址栏**粘回来**
+     *
+     * 用户在本机完成登录后，浏览器虽然进了死循环/无法访问，但**地址栏里
+     * 带着 `?secret=…`**（也可能是 `fingerprint` 或直接 `token`）。
+     * `/admin/providers/login/submit-callback` 收下这段 URL，
+     * 复用与浏览器回调**同一份** `parseCodeArtsCallbackQuery` 解析，
+     * 再由面板既有的轮询去 ticket 端点换凭据。
+     *
+     * 这条路不需要本地端口，也不需要华为配合。
+     */
+    login: true,
     listModels: true,
     chat: true,
     balance: true,

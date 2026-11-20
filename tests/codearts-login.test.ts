@@ -23,6 +23,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import {
   buildCodeArtsCallbackUrl,
@@ -414,7 +415,7 @@ test('⚠️ 服务端万一同时下发续期材料，必须透传（否则可�
 
 // ─────────────────── ⑦ 能力声明 ───────────────────
 
-test('❌ codearts 必须声明 login=false —— 华为登录链在服务端就是死循环', () => {
+test('✅ codearts 可登录，但**只能**走「手动粘贴回调链接」（死循环那条路依然不通）', () => {
   // ## 被用户两次真实登录推翻的结论（2026-10-04）
   //
   // 用户登录后被送到**华为自己的中间页**（不是我们的回调）：
@@ -432,11 +433,32 @@ test('❌ codearts 必须声明 login=false —— 华为登录链在服务端�
   //
   // 参考实现能成是因为它用 `http://127.0.0.1:<port>/authentication`，
   // 浏览器**直连本机端口**，不经过 authui/login 的二次跳转。Worker 收不到。
+  //
+  // ## ⇒ 2026-11-21：改走「手动粘贴回调链接」
+  //
+  // 上面那些事实**一个字没变**（跳转链照样死循环、`auth_callback_url` 照样不被读）。
+  // 变的是结论：登录**确实会在用户浏览器里完成一次**，而那一刻地址栏带着
+  // `?secret=…`。让用户把它粘回来即可，不需要本地端口。
   const provider = findProvider('codearts')
-  assert.equal(provider?.capabilities.login, false, 'codearts 不能声称支持登录')
+  assert.equal(provider?.capabilities.login, true, 'codearts 应声明可登录（手动回调路径）')
+
+  // ⚠️ 判据必须打在**真实接线**上：只翻 `login: true` 而没有入口，
+  // 用户点「登录」会得到「不支持从本服务发起登录」—— 那是空头承诺。
+  const index = readFileSync('src/index.ts', 'utf8')
+  const i = index.indexOf("path === '/admin/providers/login/submit-callback'")
+  assert.ok(i >= 0, '必须存在手动提交回调的端点')
+  const block = index.slice(i, i + 6000)
   assert.ok(
-    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
-    '阻塞原因必须点明是「回调只认本机 127.0.0.1」',
+    block.includes('parseCodeArtsCallbackQuery('),
+    'codearts 的提交入口必须复用 parseCodeArtsCallbackQuery（不得另写一份解析）',
+  )
+
+  // ⚠️ 而**回调处理器**本身就复用同一份 —— 同一件事只能有一个实现。
+  const handler = index.indexOf('async function handleCodeArtsCallback(')
+  assert.ok(handler >= 0)
+  assert.ok(
+    index.slice(handler, handler + 6000).includes('parseCodeArtsCallbackQuery('),
+    '回调处理器也必须调同一个纯函数（否则两处判据会分叉）',
   )
 })
 

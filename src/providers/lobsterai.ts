@@ -50,6 +50,24 @@ import {
 export const LOBSTERAI_API_BASE = 'https://lobsterai-server.youdao.com'
 
 /**
+ * 用授权码换取凭据的端点（**不带 Authorization**）。
+ *
+ * ## ⚠️ 路径是**推断**的，不是从参考实现抄来的
+ *
+ * 参考实现的 `lobsterai-oauth.ts` 只导出 `exchangeLobsteraiAuthCode`，
+ * 端点常量 `LOBSTERAI_EXCHANGE_PATH` 定义在它的 `lobsterai.ts` 里，
+ * 而那份文件的该常量在我核对时**未包含在可读片段内**。故这里按它的
+ * refresh 端点命名规律（`/api/auth/refresh`）取 `/api/auth/exchange`。
+ *
+ * ⚠️ **这是本模块唯一未经实测的端点**：接手动回调登录时**必须先用真实
+ * 授权码验证一次**。若 404，改这里即可 —— 其余流程（会话、粘码、解析、
+ * 落盘）与端点无关。
+ */
+export const LOBSTERAI_EXCHANGE_PATH = '/api/auth/exchange'
+/** 登录回调路径（本机端口；由 portal 回跳）。 */
+export const LOBSTERAI_CALLBACK_PATH = '/auth/callback'
+
+/**
  * 续期路径（`POST /api/auth/refresh`，**不带 Authorization**）。
  *
  * 依据：参考实现 `src/lobsterai.ts:34` / `lobsterai-auth.ts:524`。
@@ -147,8 +165,14 @@ const FALLBACK_MODELS: ReadonlyArray<{ id: string; name: string; contextWindow: 
 let cachedClientVersion: string | undefined
 let cachedClientVersionAt = 0
 
-/** 解析客户端版本号：内存缓存 → 上游更新接口 → 兜底常量。 */
-async function resolveClientVersion(signal: AbortSignal): Promise<string> {
+/**
+ * 解析客户端版本号：内存缓存 → 上游更新接口 → 兜底常量。
+ *
+ * ⚠️ 导出它是给**登录换码**用的：`version` 是那 5 个必填字段之一，
+ * 而它必须是**真值**（编造会让换码被拒）。故登录与签到/续期共用同一份实现，
+ * 不要各自再写一遍。
+ */
+export async function resolveClientVersion(signal: AbortSignal): Promise<string> {
   const now = Date.now()
   if (cachedClientVersion !== undefined && now - cachedClientVersionAt < VERSION_CACHE_TTL_MS) {
     return cachedClientVersion
@@ -1046,13 +1070,25 @@ export const lobsteraiProvider: Provider = {
   capabilities: {
     // 🔴 见文件头「登录为什么不可用」：授权码只能经 127.0.0.1 本地回调拿到
     // （`lobsterai-oauth.ts:256,348`），Workers 无法监听本地端口。
-    login: false,
-    loginBlockedReason:
-      'LobsterAI 登录会把浏览器的授权回调打回本机 127.0.0.1 的临时端口，'
-      + 'Cloudflare Workers 无法监听本地端口，也没有设备码轮询之类的替代流程。'
-      + '请在 LobsterAI 桌面客户端里完成登录，然后导出凭据 JSON'
-      + '（含 access_token、refresh_token、user_id、uuid、first_keyfrom、latest_keyfrom 这几项），'
-      + '粘贴到本项目的「导入凭据」里 —— 缺 uuid 与 keyfrom 会导致之后无法自动续期。',
+    /**
+     * ✅ **可用** —— 走「**手动粘贴回调链接**」（2026-11-21 改）。
+     *
+     * ## ⚠️ 上面那条事实没有变
+     *
+     * LobsterAI 的 `redirect_uri` **必须**是
+     * `http://127.0.0.1:<port>/auth/callback`（portal 登录页会校验），
+     * 而 Workers 没有监听 socket ⇒ 浏览器那一跳我们接不住。
+     *
+     * ## ⇒ 走的是另一条：让用户把地址栏**粘回来**
+     *
+     * 用户在本机完成登录后，浏览器虽然打不开那个端口，但**地址栏里带着
+     * `?authCode=…`**。`/admin/providers/login/submit-callback` 收下这段 URL，
+     * 由面板既有的轮询去 `/api/auth/exchange` 换凭据。
+     *
+     * ⚠️ **`LOBSTERAI_EXCHANGE_PATH` 是推断值、未经实测** ——
+     * 见该常量的注释。接真实账号时必须先验证一次。
+     */
+    login: true,
     listModels: true,
     chat: true,
     balance: true,
@@ -1114,4 +1150,197 @@ export const lobsteraiProvider: Provider = {
   shouldRotate(status: number): boolean {
     return status === 429 || status === 402 || status === 401 || status === 403
   },
+}
+
+// ───────────────────── 登录（手动粘贴回调链接） ─────────────────────
+
+/**
+ * 一次 LobsterAI 登录会话。
+ *
+ * ⚠️ `uuid` / `firstKeyfrom` 由**客户端**生成并贯穿账号生命周期：
+ * 它们不在服务端响应里，而是要在换码时提交、并在之后**每次续期**时原样回传
+ * （见 {@link lobsteraiKeyfromBody}）。故必须随凭据持久化。
+ */
+export interface LobsteraiLoginSession {
+  /** 安装 UUID（对齐参考实现 `main.go:166` 的 `newUuid()`）。 */
+  uuid: string
+  /** 首次登录时间戳（毫秒字符串）。 */
+  firstKeyfrom: string
+  /** portal 登录 URL（用户在浏览器打开它）。 */
+  loginUrl: string
+}
+
+/**
+ * 生成一次性登录会话。
+ *
+ * ⚠️ 用 `crypto.randomUUID()`（Web 标准），**不是** `node:crypto`
+ * —— 本模块必须能在 Workers 里跑。
+ */
+export function createLobsteraiLoginSession(nowMs: number = Date.now()): LobsteraiLoginSession {
+  const uuid = crypto.randomUUID()
+  const firstKeyfrom = String(nowMs)
+  // ⚠️ `redirect_uri` 必须是 `http://127.0.0.1:<port>/auth/callback` 形态：
+  // portal 的登录页会**校验**这个约束（参考实现 `main.go:223-225`）。
+  //
+  // 但我们**不需要真的有端口在监听** —— 用户在本机完成登录后，浏览器会打向
+  // 那个端口并失败，而**地址栏里带着 `?authCode=…`**。用户把它粘回面板即可，
+  // 由 `/admin/providers/login/submit-callback` 收下（与 trae/codearts 同一条路）。
+  //
+  // ⚠️ 端口取 18081（与 TRAE 的 18080 错开）：它只是 URL 里的一个字符串，
+  // 但两个产品共用同一个端口容易让用户在地址栏里混淆。
+  const redirectUri = `http://127.0.0.1:18081${LOBSTERAI_CALLBACK_PATH}`
+  const query = new URLSearchParams({
+    source: 'electron',
+    redirect_uri: redirectUri,
+    // ⚠️ `state` 用 uuid：它随会话持久化，回调里原样带回，可用于校验。
+    state: uuid,
+  })
+  // ⚠️ 必须手工拼 hash 段：`#/login` 属于 fragment，
+  // `URL.searchParams` 只能构造 query，拼不出「路径 + hash + ?query」这种形态。
+  const loginUrl = `https://lobsterai.youdao.com/portal#/login?${query.toString()}`
+  return { uuid, firstKeyfrom, loginUrl }
+}
+
+/**
+ * 匿名请求头（换码用 —— 此时**还没有** access token）。
+ *
+ * 只设三个头。LobsterAI 不认腾讯系那套归属头。
+ */
+export function lobsteraiAnonymousHeaders(): Record<string, string> {
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'User-Agent': LOBSTERAI_USER_AGENT,
+  }
+}
+
+/**
+ * 从一段回调 URL 里取出 `authCode`（**纯函数**）。
+ *
+ * ## 三种形态都要认（实测最易漏的是第 3 种）
+ *
+ * 1. `?authCode=…`（参考实现 `main.go` 的主形态）；
+ * 2. `?code=…`（OAuth 惯例，portal 也可能这么回）；
+ * 3. **hash 段里带的 query**（`#/login?...`）——
+ *    ⚠️ **fragment 不会进 `URL.search`**，必须手工解。这与本项目在
+ *    `state?refreshToken=…` 上踩过的是同一类问题。
+ *
+ * @returns 空串表示「没有授权码」（不是错误：可能只是登录中间页）
+ */
+export function parseLobsteraiCallbackCode(rawUrl: string): string {
+  const text = rawUrl.trim()
+  if (text === '') return ''
+
+  // ① 普通 query（完整 URL 或只有 `?a=b` 都接受）
+  const marker = text.indexOf('?')
+  if (marker >= 0) {
+    const rest = text.slice(marker + 1)
+    // ⚠️ 先截掉 hash 段，否则 `?authCode=x#/login` 会把 `x#/login` 当成值。
+    const hashAt = rest.indexOf('#')
+    const search = new URLSearchParams(hashAt >= 0 ? rest.slice(0, hashAt) : rest)
+    const fromQuery = search.get('authCode')
+      ?? search.get('auth_code')
+      ?? search.get('code')
+      ?? ''
+    if (fromQuery.trim() !== '') return fromQuery.trim()
+  }
+
+  // ② hash 段里带的 query（`#/login?authCode=…`）
+  const hashMark = text.indexOf('#')
+  if (hashMark >= 0) {
+    const fragment = text.slice(hashMark + 1)
+    const innerMark = fragment.indexOf('?')
+    if (innerMark >= 0) {
+      const inner = new URLSearchParams(fragment.slice(innerMark + 1))
+      const fromHash = inner.get('authCode')
+        ?? inner.get('auth_code')
+        ?? inner.get('code')
+        ?? ''
+      if (fromHash.trim() !== '') return fromHash.trim()
+    }
+  }
+
+  return ''
+}
+
+/**
+ * 用授权码换取凭据。
+ *
+ * ## 请求体**必须**含 5 个字段（对齐参考实现 `main.go:264-270`）
+ *
+ * `authCode` / `firstKeyfrom` / `latestKeyfrom` / `uuid` / `version`。
+ * 缺任一个上游都会拒绝，且错误文案不会指出缺哪个 —— 故这里每次都全带上。
+ *
+ * ⚠️ `latestKeyfrom` 取**当前时刻**（登录这一次是新活动），
+ * 而续期用的是**存储值**（见 {@link lobsteraiKeyfromBody}）—— 两者刻意不同。
+ *
+ * ⚠️ 该端点**不需要** `Authorization` 头（换 token 时还没有 token）。
+ *
+ * @param clientVersion 客户端版本号（用真值，不要编造）
+ */
+export async function exchangeLobsteraiAuthCode(
+  code: string,
+  session: Pick<LobsteraiLoginSession, 'uuid' | 'firstKeyfrom'>,
+  clientVersion: string,
+  signal: AbortSignal,
+): Promise<ProviderCredential> {
+  const body = {
+    authCode: code,
+    firstKeyfrom: session.firstKeyfrom,
+    // ⚠️ 登录这一次用当前时刻（新活动），与续期用存储值是两回事。
+    latestKeyfrom: String(Date.now()),
+    uuid: session.uuid,
+    version: clientVersion,
+  }
+
+  let response: Response
+  try {
+    response = await fetch(`${LOBSTERAI_API_BASE}${LOBSTERAI_EXCHANGE_PATH}`, {
+      method: 'POST',
+      headers: lobsteraiAnonymousHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    throw new ProviderError({
+      provider: 'lobsterai',
+      retryable: true,
+      message: `LobsterAI 换码请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await response.text().catch(() => '')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new ProviderError({
+      provider: 'lobsterai',
+      httpStatus: response.status,
+      message: `LobsterAI 换码响应不是 JSON（HTTP ${response.status}）：${text.slice(0, 160)}`,
+    })
+  }
+
+  const envelope = parseLobsteraiEnvelope(parsed)
+  if (!envelope.ok) {
+    // ⚠️ **业务失败也带原文**：上游习惯用 `code:0 + data:null` 的形态，
+    // 只说「失败」会让用户与本项目都无法定位。
+    throw new ProviderError({
+      provider: 'lobsterai',
+      httpStatus: response.status,
+      message: `LobsterAI 换码失败（code=${envelope.code}）：${envelope.message}`,
+    })
+  }
+
+  // ⚠️ 走**同一个** `parseCredential`：保证「登录进来」与「粘贴导入」落成同一条
+  // 账号记录（uid 规则、extras 字段都一致）。若在这里另写一份字段映射，
+  // 同一账号会出现两条记录，且续期时 extras 可能缺失。
+  const data = envelope.data
+  return parseCredential({
+    ...data,
+    // 这三个字段**不在**响应里，必须由会话补上（见 LobsteraiLoginSession 的说明）。
+    uuid: session.uuid,
+    first_keyfrom: session.firstKeyfrom,
+    latest_keyfrom: String(Date.now()),
+  })
 }

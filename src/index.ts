@@ -64,6 +64,23 @@ const CLINE_DEVICE_MIN_INTERVAL_MS = 1_000
  * —— 否则第一轮写回就把宽限抹掉了，等于没加。
  */
 const CLINE_LOGIN_SESSION_GRACE_MS = 60_000
+
+/**
+ * LobsterAI 手动回调登录的会话有效期（10 分钟）。
+ *
+ * 与 codearts / trae 同量级：用户要在浏览器里完成登录、再复制地址、再粘回来，
+ * 给的窗口太短会在「找地址栏」那一步就过期。**刻意不设更长**：
+ * `state` + `uuid` 是能换取一份凭据的能力凭证。
+ */
+const LOBSTERAI_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+
+/**
+ * Gemini 手动回调登录的会话有效期（10 分钟）。
+ *
+ * ⚠️ 与**授权码自身的寿命**对齐：Google 的授权码约 10 分钟过期，
+ * 故会话设更长没有意义（粘回来也换不到令牌，只会得到 `invalid_grant`）。
+ */
+const GEMINI_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
 import type { AccountState } from './pool/state.js'
 import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
@@ -117,12 +134,12 @@ async function loadAggregateCatalogForModels(
         const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
         const accounts = await pool.listAccounts(realm, Date.now())
         const account = accounts.find(
-          (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled,
+          (a) => (a.provider ?? LEGACY_PROVIDER) === providerId && !a.disabled,
         )
         if (account === undefined) continue
         const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
         if (credential === undefined) continue
-        const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const bound = providerForCall(providerId, provider, () => bindBuddy(env))
         const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
         // ⚠️ **必须过滤用户停用的模型**（与主目录 `disabled.has(m.id)` 同一条纪律）。
         //
@@ -151,9 +168,12 @@ import { jsonError } from './gateway/http.js'
 import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
   DEFAULT_PROVIDER,
+  ENV_BOUND_PROVIDER,
+  LEGACY_PROVIDER,
   findProvider,
   parseCredentialAnywhere,
   providerCatalog,
+  providerForCall,
   providerIds,
   PROVIDERS,
 } from './providers/index.js'
@@ -400,13 +420,45 @@ function toProviderCredential(providerId: string, cred: LoginCredential): Provid
  * 国际版（realm=global）登录会被存进 cn 分片 —— 表现为「登录成功，但账号列表为空」，
  * 且极难归因。故这里自己按 `extras['realm']` 取 stub。
  */
+/**
+ * 存储 key 的**唯一**构造规则（登录落盘与批量导入共用）。
+ *
+ * ## 🔴 为什么不能按「是不是默认供应商」决定加不加前缀（真实故障）
+ *
+ * 改前规则是 `providerId === DEFAULT_PROVIDER ? uid : \`${providerId}:${uid}\``。
+ * 它把「存储 key 的形状」绑在了**一个会变的配置值**上，代价是：
+ *
+ * - 默认供应商从 buddy 改成 Trae 之后，**同一个 Trae 账号**在改动前落盘是
+ *   `trae:12345`、改动后是 `12345` —— 两条记录指向同一份凭据，
+ *   账号列表里出现重复项，而旧账号的冷却/停用标记仍挂在旧 key 上
+ *   （表现：禁用了旧的那条，新的那条照旧可用）。
+ * - 更糟的是**历史 buddy 账号**：它们存的是**裸 uid**（没有前缀），
+ *   若规则改成「都加前缀」，这些账号会全部读不到。
+ *
+ * ## ⇒ 现行规则：**按供应商 id 白名单**，与默认供应商彻底无关
+ *
+ * - `buddy` / `workbuddy`：**裸 uid**（历史数据就是这么存的，不能变）。
+ *   这两个变体的 uid 本身就是互补的（国内 JWT 的 `sub` 与国际化账号体系不同），
+ *   且历史实现里从未加过前缀。
+ * - 其余所有供应商：`<provider>:<uid>`。
+ *
+ * ⚠️ 这条规则**是持久化格式**：改动它等于改数据的物理地址。改之前必须
+ * 同时提供迁移（读写两侧都要认旧 key），否则就是把既有账号「弄丢」。
+ */
+const BARE_UID_PROVIDERS: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+
+/** 构造账号的存储 key（见 {@link BARE_UID_PROVIDERS} 的规则说明）。 */
+function storageUidFor(providerId: string, uid: string): string {
+  return BARE_UID_PROVIDERS.has(providerId) ? uid : `${providerId}:${uid}`
+}
+
 async function persistProviderCredential(
   env: Env,
   credential: ProviderCredential,
   now: number,
 ): Promise<Record<string, unknown>> {
   const providerId = credential.provider
-  const storageUid = providerId === DEFAULT_PROVIDER ? credential.uid : `${providerId}:${credential.uid}`
+  const storageUid = storageUidFor(providerId, credential.uid)
   const realm = credential.extras['realm'] ?? 'cn'
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   await pool.createAccount(
@@ -445,7 +497,7 @@ async function realmForProvider(
   for (const realm of candidates) {
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const has = (await pool.listAccounts(realm, Date.now())).some(
-      (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+      (a) => (a.provider ?? LEGACY_PROVIDER) === providerId,
     )
     if (has) return realm
   }
@@ -632,6 +684,72 @@ function escapeHtml(text: string): string {
  *   它既读回这里的结果、也能自己再打一次 ticket 端点。
  * 这样即使 `waitUntil` 被 Worker 提前回收（它只是尽力而为），登录也不会失败。
  */
+/**
+ * 从华为回调的 query 里解出 `state` 与 `secret`（**纯函数**）。
+ *
+ * ## ⚠️ 为什么必须抽出来（而不是留在回调处理器里）
+ *
+ * 「手动粘贴回调链接」那条路径（`/admin/providers/login/submit-callback`）也要
+ * 解析**同一种** URL。若在那边再写一遍参数提取，就会出现两份实现 ——
+ * 而本仓库反复踩过「同一个 bug 只修一半」（`parseSseLine` 那次最典型：
+ * 一处容忍 `data:` 无空格、另一处不容忍，于是错误帧永远扫不到）。
+ *
+ * 故判据只此一份：回调处理器与手动提交都调它。
+ *
+ * ## 三种完成信号都要认（实测）
+ *
+ * 1. `?secret=<值>` —— 标准形态；
+ * 2. `?fingerprint=<base64(URL)>` —— 解出内层 URL，从它的 query 取 token；
+ *    ⚠️ 实测它**未必带 token**（可能只是 `/doer/login?...` 自身地址）；
+ * 3. `?token=` / `access_token` / `accessToken` / `authCode` —— 直接回传。
+ *
+ * @returns `secret` 为**空串**表示「还没完成」（不是错误）
+ */
+export function parseCodeArtsCallbackQuery(
+  search: URLSearchParams,
+): { state: string; secret: string; fingerprintToken: string } {
+  let state = search.get('state') ?? ''
+  let secret = search.get('secret') ?? ''
+
+  // ② `fingerprint` 内层 URL 的 token（解不出就留空，不当作错误）
+  let fingerprintToken = ''
+  const fingerprintRaw = search.get('fingerprint') ?? ''
+  if (fingerprintRaw !== '') {
+    try {
+      // Workers 里没有 Buffer，用 atob 解 base64（含 URL-safe 变体）
+      const normalized = fingerprintRaw.replaceAll('-', '+').replaceAll('_', '/')
+      const decoded = atob(normalized)
+      const inner = new URLSearchParams(new URL(decoded).search)
+      fingerprintToken = inner.get('token')
+        ?? inner.get('access_token')
+        ?? inner.get('accessToken')
+        ?? inner.get('authCode')
+        ?? ''
+    } catch {
+      // 解码失败：不当作错误（它可能只是我们看不懂的中间态），继续走 secret 分支
+    }
+  }
+
+  // ⚠️ 最坏情况：上游把 `?secret=` 直接拼在了已有 query 后面，
+  // 于是 state 变成 `"<state>?secret=<secret>"`。剥出来，否则两边都拿不到。
+  const questionMark = state.indexOf('?')
+  if (questionMark >= 0) {
+    const inner = new URLSearchParams(state.slice(questionMark + 1))
+    if (secret === '') secret = inner.get('secret') ?? ''
+    state = state.slice(0, questionMark)
+  }
+
+  // ③ 直接回传 token
+  const directToken = search.get('token')
+    ?? search.get('access_token')
+    ?? search.get('accessToken')
+    ?? search.get('authCode')
+    ?? ''
+  if (directToken !== '') secret = secret === '' ? directToken : secret
+
+  return { state, secret, fingerprintToken }
+}
+
 async function handleCodeArtsCallback(
   env: Env,
   ctx: ExecutionContext,
@@ -663,32 +781,15 @@ async function handleCodeArtsCallback(
    * 那种情况下它**不是**完成信号，应继续当作「等待中」，而不是报错。
    * 故这里只在**真的解出 token** 时才认它。
    */
+  // ⚠️ 三种完成信号的解析**只有一份实现**（`parseCodeArtsCallbackQuery`），
+  // 手动提交回调的那条路径也调它 —— 见该函数头部的说明。
   let fingerprintToken = ''
-  const fingerprintRaw = params.get('fingerprint') ?? ''
-  if (fingerprintRaw !== '') {
-    try {
-      // Workers 里没有 Buffer，用 atob 解 base64（含 URL-safe 变体）
-      const normalized = fingerprintRaw.replaceAll('-', '+').replaceAll('_', '/')
-      const decoded = atob(normalized)
-      const inner = new URLSearchParams(new URL(decoded).search)
-      fingerprintToken = inner.get('token')
-        ?? inner.get('access_token')
-        ?? inner.get('accessToken')
-        ?? inner.get('authCode')
-        ?? ''
-    } catch {
-      // 解码失败：不当作错误（它可能只是我们看不懂的中间态），继续走 secret 分支
-    }
-  }
-
-  // ⚠️ 最坏情况的剥离：若华为把 `?secret=` 直接拼在了已有 query 后面，
-  // 我们会解析出 `state = "<state>?secret=<secret>"`。把 secret 剥出来，
-  // 否则 state 找不到会话、而 secret 又缺失 —— 表现为「回调页报参数缺失」。
-  const questionMark = state.indexOf('?')
-  if (questionMark >= 0) {
-    const inner = new URLSearchParams(state.slice(questionMark + 1))
-    if (secret === '') secret = inner.get('secret') ?? ''
-    state = state.slice(0, questionMark)
+  {
+    const parsed = parseCodeArtsCallbackQuery(params)
+    // state 已在上面从**路径**取过；路径优先，故只在路径为空时采用 query 的。
+    if (state === '') state = parsed.state
+    if (secret === '') secret = parsed.secret
+    fingerprintToken = parsed.fingerprintToken
   }
 
   // ⚠️ **诊断日志**（排查「登录后一直显示登录中」必需）。
@@ -719,16 +820,6 @@ async function handleCodeArtsCallback(
 
   // ⚠️ `fingerprint` 里解出 token 时，它**等价于** `secret`（都是完成信号），
   // 故不能因为它没带 `secret` 就判「参数不完整」。
-  // ⚠️ 第三种可能：华为**直接回传 token**（参考实现的 `pickToken` 就是为这条路径准备的，
-  // 见 `login.ts:149-155`）。它认 `token` / `access_token` / `accessToken` / `authCode`。
-  // 我们的实现原先只认 `secret` —— 若上游换成直接回传，我们会判「参数不完整」。
-  const directToken = params.get('token')
-    ?? params.get('access_token')
-    ?? params.get('accessToken')
-    ?? params.get('authCode')
-    ?? ''
-  if (directToken !== '') secret = secret === '' ? directToken : secret
-
   if (state === '' || (secret === '' && fingerprintToken === '')) {
     // ⚠️ 文案要点明**收到了什么**，便于用户与我们一起定位。
     // 实测用户反馈：华为把他送到了 `/doer/login?...&fingerprint=<base64(当前URL)>`，
@@ -1364,7 +1455,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // - `workbuddy`（国际版）→ `www.workbuddy.ai`
     // 两家的 `/v2/plugin/auth/state` 协议完全相同，只是域名不同
     // （实测国际版返回 `https://www.workbuddy.ai/login?platform=CLI&state=...`）。
-    const loginProvider = body.provider ?? DEFAULT_PROVIDER
+    const loginProvider = body.provider ?? LEGACY_PROVIDER
     // ⚠️ **realm 由供应商决定，不由客户端决定**。
     // 国际版账号必须落 `global` 分片，且会话也必须存在同一个分片里，
     // 否则轮询时找不到会话（轮询按 realm 分片逐个查）。
@@ -1408,7 +1499,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
       // ⚠️ 按**会话里记的供应商**选登录域与 realm：
       // 会话是发起时写下的，比客户端在轮询阶段的任何输入都可信。
-      const providerId = session.provider ?? DEFAULT_PROVIDER
+      const providerId = session.provider ?? LEGACY_PROVIDER
       const bases = resolveUpstream(env)
       const chatBase = providerId === WORKBUDDY_INTL.id ? WORKBUDDY_INTL.chatBase : bases.chat
       const sessionRealm = providerId === WORKBUDDY_INTL.id ? 'global' : session.realm
@@ -1518,13 +1609,25 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const loginRealm = body.realm ?? (providerId === WORKBUDDY_INTL.id ? 'global' : 'cn')
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(loginRealm))
 
-    if (providerId === 'qoder') {
+    // ── qoder（阿里系，国际版）/ qodercn（中国版） ──
+    //
+    // ⚠️ **两站共用一套设备码流程**，差异只在 `startQoderLogin` 的参数
+    // （`buildQoderProduct` 决定 authBase / clientId / openApiBase）。
+    // 轮询侧**不需要**再分派：`pollQoderLogin` 从会话里读 `productId`，
+    // 会话是发起时写下的，比客户端在轮询阶段的任何输入都可信。
+    if (providerId === 'qoder' || providerId === 'qodercn') {
       const { startQoderLogin } = await import('./providers/qoder.js')
-      const session = await startQoderLogin('qoder')
+      // ⚠️ 必须传对 variant：传错会让用户在**错误的站点**授权，
+      // 拿到的令牌打不通对应站的推理端点（401，且看起来像「凭据坏了」）。
+      const session = await startQoderLogin(providerId)
       const state = crypto.randomUUID()
       // 会话存 DO（**不返回 verifier 给前端**：那是换取令牌的秘密）
-      await pool.saveLoginSession(state, { provider: 'qoder', kind: 'qoder', session }, Date.now() + 15 * 60 * 1000)
-      return json({ ok: true, provider: 'qoder', state, authUrl: session.loginUrl })
+      await pool.saveLoginSession(
+        state,
+        { provider: providerId, kind: 'qoder', session },
+        Date.now() + 15 * 60 * 1000,
+      )
+      return json({ ok: true, provider: providerId, state, authUrl: session.loginUrl })
     }
     if (providerId === 'zcode') {
       const { startZcodeLogin } = await import('./providers/zcode.js')
@@ -1642,28 +1745,40 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // ⚠️ 会话存 `cn` 分片：raccoon 的凭据不带 `extras.realm`，
     // 与 buddy 同属国内分片（见 `realmForProvider`）。
     if (providerId === 'raccoon') {
-      const { beginRaccoonQrLogin } = await import('./providers/raccoon.js')
-      const started = beginRaccoonQrLogin()
+      // ## ⚠️ 2026-11-21：扫码链已死，改走官方浏览器授权链
+      //
+      // 实测：扫码确认页 `/login/mp` **已 404**（签发本身成功，但用户扫进去
+      // 只看到 404 页，界面上零报错）。而轮询端点仍正常 ⇒ 旧实现会一直「耐心
+      // 等待」一个永远不会被完成的授权。
+      //
+      // ⇒ 改用官方现在走的那条：`/authorize` 页 → 回跳 127.0.0.1 带 code →
+      // `login_with_authorization_code` 换码。回跳落在本机端口，故与
+      // trae / codearts / lobsterai / gemini 同一条路：**手动粘贴回调链接**。
+      const { createRaccoonAuthorizeSession } = await import('./providers/raccoon.js')
+      const session = createRaccoonAuthorizeSession()
       const state = crypto.randomUUID()
+      const expiresAt = Date.now() + RACCOON_LOGIN_STATE_TTL_MS
       await pool.saveLoginSession(
         state,
         {
           provider: 'raccoon',
           kind: 'raccoon',
           realm: loginRealm,
-          // ⚠️ 存 `qrcode_code`：轮询时必须原样回传，丢了就再也查不到这个会话
-          qrCode: started.code,
+          // ⚠️ 官方页要求的 64 位 hex CSRF 令牌，回跳时原样带回，用于校验
+          authorizeState: session.state,
+          port: session.port,
+          redirectUri: session.redirectUri,
           createdAt: Date.now(),
+          expiresAt,
         },
-        Date.now() + RACCOON_LOGIN_STATE_TTL_MS,
+        expiresAt,
       )
       return json({
         ok: true,
         provider: 'raccoon',
         state,
-        // 面板把 `qrSvg` 直接插进 DOM（无需前端 QR 库）；`qrUrl` 供「复制链接」兜底。
-        qrSvg: started.qrSvg,
-        qrUrl: started.qrUrl,
+        authUrl: session.authorizeUrl,
+        redirectUri: session.redirectUri,
         realm: loginRealm,
         expiresInMs: RACCOON_LOGIN_STATE_TTL_MS,
       })
@@ -1755,10 +1870,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // 依据：`deepseek-harness-codearts/src/minimax-oauth.ts:10-16,196-201,276-280`。
     //
     // ⚠️ 账号域是 `account.minimax.cn`，业务域是 `agent.minimax.cn` —— 不可混用。
-    if (providerId === 'minimax') {
-      const { startMinimaxLogin } = await import('./providers/minimax.js')
+    if (providerId === 'minimax' || providerId === 'minimaxintl') {
+      const { startMinimaxLogin, minimaxSiteFor } = await import('./providers/minimax.js')
+      // ⚠️ 站点必须跟着 provider 走：国际版的账号域是 `account.minimax.io`、
+      // 业务域是 `agent.minimaxi.com`（实测，见 `MinimaxSite` 的注释）。
+      // 传错站点的症状是「授权页打不开 / 令牌换回来却 401」。
+      const site = minimaxSiteFor(providerId)
       try {
-        const started = await startMinimaxLogin(AbortSignal.timeout(30_000))
+        const started = await startMinimaxLogin(AbortSignal.timeout(30_000), fetch, site)
         const state = crypto.randomUUID()
         const now = Date.now()
         const deadline = now + started.expiresInSec * 1000
@@ -1766,7 +1885,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         await pool.saveLoginSession(
           state,
           {
-            provider: 'minimax',
+            provider: providerId,
             kind: 'minimax',
             realm: loginRealm,
             // ⚠️ 设备码 + PKCE verifier 都必须持久化：Workers 无跨请求内存，
@@ -1786,7 +1905,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         )
         return json({
           ok: true,
-          provider: 'minimax',
+          provider: providerId,
           state,
           userCode: started.userCode,
           verificationUri: started.verificationUri,
@@ -1846,6 +1965,67 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // ③ 轮询 `long.open.weixin.qq.com/connect/l/qrconnect` 拿一次性 `code`；
     // ④ 用 `code` 换 `rcode`（`bindLoomyThirdAccount`）→ 视 `bind` 走 skip 或绑手机号。
     //
+    // ── gemini（Google Cloud Code Assist）：浏览器登录 + **手动粘贴回调链接** ──
+    //
+    // ⚠️ Google 对原生应用**只允许 loopback 重定向**（RFC 8252），
+    // 而本项目注册的 `redirect_uri` 就是 `http://localhost:<port>/oauth-callback`
+    // —— Worker 收不到那个端口。故与 trae / codearts / lobsterai 同一条路：
+    // 让用户把地址栏（带 `?code=…`）粘回来。
+    if (providerId === 'gemini') {
+      const { buildGeminiAuthUrl } = await import('./providers/gemini.js')
+      const state = crypto.randomUUID()
+      const expiresAt = Date.now() + GEMINI_LOGIN_STATE_TTL_MS
+      await pool.saveLoginSession(
+        state,
+        { provider: 'gemini', kind: 'gemini', realm: loginRealm, createdAt: Date.now(), expiresAt },
+        expiresAt,
+      )
+      return json({
+        ok: true,
+        provider: 'gemini',
+        state,
+        authUrl: buildGeminiAuthUrl(state),
+        realm: loginRealm,
+        expiresInMs: GEMINI_LOGIN_STATE_TTL_MS,
+      })
+    }
+
+    // ── lobsterai（有道龙虾）：浏览器登录 + **手动粘贴回调链接** ──
+    //
+    // ⚠️ LobsterAI 的 `redirect_uri` 必须是 `http://127.0.0.1:<port>/auth/callback`
+    // （portal 登录页会校验），Worker 收不到那个端口。故与 trae / codearts 同一条路：
+    // 让用户把地址栏（带 `?authCode=…`）粘回来。
+    //
+    // ⚠️ `uuid` / `firstKeyfrom` 必须**随会话持久化**（Workers 无跨请求内存），
+    // 且它们最终要进凭据的 `extras` —— 续期请求体要用它们（缺了就续期失败）。
+    if (providerId === 'lobsterai') {
+      const { createLobsteraiLoginSession } = await import('./providers/lobsterai.js')
+      const session = createLobsteraiLoginSession()
+      const state = crypto.randomUUID()
+      const expiresAt = Date.now() + LOBSTERAI_LOGIN_STATE_TTL_MS
+      await pool.saveLoginSession(
+        state,
+        {
+          provider: 'lobsterai',
+          kind: 'lobsterai',
+          realm: loginRealm,
+          uuid: session.uuid,
+          firstKeyfrom: session.firstKeyfrom,
+          createdAt: Date.now(),
+          expiresAt,
+        },
+        expiresAt,
+      )
+      return json({
+        ok: true,
+        provider: 'lobsterai',
+        state,
+        authUrl: session.loginUrl,
+        realm: loginRealm,
+        expiresInMs: LOBSTERAI_LOGIN_STATE_TTL_MS,
+      })
+    }
+
     // ⚠️ 会话里存 `uuid` 与 `lastErrcode`：轮询**必须原样回传**，
     // 而 Workers 没有跨请求内存（面板每几秒发一个独立请求）。
     if (providerId === 'loomy' && body.mode === 'wechat') {
@@ -2133,6 +2313,220 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
 
   // ── 轮询供应商登录结果 ──
+  // ── 登录：**手动提交回调链接**（手机 / 另一台电脑完成授权的兜底路径） ──
+  //
+  // ## 为什么必须有这个端点
+  //
+  // 好几家的授权回调都落在 `http://127.0.0.1:<port>/…` —— 那是**桌面客户端**
+  // 在自己的机器上监听端口。而 Workers 没有监听 socket（AGENTS.md §2.5 第 2 条），
+  // 于是两件事同时发生：
+  //
+  // 1. 浏览器被上游重定向到 `127.0.0.1:<port>` ⇒ 用户看到**浏览器的**
+  //    「无法访问此网站」（不是我们的页面）；
+  // 2. 但**地址栏里带着完整凭证材料**（`refreshToken` / `code` / `secret`…）。
+  //
+  // ⇒ 只要让用户把那条地址**整段粘回来**，我们就能像收到回调一样解析它。
+  // 这不需要任何本地端口，也不需要上游配合 —— 它只是「人工搬运一次 URL」。
+  //
+  // ## 安全
+  //
+  // 必须带管理密钥（与其它 `/admin/*` 一样，此端点在下方的鉴权之后）。
+  // `state` 绑定到**已存在**的登录会话，供应商只从会话载荷取、**绝不**从请求体取
+  // —— 否则任何一次提交都能把凭据写进别家的流程里。
+  if (path === '/admin/providers/login/submit-callback' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { state?: string; callbackUrl?: string }
+    const state = typeof body.state === 'string' ? body.state : ''
+    const callbackUrl = typeof body.callbackUrl === 'string' ? body.callbackUrl.trim() : ''
+    if (state === '') return json({ error: { message: 'state 必填（请从面板重新发起登录）' } }, 400)
+    if (callbackUrl === '') {
+      return json({ error: { message: '请粘贴浏览器地址栏里的完整回调链接' } }, 400)
+    }
+
+    const saved = await findLoginSession(env, state)
+    if (saved === undefined) {
+      return json(
+        { error: { message: '登录会话不存在或已过期（有效期 10 分钟），请重新发起登录', type: 'unknown_state' } },
+        404,
+      )
+    }
+
+    const kind = sessionString(saved.payload, 'kind')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+    // ⚠️ 必须用**会话原本的过期时刻**回写（不能续满窗口），与浏览器回调同口径。
+    const expiresAt = sessionNumber(saved.payload, 'expiresAt') ?? (Date.now() + TRAE_LOGIN_STATE_TTL_MS)
+
+    // ── TRAE ──
+    //
+    // 回调形态：`…/authorize?refreshToken=…&userInfo={…}&userJwt={…}`
+    // （**直传 token**，不是 OAuth 的 `?code=` 交换）。
+    //
+    // ⚠️ 与浏览器回调**共用同一份解析**（`parseTraeCallback`），只差「URL 从哪来」。
+    // 分叉出第二份解析是本仓库反复踩过的缺陷（「同一个 bug 只修一半」）。
+    if (kind === 'trae') {
+      const parsed = parseTraeCallback(callbackUrl)
+      if (!parsed.ok) {
+        // ⚠️ 失败也写回会话（与浏览器回调一致）：否则面板只会一直等到超时，
+        // 而真实原因是「粘错了链接 / 上游换了流程」。
+        await pool.saveLoginSession(state, { ...saved.payload, failed: parsed.reason }, expiresAt)
+        return json({ ok: false, status: 'failed', message: `回调无法解析：${parsed.reason}` }, 400)
+      }
+      await pool.saveLoginSession(
+        state,
+        { ...saved.payload, callback: parsed.info, callbackAt: Date.now() },
+        expiresAt,
+      )
+      return json({ ok: true, status: 'accepted', message: '已收到回调材料，正在换取凭据…' })
+    }
+
+    // ── codearts（华为云码道）──
+    //
+    // 回调形态：`/login/codearts/callback/<state>?secret=…`（也可能带
+    // `fingerprint` 或直接回传 `token`）。
+    //
+    // ⚠️ 解析**必须复用** `parseCodeArtsCallbackQuery`（回调处理器用的也是它）——
+    // 三种完成信号只允许有一份判据。
+    if (kind === 'codearts') {
+      // ⚠️ 把粘贴进来的 URL 还原成 search：既接受完整 URL，
+      // 也接受用户只复制了 `?secret=…` 那一段（手机上手选时常会这样）。
+      const marker = callbackUrl.indexOf('?')
+      const search = new URLSearchParams(marker >= 0 ? callbackUrl.slice(marker + 1) : callbackUrl)
+      const parsed = parseCodeArtsCallbackQuery(search)
+      // ⚠️ 回传的 state 必须与会话一致：粘错链接时静默写进别的会话是危险的。
+      if (parsed.state !== '' && parsed.state !== state) {
+        return json(
+          { ok: false, status: 'failed', message: '这条链接属于另一次登录（state 不一致），请重新发起登录' },
+          400,
+        )
+      }
+      const secret = parsed.secret !== '' ? parsed.secret : parsed.fingerprintToken
+      if (secret === '') {
+        return json(
+          {
+            ok: false,
+            status: 'failed',
+            message: '这条链接里没有可用的 secret / fingerprint token —— '
+              + '它可能只是登录中间页。请等华为侧真正跳转到 127.0.0.1 之后，再复制那一次的地址。',
+          },
+          400,
+        )
+      }
+      await pool.saveLoginSession(
+        state,
+        { ...saved.payload, secret, secretAt: Date.now() },
+        expiresAt,
+      )
+      return json({ ok: true, status: 'accepted', message: '已收到回调材料，正在换取凭据…' })
+    }
+
+    // ── raccoon（商汤小浣熊）──
+    //
+    // 回调形态：`http://127.0.0.1:18082/auth/callback?code=…&state=…`
+    // ⚠️ 参数名是 **`code`**（不是 `authorization_code`）—— 后者是换码端点的
+    // body 字段，两者是两回事。
+    if (kind === 'raccoon') {
+      const { parseRaccoonCallback } = await import('./providers/raccoon.js')
+      const parsed = parseRaccoonCallback(callbackUrl)
+      if (parsed.code === '') {
+        return json(
+          {
+            ok: false,
+            status: 'failed',
+            message: '这条链接里没有 code —— 它可能只是授权页/中间页。'
+              + '请等浏览器跳到 127.0.0.1 那个地址（即使页面报「无法访问」）之后，再复制那一次的地址。',
+          },
+          400,
+        )
+      }
+      // ⚠️ 回传的 state 必须与会话一致（粘错链接时静默写进别的会话是危险的）。
+      const expected = sessionString(saved.payload, 'authorizeState')
+      if (parsed.state !== '' && expected !== '' && parsed.state !== expected) {
+        return json(
+          { ok: false, status: 'failed', message: '这条链接属于另一次登录（state 不一致），请重新发起登录' },
+          400,
+        )
+      }
+      await pool.saveLoginSession(
+        state,
+        { ...saved.payload, authorizationCode: parsed.code, codeAt: Date.now() },
+        expiresAt,
+      )
+      return json({ ok: true, status: 'accepted', message: '已收到授权码，正在换取凭据…' })
+    }
+
+    // ── gemini（Google Cloud Code Assist）──
+    //
+    // 回调形态：`http://localhost:8845/oauth-callback?code=4/0A…&state=…`
+    //
+    // ⚠️ 解析复用 `parseGeminiCallback`（纯函数，一次性实现）。
+    if (kind === 'gemini') {
+      const { parseGeminiCallback } = await import('./providers/gemini.js')
+      const parsed = parseGeminiCallback(callbackUrl)
+      // 用户在 Google 页面点了「取消」：如实报错，不要让面板空等。
+      if (parsed.error !== '') {
+        await pool.saveLoginSession(
+          state,
+          { ...saved.payload, failed: `Google 侧返回错误：${parsed.error}` },
+          expiresAt,
+        )
+        return json({ ok: false, status: 'failed', message: `Google 授权未完成：${parsed.error}` }, 400)
+      }
+      if (parsed.code === '') {
+        return json(
+          {
+            ok: false,
+            status: 'failed',
+            message: '这条链接里没有 code —— 它可能只是登录页/中间页。'
+              + '请等浏览器跳到 localhost 那个地址（即使页面报「无法访问」）之后，再复制那一次的地址。',
+          },
+          400,
+        )
+      }
+      // ⚠️ 回传的 state 必须与会话一致（粘错链接时静默写进别的会话是危险的）。
+      if (parsed.state !== '' && parsed.state !== state) {
+        return json(
+          { ok: false, status: 'failed', message: '这条链接属于另一次登录（state 不一致），请重新发起登录' },
+          400,
+        )
+      }
+      await pool.saveLoginSession(state, { ...saved.payload, code: parsed.code, codeAt: Date.now() }, expiresAt)
+      return json({ ok: true, status: 'accepted', message: '已收到授权码，正在换取令牌…' })
+    }
+
+    // ── lobsterai（有道龙虾）──
+    //
+    // 回调形态：`http://127.0.0.1:18081/auth/callback?authCode=…`
+    // （也可能走 `?code=` 或把参数放在 `#/login?…` 的 hash 段里）。
+    if (kind === 'lobsterai') {
+      const { parseLobsteraiCallbackCode } = await import('./providers/lobsterai.js')
+      const authCode = parseLobsteraiCallbackCode(callbackUrl)
+      if (authCode === '') {
+        return json(
+          {
+            ok: false,
+            status: 'failed',
+            message: '这条链接里没有 authCode —— 它可能只是登录页/中间页。'
+              + '请等浏览器跳到 127.0.0.1 那个地址（即使页面报「无法访问」）之后，再复制那一次的地址。',
+          },
+          400,
+        )
+      }
+      // ⚠️ `authCode` 是**一次性的**：换码会消耗它，故这里只写回会话，
+      // 由轮询去调 `exchangeLobsteraiAuthCode`（单出口，避免重复消耗）。
+      await pool.saveLoginSession(state, { ...saved.payload, authCode, authCodeAt: Date.now() }, expiresAt)
+      return json({ ok: true, status: 'accepted', message: '已收到授权码，正在换取凭据…' })
+    }
+
+    return json(
+      {
+        error: {
+          message: '该供应商不支持手动提交回调链接（只有回调落在 127.0.0.1 的家需要它）',
+          type: 'unsupported_provider',
+        },
+      },
+      400,
+    )
+  }
+
   if (path === '/admin/providers/login/poll' && request.method === 'GET') {
     const state = url.searchParams.get('state') ?? ''
     // ⚠️ 会话按 realm 分片存放（国际版的在 `global`，其余家在 `cn`）。
@@ -2248,21 +2642,45 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         })
       }
       // ── raccoon：微信扫码（二维码由本服务渲染，用户扫完即完成） ──
+      // ── raccoon：手动回调 → 用授权码换凭据（2026-11-21 改；扫码链已死）──
+      //
+      // ⚠️ 旧的扫码分支**已删除**（不是注释掉）：`/login/mp` 实测 404，
+      // 留着它只会让轮询永远「耐心等待」一个不可能完成的授权。
       if (saved.payload['kind'] === 'raccoon') {
-        const { pollRaccoonQrLogin } = await import('./providers/raccoon.js')
-        const qrCode = saved.payload['qrCode']
-        if (typeof qrCode !== 'string' || qrCode === '') {
-          return json({ done: false, status: 'failed', message: '登录会话缺少 qrcode_code，请重新发起' })
+        const code = sessionString(saved.payload, 'authorizationCode')
+        if (code === '') {
+          return json({
+            done: false,
+            status: 'awaiting_browser',
+            message: '等待你粘贴回调链接…（在浏览器完成商汤授权后，'
+              + '把地址栏里 127.0.0.1 那一整段链接复制到下方输入框提交）',
+          })
         }
-        const polled = await pollRaccoonQrLogin(qrCode, AbortSignal.timeout(20_000))
-        // `success` 才带凭据；其余状态如实回传，面板据此显示「等待扫码 / 已扫码待确认 / 已取消」
-        if (polled.status === 'success' && polled.credential !== undefined) {
-          return json(await persistProviderCredential(env, polled.credential, now))
+        // ⚠️ 授权码是**一次性**的：已换过就只落盘，不再打上游。
+        const existing = saved.payload['credential']
+        if (existing !== undefined) {
+          const result = await persistProviderCredential(env, existing as ProviderCredential, now)
+          await saved.pool.removeLoginSession(state)
+          return json(result)
         }
-        if (polled.status === 'canceled') {
-          return json({ done: false, status: 'canceled', message: '用户已取消授权，请重新发起' })
+        const { exchangeRaccoonAuthorizationCode } = await import('./providers/raccoon.js')
+        let credential: ProviderCredential
+        try {
+          credential = await exchangeRaccoonAuthorizationCode(code, AbortSignal.timeout(30_000))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const retryable = error instanceof ProviderError && error.retryable
+          if (retryable) return json({ done: false, status: 'pending', message })
+          await saved.pool.saveLoginSession(
+            state,
+            { ...saved.payload, failed: message },
+            sessionNumber(saved.payload, 'expiresAt') ?? now + RACCOON_LOGIN_STATE_TTL_MS,
+          )
+          return json({ done: false, status: 'failed', message: `Raccoon 登录失败：${message}` })
         }
-        return json({ done: false, status: polled.status, message: '等待扫码…' })
+        const result = await persistProviderCredential(env, credential, now)
+        await saved.pool.removeLoginSession(state)
+        return json(result)
       }
       // ── cline：WorkOS 设备码（单次轮询 + 会话内持久化节流） ──
       //
@@ -2360,7 +2778,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
       // ── minimax：设备码 + PKCE 轮询（与 cline 同型，判据不同） ──
       if (saved.payload['kind'] === 'minimax') {
-        const { pollMinimaxLoginOnce } = await import('./providers/minimax.js')
+        const { pollMinimaxLoginOnce, minimaxSiteFor } = await import('./providers/minimax.js')
 
         const deviceCode = sessionString(saved.payload, 'deviceCode')
         const codeVerifier = sessionString(saved.payload, 'codeVerifier')
@@ -2397,7 +2815,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           expiresInSec: Math.max(1, Math.round((deadline - now) / 1000)),
           intervalSec,
         }
-        const outcome = await pollMinimaxLoginOnce(auth, AbortSignal.timeout(20_000))
+        // ⚠️ 站点跟着**会话**记的 provider 走（不信客户端在轮询阶段的任何输入）。
+        const site = minimaxSiteFor(
+          typeof saved.payload['provider'] === 'string' ? saved.payload['provider'] : 'minimax',
+        )
+        const outcome = await pollMinimaxLoginOnce(auth, AbortSignal.timeout(20_000), fetch, site)
 
         if (outcome.kind === 'pending') {
           // ⚠️ 每轮都把新间隔写回会话：`slow_down` 的 **+5 秒累积退避**
@@ -2415,6 +2837,100 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           return json({ done: false, status: 'failed', message: outcome.message })
         }
         return json(await persistProviderCredential(env, outcome.credential, now))
+      }
+      // ── gemini：手动回调 → 用授权码换令牌 ──
+      if (saved.payload['kind'] === 'gemini') {
+        const code = sessionString(saved.payload, 'code')
+        if (code === '') {
+          return json({
+            done: false,
+            status: 'awaiting_browser',
+            message: '等待你粘贴回调链接…（在浏览器完成 Google 授权后，'
+              + '把地址栏里 localhost 那一整段链接复制到下方输入框提交）',
+          })
+        }
+        // ⚠️ 授权码是**一次性**的：已换过就只落盘，不再打上游。
+        const existing = saved.payload['credential']
+        if (existing !== undefined) {
+          const result = await persistProviderCredential(env, existing as ProviderCredential, now)
+          await saved.pool.removeLoginSession(state)
+          return json(result)
+        }
+        const { exchangeGeminiAuthCode } = await import('./providers/gemini.js')
+        let credential: ProviderCredential
+        try {
+          // ⚠️ `redirect_uri` 必须与授权时**逐个字符相同**（Google 会比对，
+          // 不一致就是 `redirect_uri_mismatch`）。
+          credential = await exchangeGeminiAuthCode(
+            code,
+            `http://localhost:${sessionString(saved.payload, 'port') || '8845'}/oauth-callback`,
+            AbortSignal.timeout(30_000),
+          )
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const retryable = error instanceof ProviderError && error.retryable
+          if (retryable) return json({ done: false, status: 'pending', message })
+          await saved.pool.saveLoginSession(
+            state,
+            { ...saved.payload, failed: message },
+            sessionNumber(saved.payload, 'expiresAt') ?? now + GEMINI_LOGIN_STATE_TTL_MS,
+          )
+          return json({ done: false, status: 'failed', message: `Gemini 登录失败：${message}` })
+        }
+        const result = await persistProviderCredential(env, credential, now)
+        await saved.pool.removeLoginSession(state)
+        return json(result)
+      }
+      // ── lobsterai：手动回调 → 用 authCode 换凭据 ──
+      //
+      // ⚠️ 状态形状与 codearts 一致（awaiting_browser / pending / failed / done），
+      // 面板据此区分「还没粘链接」与「正在换」。
+      if (saved.payload['kind'] === 'lobsterai') {
+        const authCode = sessionString(saved.payload, 'authCode')
+        if (authCode === '') {
+          return json({
+            done: false,
+            status: 'awaiting_browser',
+            message: '等待你粘贴回调链接…（在浏览器完成登录后，'
+              + '把地址栏里 127.0.0.1 那一整段链接复制到下方输入框提交）',
+          })
+        }
+        // 已换过码：直接落盘（`authCode` 是一次性的，重复换码必然失败）
+        const existing = saved.payload['credential']
+        if (existing !== undefined) {
+          const result = await persistProviderCredential(env, existing as ProviderCredential, now)
+          await saved.pool.removeLoginSession(state)
+          return json(result)
+        }
+        const { exchangeLobsteraiAuthCode, resolveClientVersion } = await import('./providers/lobsterai.js')
+        let credential: ProviderCredential
+        try {
+          const clientVersion = await resolveClientVersion(AbortSignal.timeout(20_000))
+          credential = await exchangeLobsteraiAuthCode(
+            authCode,
+            {
+              uuid: sessionString(saved.payload, 'uuid'),
+              firstKeyfrom: sessionString(saved.payload, 'firstKeyfrom'),
+            },
+            clientVersion,
+            AbortSignal.timeout(30_000),
+          )
+        } catch (error) {
+          // ⚠️ 只有**明确被拒**才写终态；网络类失败留给下一轮重试
+          //（`authCode` 一旦被服务端接受就不能再用，故这里只在非重试错误时落 failed）。
+          const message = error instanceof Error ? error.message : String(error)
+          const retryable = error instanceof ProviderError && error.retryable
+          if (retryable) return json({ done: false, status: 'pending', message })
+          await saved.pool.saveLoginSession(
+            state,
+            { ...saved.payload, failed: message },
+            sessionNumber(saved.payload, 'expiresAt') ?? now + LOBSTERAI_LOGIN_STATE_TTL_MS,
+          )
+          return json({ done: false, status: 'failed', message: `LobsterAI 登录失败：${message}` })
+        }
+        const result = await persistProviderCredential(env, credential, now)
+        await saved.pool.removeLoginSession(state)
+        return json(result)
       }
       // ── codearts：浏览器回跳 + ticket 换取凭据 ──
       // `{done:false, status}` 是**约定形状**：面板据此区分「等浏览器」
@@ -2450,7 +2966,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const results: Array<Record<string, unknown>> = []
 
     for (const account of accounts) {
-      const providerId = account.provider ?? DEFAULT_PROVIDER
+      const providerId = account.provider ?? LEGACY_PROVIDER
       if (only !== '' && providerId !== only) continue
       if (account.disabled) {
         results.push({ uid: account.uid, provider: providerId, ok: false, detail: '账号已禁用' })
@@ -2477,7 +2993,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         results.push({ uid: account.uid, provider: providerId, ok: false, detail: '账号缺少凭据' })
         continue
       }
-      const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+      const bound = providerForCall(providerId, provider, () => bindBuddy(env))
       try {
         const r = await bound.checkin!(credential, AbortSignal.timeout(30_000))
         results.push({
@@ -2532,7 +3048,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const started: Array<Record<string, unknown>> = []
 
     for (const account of accounts) {
-      if ((account.provider ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) continue
+      // ⚠️ 「成长任务」是 **WorkBuddy 独有**的体系（`startRun` 发的是腾讯
+      // `/v2/report` 协议）。判据必须是「这一家是不是 buddy」，**不是**
+      // 「是不是默认供应商」—— 默认值改成 Trae 之后，后者会让这段代码
+      // 去拿 Trae 账号跑腾讯任务（必然全失败）。
+      if ((account.provider ?? LEGACY_PROVIDER) !== ENV_BOUND_PROVIDER) continue
       if (account.disabled) continue
       const credential = (await pool.getCredential(account.uid)) as LoginCredential | undefined
       if (credential === undefined) continue
@@ -2798,7 +3318,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const candidatePool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
       const accounts = await candidatePool.listAccounts(realm, Date.now())
       for (const a of accounts) {
-        if ((a.provider ?? DEFAULT_PROVIDER) !== providerId) continue
+        if ((a.provider ?? LEGACY_PROVIDER) !== providerId) continue
         // ⚠️ 跳过明确不可用的账号：它们大概率还是失败，白打上游一次
         //（也避免在 refresh_token 已失效时反复尝试续期 —— 那是**终态**，
         // 重试只会浪费一次请求）。判据与 `pick()` 的健康检查保持一致。
@@ -2812,7 +3332,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
     // ⚠️ 只有国内版（buddy）需要绑定 env —— 它允许用 env 覆盖域名便于调试；
     // 国际版恒用官方域名。
-    const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+    const bound = providerForCall(providerId, provider, () => bindBuddy(env))
     let models: ProviderModel[] | undefined
     let lastError: unknown
     for (const cand of candidates) {
@@ -2918,7 +3438,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         // `fetchBalance` —— 那会让所有非 buddy 账号拿到 401
         //（实测：cline/trae/qoder 等的余额全报 auth_error，
         //  而它们的模型目录明明拉得到 485/38/17 个，证明凭据是好的）。
-        const pid = a.provider ?? DEFAULT_PROVIDER
+        const pid = a.provider ?? LEGACY_PROVIDER
         const provider = findProvider(pid)
         if (provider === undefined || !provider.capabilities.balance || provider.balance === undefined) {
           out.push({
@@ -2927,7 +3447,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           })
           continue
         }
-        const boundProvider = pid === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const boundProvider = providerForCall(pid, provider, () => bindBuddy(env))
         // ⚠️ 先把方法取出来再调：TS 无法透过三元表达式收窄 `boundProvider.balance`
         // 的可选性（上面已判过 `provider.balance !== undefined`）。
         const balanceFn = boundProvider.balance
@@ -2940,7 +3460,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           uid: a.uid,
           // ⚠️ 必须回传 provider：面板按供应商卡片汇总积分，
           // 不回传会让所有账号的积分都算到默认供应商头上（静默算错）。
-          provider: a.provider ?? DEFAULT_PROVIDER,
+          provider: a.provider ?? LEGACY_PROVIDER,
           nickname: a.nickname,
           total: b.total,
           expiring: b.expiring,
@@ -2950,7 +3470,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       } catch (error) {
         out.push({
           uid: a.uid,
-          provider: a.provider ?? DEFAULT_PROVIDER,
+          provider: a.provider ?? LEGACY_PROVIDER,
           nickname: a.nickname,
           error: error instanceof Error ? error.message : String(error),
         })
@@ -3071,7 +3591,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // ⚠️ 存储 key 加供应商前缀。
       // 不同供应商的 uid 空间互相独立，可能出现同 uid 不同家的情况；
       // 不加前缀会互相覆盖凭据（表现为「导入 B 家后 A 家坏了」）。
-      const storageUid = providerId === DEFAULT_PROVIDER ? credential.uid : `${providerId}:${credential.uid}`
+      const storageUid = storageUidFor(providerId, credential.uid)
 
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realmOf))
       try {
@@ -3143,7 +3663,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         // ⚠️ 必须回传 provider：面板靠它把账号分到各家卡片下。
         // 不回传时面板的 `.filter(a => a.provider === id)` 恒为空，
         // 表现为「点开供应商看不到自己的账号」（实测踩到）。
-        provider: a.provider ?? DEFAULT_PROVIDER,
+        provider: a.provider ?? LEGACY_PROVIDER,
         nickname: a.nickname,
         disabled: a.disabled,
         reason: a.reason,
@@ -3295,7 +3815,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const pool = pools.get(r)
       if (pool === undefined) continue
       for (const a of await pool.listAccounts(r, Date.now())) {
-        const pid = a.provider ?? DEFAULT_PROVIDER
+        const pid = a.provider ?? LEGACY_PROVIDER
         const list = byProvider.get(pid) ?? []
         list.push({ account: a, realm: r })
         byProvider.set(pid, list)
@@ -3339,7 +3859,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       disabledTotal += disabled.size
 
       try {
-        const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const bound = providerForCall(providerId, provider, () => bindBuddy(env))
         // ⚠️ 走**续期重试**：过期的令牌不该让整家从目录里消失。
         // 实测踩到：raccoon 的 access token 过期后，/v1/models 直接把它
         // 归到 errors 里，客户端看到的是「这家没有模型」——
@@ -3610,6 +4130,67 @@ function hourUtc8(now: number): number {
 const REFRESH_LEAD_MS = 3_600_000
 
 /**
+ * **保活**提前量：距上次续期满这个时长就主动续一次（7 天）。
+ *
+ * ## 🔴 为什么光有「距过期不足 1 小时」不够（真实缺陷）
+ *
+ * 腾讯系（`buddy` / `workbuddy`）的 access_token 有效期**以天计** ——
+ * 参考实现实测到 60 / 30 / 28 天三批（上游在持续收缩）。而 lead-time 判据
+ * 只在「距过期不足 1 小时」时才放行 ⇒ 调度器每小时都跑，但**每轮都被跳过**
+ * ⇒ `refresh_token` 闲置 28 天后被服务端**作废**：
+ *
+ * ```
+ * POST /v2/plugin/auth/token/refresh
+ * → 401 {"code":12153,"msg":"12153:refresh token is invalid"}
+ * ```
+ *
+ * 用户看到的是「凭据过期」，而真实原因是**我们让它闲置太久**。
+ * 且按原实现，这个缺陷在 28 天后**必然复发**。
+ *
+ * ## ⚠️ 三条取舍（别按直觉改）
+ *
+ * 1. **判据是「距上次续期多久」，不是「TTL 的百分比」**：TTL 在
+ *    60/30/28 天之间变过，按比例算（60×20%=12 天）会贴到闲置红线；
+ * 2. **`REFRESH_LEAD_MS` 一个字都不改**：它是**所有家共用**的。改大等于让
+ *    codearts / gemini 这类 TTL≈1h、且 refresh_token **一次性**的家每轮都续期
+ *    —— 那会把它们的 refresh_token 全烧光（本项目已因此丢过账号）；
+ * 3. **只对「TTL 以天计」的家生效**（见 {@link KEEPALIVE_PROVIDERS}）：
+ *    这是**可选**的保活腿，不是全局策略。
+ *
+ * ⚠️ 「上次续期时刻」怎么取：续期会重签 access_token，
+ * 而 JWT 的 `iat` **天然就是**那个时刻 ⇒ 不需要新字段。
+ * 解不出 `iat` 时**退化成旧行为**（不保活），而不是每轮都续
+ * —— 后者会把所有解不出 JWT 的凭据白白刷新一遍。
+ */
+const KEEPALIVE_MAX_IDLE_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * 适用**保活**的供应商（TTL 以天计、且 refresh_token 会因闲置而失效）。
+ *
+ * ⚠️ 只放这两家。**不要**把 TTL≈1h 的家加进来 —— 见
+ * {@link KEEPALIVE_MAX_IDLE_MS} 的取舍第 2 条。
+ */
+const KEEPALIVE_PROVIDERS: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+
+/**
+ * 从 JWT 的 `iat`（秒）解出「上次续期时刻」（毫秒）。
+ *
+ * @returns `0` = 解不出（**不是**「从未续期」—— 调用方据此退化成旧行为）
+ */
+function credentialIssuedAtMs(accessToken: string): number {
+  const parts = accessToken.split('.')
+  if (parts.length < 2) return 0
+  try {
+    const json = atob((parts[1] ?? '').replaceAll('-', '+').replaceAll('_', '/'))
+    const payload = JSON.parse(json) as Record<string, unknown>
+    const iat = payload.iat
+    return typeof iat === 'number' && Number.isFinite(iat) && iat > 0 ? iat * 1000 : 0
+  } catch {
+    return 0
+  }
+}
+
+/**
  * 扫一遍所有账号，把**快过期**的凭据提前续掉。
  *
  * 这是「动不动就掉登录」的根治手段：把「撞到 401 才续期」变成
@@ -3632,7 +4213,7 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
     for (const account of accounts) {
       // ⚠️ 停用的账号不动它 —— 用户明确说不用了，续期是多余的上游请求。
       if (account.disabled) continue
-      const providerId = account.provider ?? DEFAULT_PROVIDER
+      const providerId = account.provider ?? LEGACY_PROVIDER
       const provider = findProvider(providerId)
       // ⚠️ 没有 `refresh` 的家直接跳过（见函数注释的说明）。
       if (provider?.refresh === undefined) continue
@@ -3648,15 +4229,32 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
       const expiresAt = credential.expiresAt
       // ⚠️ `0` = **未知**，不是「已过期」（见函数注释）。
       if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
-      // 还没到「提前量」窗口 ⇒ 不动它（避免每个整点都白打一次上游）。
-      if (expiresAt - now > REFRESH_LEAD_MS) continue
+
+      // ── 续期判据：**两条腿取或** ──
+      //
+      // ① 到期腿：距过期不足 1 小时（所有家适用）；
+      // ② **保活腿**：距上次续期满 7 天（**只有 TTL 以天计的家**，见
+      //    `KEEPALIVE_PROVIDERS`）。
+      //
+      // ⚠️ ②**不能**推广到所有家：gemini / codearts 这类 TTL≈1h 且
+      // refresh_token **一次性**的，每轮都续会把令牌烧光（本项目丢过账号）。
+      const dueByExpiry = expiresAt - now <= REFRESH_LEAD_MS
+      const dueByKeepAlive = KEEPALIVE_PROVIDERS.has(providerId)
+        && (() => {
+          const issuedAt = credentialIssuedAtMs(credential.accessToken)
+          // ⚠️ 解不出 `iat` ⇒ **退化成旧行为**（不保活），而不是「立刻续」——
+          // 后者会把所有解不出 JWT 的凭据每轮白刷一遍。
+          if (issuedAt <= 0) return false
+          return now - issuedAt >= KEEPALIVE_MAX_IDLE_MS
+        })()
+      if (!dueByExpiry && !dueByKeepAlive) continue
 
       try {
         const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
         await pool.putCredential(account.uid, fresh, now)
         console.log(
           `[cron] ${providerId} ${account.uid} 主动续期成功`
-            + `（原过期于 ${new Date(expiresAt).toISOString()}）`,
+            + `（${dueByExpiry ? '临近过期' : '保活'}，原过期于 ${new Date(expiresAt).toISOString()}）`,
         )
       } catch (error) {
         // ⚠️ 如实记原因。**不惩罚账号** —— 续期失败可能是网络抖动，

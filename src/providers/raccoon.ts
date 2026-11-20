@@ -994,7 +994,19 @@ export const raccoonProvider: Provider = {
   name: 'Raccoon（商汤）',
   capabilities: {
     /**
-     * ✅ 登录可在 Workers 完成（**仅扫码路径**）。
+     * ✅ 登录可在 Workers 完成 —— **走官方授权页 + 手动粘贴回调链接**。
+     *
+     * ## ⚠️ 2026-11-21：扫码路径已死，别再按它理解本项
+     *
+     * 扫码确认页 `/login/mp` 实测 **404**（签发仍成功 ⇒ 用户扫进去只看到
+     * 404 页，界面上零报错）。故登录改走
+     * {@link createRaccoonAuthorizeSession}：官方 `/authorize` 页 → 回跳
+     * `127.0.0.1` 带 `code` → 用户把地址栏粘回面板 →
+     * {@link exchangeRaccoonAuthorizationCode} 换凭据。
+     *
+     * 下面这段「扫码的 code 由客户端自造」的说明**仍然是事实**（轮询端点
+     * 至今可用），但它对应的**入口已不再接线** —— 详见
+     * {@link beginRaccoonQrLogin} 的警示。
      *
      * 依据：扫码的 `code` 由**客户端自造**、服务端只做轮询查询
      * （`src/raccoon.ts:14-17`、`src/raccoon-oauth.ts:112-118`），
@@ -1088,9 +1100,21 @@ export interface RaccoonQrLoginStart {
 /**
  * 发起一次扫码登录：生成 code、拼出二维码内容、并就地渲染成 SVG。
  *
- * ⚠️ **不碰网络、不碰凭据** —— 纯本地计算，故可离线单测，
- * 也不会因误调接口消耗用户凭据。真正的登录状态由
- * {@link pollRaccoonQrLogin} 轮询得到。
+ * ## 🔴 **本函数已不可用（2026-11-21）—— 不要再接回登录入口**
+ *
+ * 扫码确认页 `https://xiaohuanxiong.com/login/mp` **实测已 404**。
+ * 而签发本身仍是成功的（轮询端点照常回 `pending`）⇒ 若接回入口，
+ * 用户会扫到一个 404 页，而界面上**零报错、日志里也没有任何异常**
+ * —— 这正是它藏了这么久的原因。
+ *
+ * 登录入口现在走 {@link createRaccoonAuthorizeSession}（官方授权页 +
+ * 手动粘贴回调链接）。
+ *
+ * ⚠️ **为什么还保留着**：上游随时可能把 `/login/mp` 修回来，届时这段
+ * 纯本地计算（含二维码渲染）仍可直接复用。但**保留 ≠ 可用** ——
+ * 能力声明与入口都不能引用它。
+ *
+ * ⚠️ **不碰网络、不碰凭据** —— 纯本地计算，故可离线单测。
  */
 export function beginRaccoonQrLogin(): RaccoonQrLoginStart {
   const code = generateQrCode()
@@ -1126,6 +1150,15 @@ export function buildQrLoginUrl(code: string): string {
 
 /**
  * 轮询一次扫码登录状态。
+ *
+ * ## 🔴 **本函数已无调用点（2026-11-21）**
+ *
+ * 理由见 {@link beginRaccoonQrLogin} 的说明：扫码确认页已 404。
+ * 现在登录走 {@link exchangeRaccoonAuthorizationCode}。
+ *
+ * ⚠️ 保留它是因为**协议本身仍然有效**（实测该端点在 2026-11-21 仍回
+ * `{"code":0,...,"data":{"status":"pending"}}`）—— 上游若修回 `/login/mp`，
+ * 这条轮询立刻又能用。但**不要**在没有入口的情况下把它当成「可用能力」。
  *
  * ⚠️ **任何异常都降级为 `pending`**（网络抖动、响应畸形、未知 status）：
  * 轮询是 2 秒一次的循环，偶发失败不应中断整个登录流程；而把未知状态
@@ -1329,5 +1362,215 @@ export async function refreshRaccoonCredential(
     accessToken,
     refreshToken: nextRefresh,
     ...(expMs === undefined ? {} : { expiresAt: expMs }),
+  }
+}
+
+// ───────────────────── 浏览器授权登录（2026-11-21 新增） ─────────────────────
+
+/**
+ * 授权页路径。
+ *
+ * ## ⚠️ 为什么必须换掉扫码那条链（实测 2026-11-21）
+ *
+ * 扫码确认页 `/login/mp` **已 404**（实测 `https://xiaohuanxiong.com/login/mp`
+ * → 404，带不带 code 都一样）。而**签发本身是成功的**
+ * —— 也就是说用户扫进去只会看到一个 404 页，界面上零报错、日志里也没有。
+ *
+ * ⚠️ 且**轮询端点仍然正常**（实测 `login_with_qrcode_code` → 200 +
+ * `{"status":"pending"}`）⇒ 这就是为什么这个缺陷一直没被发现：
+ * 我们的轮询会一直「耐心等待」，而用户那边根本没有可完成授权的页面。
+ *
+ * ## ✅ 官方现在走的是这条
+ *
+ * 参考实现（`raccoon-authorize.ts`，2026-11-17）记录的官方链路：
+ * `GET /authorize?login_source=desktop&appname=…&desktop_callback=loopback
+ *  &redirect=http://127.0.0.1:<port>/auth/callback&state=<64 hex>`
+ * → 用户在页面上确认 → 回跳 `127.0.0.1` 带 `code`
+ * → `POST {auth}/login_with_authorization_code {authorization_code}` 换凭据。
+ *
+ * 与 trae / codearts / lobsterai / gemini 同一条路：回跳落在本机端口，
+ * 我们用**手动粘贴回调链接**接住它。
+ */
+export const RACCOON_AUTHORIZE_PATH = '/authorize'
+
+/** 授权页显示的应用名（官方页面会校验长度 1..100）。 */
+export const RACCOON_AUTH_APPNAME = '商汤小浣熊'
+
+/** 换码端点（`POST`，body 只有一个 `authorization_code`）。 */
+export const RACCOON_AUTHORIZE_EXCHANGE_PATH = '/login_with_authorization_code'
+
+/**
+ * 回跳路径（写死在本机回环地址上）。
+ *
+ * ⚠️ 官方页面的解析器要求它是
+ * `http://127.0.0.1:<4~5 位端口>/auth/callback` 形态（正则校验）。
+ */
+export const RACCOON_LOOPBACK_CALLBACK_PATH = '/auth/callback'
+
+/** 一轮授权登录的会话（全部随登录会话持久化）。 */
+export interface RaccoonAuthorizeSession {
+  /** 64 位小写 hex 的 CSRF 令牌（官方页面要求正好这个形态）。 */
+  state: string
+  /** 回环端口（1024..65535）。 */
+  port: number
+  /** 用户在浏览器里打开的授权页 URL。 */
+  authorizeUrl: string
+  /** 回跳地址（换码时**不需要**它，但文案里要展示给用户看「等的是哪个地址」）。 */
+  redirectUri: string
+}
+
+/**
+ * 生成一轮授权登录会话（**纯本地计算**，不碰网络）。
+ *
+ * ## ⚠️ 三个必须按官方规则构造的字段
+ *
+ * 1. `state` 必须是 **64 位小写 hex**（不是 UUID —— UUID 带连字符，页面会判 null）；
+ * 2. `redirect` 必须是 `http://127.0.0.1:<4~5 位端口>/auth/callback`；
+ * 3. 参数名**只能在**官方白名单里（多一个键整条链接作废）。
+ *
+ * 端口我们随意取一个固定值即可 —— **不需要真的有人监听**：
+ * 用户在本机完成授权后浏览器会打向它并失败，而**地址栏里带着 `code`**。
+ */
+export function createRaccoonAuthorizeSession(port: number = 18082): RaccoonAuthorizeSession {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  let state = ''
+  for (const byte of bytes) state += byte.toString(16).padStart(2, '0')
+  const redirectUri = `http://127.0.0.1:${port}${RACCOON_LOOPBACK_CALLBACK_PATH}`
+  const query = new URLSearchParams({
+    login_source: 'desktop',
+    appname: RACCOON_AUTH_APPNAME,
+    desktop_callback: 'loopback',
+    redirect: redirectUri,
+    state,
+  })
+  return {
+    state,
+    port,
+    redirectUri,
+    authorizeUrl: `${RACCOON_API_BASE}${RACCOON_AUTHORIZE_PATH}?${query.toString()}`,
+  }
+}
+
+/**
+ * 从一段回调 URL 里取出授权码（**纯函数**）。
+ *
+ * 形态：`http://127.0.0.1:18082/auth/callback?code=…&state=…`
+ *
+ * ⚠️ 参考实现记录的参数名在 desktop 形态下是 **`code`**（不是
+ * `authorization_code`）—— 那是页面投递时用的名字，与换码端点的 body 字段
+ * 是两回事，别混用。
+ */
+export function parseRaccoonCallback(rawUrl: string): { code: string; state: string } {
+  const text = rawUrl.trim()
+  const out = { code: '', state: '' }
+  const marker = text.indexOf('?')
+  if (marker < 0) return out
+  const rest = text.slice(marker + 1)
+  // ⚠️ 截掉 hash 段（`?code=x#frag` 会把 `x#frag` 当成值）
+  const hashAt = rest.indexOf('#')
+  const search = new URLSearchParams(hashAt >= 0 ? rest.slice(0, hashAt) : rest)
+  out.code = (search.get('code') ?? search.get('authorization_code') ?? '').trim()
+  out.state = (search.get('state') ?? '').trim()
+  return out
+}
+
+/**
+ * 用一次性授权码换凭据。
+ *
+ * ## ⚠️ 成功门（比「有没有 token」严格）
+ *
+ * 必须有 `access_token`，**并且**满足二者之一：
+ * - 一枚**有效**的 IAM 令牌（`iss` 以 `/iam` 结尾、有 `sub`、`exp` 未过期）；
+ * - 或一枚 `refresh_token`。
+ *
+ * 差一点就**拒绝并给具名原因** —— 存下半截凭据等于存下一个「轮换后什么都不剩」
+ * 的东西（`raccoon-authorize.ts:657-680` 的同一取舍）。
+ *
+ * ⚠️ **只带 `Content-Type` 一个头**（与官方逐字节相同）。
+ */
+export async function exchangeRaccoonAuthorizationCode(
+  code: string,
+  signal: AbortSignal,
+): Promise<ProviderCredential> {
+  let response: Response
+  try {
+    response = await fetch(
+      `${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}${RACCOON_AUTHORIZE_EXCHANGE_PATH}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ authorization_code: code }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)]),
+      },
+    )
+  } catch (error) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      retryable: true,
+      message: `Raccoon 换码请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ProviderError({
+      provider: 'raccoon',
+      httpStatus: response.status,
+      message: `Raccoon 换码响应不是 JSON（HTTP ${response.status}）`,
+    })
+  }
+  const envelope = parseEnvelope(payload, response.status)
+  if (envelope.code !== 0 || envelope.data === undefined) {
+    // ⚠️ `200035` = 授权码不存在/已用过 —— 这是**用户最常遇到**的，
+    // 必须能看懂（否则用户会以为整个登录都坏了）。
+    const hint = envelope.code === 200035
+      ? '（授权码已失效或已被用过：它只能换一次，且约几分钟过期 —— 请重新发起登录）'
+      : ''
+    throw new ProviderError({
+      provider: 'raccoon',
+      httpStatus: response.status,
+      message: `Raccoon 换码失败（code=${envelope.code}）：${envelope.message}${hint}`,
+    })
+  }
+
+  const data = envelope.data
+  const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
+  if (accessToken.trim() === '') {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 换码响应缺少 access_token（不产出半截凭据）',
+    })
+  }
+  const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
+  // ⚠️ 成功门：IAM 令牌**不要求** refresh；但两者都没有就是不可接受的。
+  if (refreshToken === '' && !isRaccoonIamToken(accessToken)) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 换码拿到了 access_token，但它既不是有效 IAM 令牌、也没有 refresh_token —— '
+        + '这种凭据一旦过期就无法续期，故拒绝入库（请重新登录）',
+    })
+  }
+
+  // ⚠️ 走**同一个** parseCredential：保证登录与导入落成同一条账号记录。
+  return parseCredential({ ...data })
+}
+
+/**
+ * 判断一枚令牌是不是 IAM 形态（`iss` 以 `/iam` 结尾）。
+ *
+ * ⚠️ **不验签**：签名由服务端负责；这里只决定「成功门走哪一半」。
+ */
+export function isRaccoonIamToken(token: string): boolean {
+  const parts = token.split('.')
+  if (parts.length < 2) return false
+  try {
+    const json = atob((parts[1] ?? '').replaceAll('-', '+').replaceAll('_', '/'))
+    const payload = JSON.parse(json) as Record<string, unknown>
+    const iss = payload.iss
+    return typeof iss === 'string' && iss.endsWith('/iam')
+  } catch {
+    return false
   }
 }

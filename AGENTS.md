@@ -21,9 +21,15 @@
 - **服务**：`https://<你的域名>`（备用 `<worker 名>.<你的子域>.workers.dev`）
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
-  OpenAI 兼容流式/非流式网关 + **Responses API**、**13 家供应商**、
+  OpenAI 兼容流式/非流式网关 + **Responses API**、**15 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **632 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **644 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+
+> **第 11 轮（2026-11-21）**：新增 `qodercn` / `minimaxintl`；
+> **默认供应商改为 `trae`**（并把「默认供应商」与 env 绑定 / 存储 key / 兜底判据**彻底解耦**）；
+> 新增「**手动粘贴回调链接**」登录（trae / codearts / lobsterai / gemini / raccoon）；
+> raccoon 修 `/login/mp` 404；移植 3 个上游已修的真实缺陷
+> （qoder 额度码 112、workbuddy 国际版签到误判、buddy 保活续期）。详见 §9.1c。
 
 **第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
 原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
@@ -171,7 +177,7 @@
 | 不做 | 原因 |
 |---|---|
 | 移植 Go 项目全部功能 | Go 侧 21k 行含大量部署态能力（Docker、面板、归档），与 serverless 目标无关 |
-| 支持全部 provider | ✅ **已做 13 家**（第 8 步 + 第 9 轮，含腾讯国内版 + 国际版双变体）。`loomy` 曾于 `9ac653f` 删除，**第 9 轮已重新接入**（短信登录）。未接登录的家其推理仍可用「导入凭据」 |
+| 支持全部 provider | ✅ **已做 15 家**（第 8 步 + 第 9/11 轮）。`loomy` 曾于 `9ac653f` 删除，第 9 轮已重新接入（短信登录）。**第 11 轮后所有家都能从本服务登录**（回调落在本机端口的家走「手动粘贴回调链接」） |
 | ~~zcode 签到~~ | 已确认**不可行**（需 headful Chromium 过阿里云 captcha）；推理不受影响 |
 | 管理面板的完整复刻 | 面板功能多；第一版只做**能验证闭环的最小 API** |
 | `Expert_Philanthropy` 任务 | 需真实捐款，Go 侧已实测无法绕过（`internal/panel/autotask.go:19`） |
@@ -530,7 +536,7 @@ TaskRunner DO
 
 ## 九、实施进度与实测发现
 
-**第 1–8 步全部完成；第 9–10 轮改造已交付。** `npm test` → **632/632 通过**；`npm run typecheck` → 通过。
+**第 1–8 步全部完成；第 9–11 轮改造已交付。** `npm test` → **644/644 通过**；`npm run typecheck` → 通过。
 
 > 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
 > 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
@@ -547,7 +553,7 @@ TaskRunner DO
 | 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功** |
 | 6. 聚合网关 | ✅ **完成**：`/v1/models` + 流式/非流式 `/v1/chat/completions`（含工具调用）+ 已接入账号池 |
 | 7. Web 面板 | ✅ **完成**：`/panel/` 上线，**6 视图**（积分包页已按用户要求删除），CSP 严格 |
-| 8. 多供应商 | ✅ **完成**：接入统一 `Provider` 接口。**第 9 轮后为 13 家**（含重新接入的 `loomy` 与新增的 `gemini`） |
+| 8. 多供应商 | ✅ **完成**：接入统一 `Provider` 接口。**第 9 轮后 13 家**（含重新接入的 `loomy` 与新增的 `gemini`）；**第 11 轮后 15 家**（+ `qodercn` / `minimaxintl`） |
 
 ### 9.1b 第 9 轮改造（2026-10-08/09）：Responses API + 续期缺陷 + 面板管理
 
@@ -1782,6 +1788,180 @@ realm 是记在凭据 `extras.realm` 上的。
 ⚠️ 另记录一条部署环境事实：本沙箱到 `api.cloudflare.com` 的**上传速度仅 ~89 KB/s**，
 而产物 gzip 后 368 KiB ⇒ 部署经常在 undici 的 10s connect 超时上失败。
 **必须**用重试循环（实测 1–4 次内总有一次成功），不要以为是自己代码的问题。
+
+### 9.1c 第 11 轮（2026-11-21）：qoder cn + minimax 国际版 + 默认 Trae + 手动回调登录
+
+**测试基线：644 条单测通过；`npm run typecheck` 通过；`wrangler deploy --dry-run` 通过。**
+
+参考来源：`iJetLi/dsh-providers-hub`（`77d8148a`，2026-11-20）。用户诉求：
+「增加 qoder cn 供应商；看原有供应商有没有需要更新的；有登录方便的就加上；
+默认提供商改为 Trae（workbuddy 不太稳定）」，追加一句：
+「既然这个可以这么登录，那其它无法直接登录的供应商能不能这么搞」。
+
+#### ① 新增两家供应商（共 15 家）
+
+| id | 来源 | 说明 |
+|---|---|---|
+| `qodercn` | 阿里 Qoder 中国版 | **实现早已存在**（`buildQoderProduct('qodercn')`），只差注册与登录接线 |
+| `minimaxintl` | MiniMax Code 国际版 | 把 8 处硬编码站点常量参数化为 `MinimaxSite` |
+
+**⚠️ `qodercn` 的两个陷阱（都已修，别改回去）**：
+
+1. `parseCredential` 里的 `provider` 字段是**硬编码 `'qoder'`** 的 ⇒ 直接挂函数引用
+   会让中国版账号全部落成 `qoder`，然后拿中国版令牌打国际版端点（必然 401，
+   而症状是「凭据坏了」）。改为 **provider 内部绑定 `product.id`**。
+2. **两站凭据形状无法区分**（都是 `security_oauth_token` + `machine_id`）⇒
+   `qodercn` **刻意不声明 `matchesShape`**，只能显式声明。
+   给它声明判据会让自动识别按注册顺序把国际版凭据判给中国版。
+
+**⚠️ `minimaxintl` 的站点实测（2026-11-21，零凭据）**：
+
+| 用途 | host | 实测 |
+|---|---|---|
+| 目录/推理/积分 | `agent.minimaxi.com` | `GET /mavis/api/v1/models?region=en` → **200** |
+| OAuth 设备码 | `account.minimax.io` | `POST /oauth2/device/code` → **400**（缺字段，端点存在） |
+
+⚠️ **`agent.minimax.io` 是错的**：它回 **307** 跳到 `agent.minimaxi.com`。
+`fetch` 默认跟随重定向，而 307 转发会改变方法 / 丢 `Authorization`
+（表现为「目录能读到、一发消息就 401」）⇒ 直接写**重定向终点**。
+⚠️ 反过来 `account.minimaxi.com/oauth2/device/code` 是 **404** —— 两个 host 不可互换。
+
+#### ② 🔴 默认供应商改 Trae —— 这牵动了**四处**真实故障点
+
+用户要求「默认供应商改为 Trae」。源码里 `DEFAULT_PROVIDER` 此前被当成**四个不同概念**
+共用（因为默认值恰好是 buddy，四者一直重合）：
+
+| 概念 | 旧写法 | 改默认值后的后果 |
+|---|---|---|
+| **裸模型名回落到谁** | `DEFAULT_PROVIDER` | ✅ 这才是它该管的事 |
+| **谁需要 env 绑定** | `x === DEFAULT_PROVIDER ? bindBuddy(env) : p` | 把 **Trae 喂进 `bindBuddy`** ⇒ 拿 Trae 凭据打腾讯端点；而**真正的 buddy** 反而拿不到绑定 |
+| **WorkBuddy 专用协议分支** | `if (providerId !== DEFAULT_PROVIDER)` | **Trae 走进腾讯私有协议路径**（用 SOLO 请求体 POST `/v2/chat/completions`），且会被记成 Trae 账号失败 |
+| **存储 key 加不加前缀** | `providerId === DEFAULT_PROVIDER ? uid : \`${p}:${uid}\`` | 同一 Trae 账号改动前是 `trae:123`、改动后是 `123` ⇒ **重复账号**，且旧的冷却/停用标记挂在旧 key 上 |
+
+⇒ 引入**四个独立常量/函数**，把概念拆开：
+
+- `DEFAULT_PROVIDER = 'trae'` —— 只管裸模型名路由；
+- `ENV_BOUND_PROVIDER = 'buddy'` —— 谁需要 `bindBuddy`；
+- `providerForCall(id, fallback, bindEnvBound)` —— **所有调用点统一走它**（替换了 7 处三元式）；
+- `LEGACY_PROVIDER = 'buddy'` —— **历史账号没有 `provider` 字段时**当作哪家（18 处兜底）；
+- `storageUidFor(providerId, uid)` —— 存储 key 规则，按**白名单**（buddy/workbuddy 裸 uid，其余加前缀），与默认供应商无关。
+
+⚠️ **`LEGACY_PROVIDER` 与 `DEFAULT_PROVIDER` 必须分开**：前者是**数据的解释规则**
+（历史数据没写 `provider` 字段，那时的唯一供应商是 WorkBuddy），后者是**路由偏好**。
+把兜底读成 `DEFAULT_PROVIDER` 会让所有老账号被当成 Trae 账号 ⇒ 拿腾讯凭据打字节端点。
+
+⚠️ 同时修正了**三处语义错位**（它们此前靠「默认=buddy」这个巧合才正确）：
+
+- `gateway/models.ts` 的 `owned_by` 恒写 `buddy`（那是 WorkBuddy 专用解析器）；
+- `gateway/server.ts` 的 `pickCandidate(..., 'buddy')`（WorkBuddy 专用路径内部）；
+- `index.ts` 的 `/admin/tasks/daily-all` 判据改为 `ENV_BOUND_PROVIDER`（成长任务是腾讯独有体系）。
+
+**改写了 4 条旧断言**（它们把旧耦合钉死了）：默认供应商「必须是注册表第 0 项」
+→ 改为「必须已注册且显式声明」；「WorkBuddy 最后试」从**比数组下标**（空断言）
+→ 改为**行为级**（喂歧义输入，结果必须不是 buddy）。
+
+#### ③ 手动粘贴回调链接（用户追加要求）
+
+**洞察**：回调落在 `127.0.0.1:<port>` 的那几家，浏览器那一跳必然失败，
+**但地址栏里带着完整凭证**。让用户把那段 URL 粘回来，效果等同于我们收到回调
+—— 不需要本地端口，也不需要上游配合。
+
+新增 `POST /admin/providers/login/submit-callback`（**需管理密钥**，
+`state` 绑定已存在的登录会话，供应商**只从会话载荷取、绝不从请求体取**）。
+
+| 家 | 回调参数 | 复用哪份解析（**同一件事只有一个实现**） |
+|---|---|---|
+| `trae` | `refreshToken` / `userInfo` / `userJwt` | `parseTraeCallback` |
+| `codearts` | `secret` / `fingerprint` / `token` | **新抽出** `parseCodeArtsCallbackQuery`（回调处理器也改用它，删掉了重复实现） |
+| `lobsterai` | `authCode` / `code`（含 hash 段） | **新增** `parseLobsteraiCallbackCode` |
+| `gemini` | `code` / `state` / `error` | **新增** `parseGeminiCallback` |
+| `raccoon` | `code` / `state` | **新增** `parseRaccoonCallback` |
+
+⚠️ **只有那 5 家显示输入框**（`MANUAL_CALLBACK_PROVIDERS`）：对设备码家显示它
+只会让人以为「必须粘贴」。
+
+⚠️ **一次性凭证只能有一个交换出口**：`authCode` / `code` 换码会**消耗**凭证，
+故提交端点**只写回会话**，由面板轮询去换（trae 的 `ExchangeToken` 还会**轮换**
+refresh_token —— 两处都换会让第二次必然失败）。
+
+⚠️ **lobsterai 的 `LOBSTERAI_EXCHANGE_PATH` 是推断值**（`/api/auth/exchange`），
+**未经实测** —— 参考实现里该常量不在可读片段内。接真实账号时必须先验证一次，
+若 404 改这一个常量即可（其余流程与端点无关）。已在代码里显式标注。
+
+#### ④ raccoon 扫码页已死（实测，本轮修）
+
+**实测 2026-11-21**：
+
+| 路径 | 结果 |
+|---|---|
+| `GET /login/mp` | **404**（带不带 `code` 都一样） |
+| `GET /authorize` | **200** |
+| `POST /api/web/auth/v1/login_with_qrcode_code` | **200** + `{"status":"pending"}` |
+| `POST /api/web/auth/v1/login_with_authorization_code` | **400** + `code:200035`（端点存在） |
+
+⚠️ **这就是它藏了这么久的原因**：**签发仍成功、轮询仍「耐心等待」**，
+而用户扫进去只看到一个 404 页、界面上零报错、日志里也没有异常。
+
+⇒ 改走官方 `/authorize` 授权页 + 手动回调（`createRaccoonAuthorizeSession`
+按官方页面规则构造：`state` 必须 **64 位小写 hex**、`redirect` 必须是
+`http://127.0.0.1:<4~5 位端口>/auth/callback`、参数名只能在白名单内）。
+旧的扫码函数**保留但标注「已不可用」**（协议端点仍活，上游修回来可直接复用）。
+
+#### ⑤ 移植三个上游已修的真实缺陷
+
+**a. qoder 额度码不是「一个值」，是一条链**
+
+旧判据只认 `110`。而上游的「额度用尽」还有 **`112`**，其报文**只带一个
+`pricingUrl` 字段**、没有任何自然语言说明 ⇒ 码值腿与文案腿全 false ⇒
+错误被归成「服务端故障」⇒ ① 白退避重试；② **既不换号、也不换 provider**。
+
+修法两条腿**必须同时在**：`QODER_BILLING_CODES = ['110','112']`
++ 文案腿认**结构字段** `"pricingUrl":`（不认主题词，避免误伤正常讨论定价的正文）。
+⚠️ 本轮实测发现：对象形态**也要**判 `pricingUrl` 键（只判字符串分支时，
+单测直接把对象喂进来会漏）。
+
+**b. workbuddy 国际版「没有签到接口」是误判**
+
+旧理由「CLI 内核里只有 `get-dosage-notify`」——**那个推理是错的**：
+签到端点是 IDE / 网页前端直调的，CLI 内核里本来就不会有
+（与当年 `get-user-resource` 余额的误判同型）。
+
+实测（零凭据探测端点存在性，401 = 存在但要鉴权；不存在回 404）：
+
+| 端点 | `www.workbuddy.ai` | `copilot.tencent.com` |
+|---|---|---|
+| `POST /v2/billing/meter/checkin-activity-status` | **401** | **401** |
+| `POST /v2/billing/meter/daily-checkin` | **401** | **401** |
+
+⇒ 两站**同形** ⇒ `checkin: true`。
+⚠️ 国际版还有一处差异：每日奖励挂在**活动**上，活动关闭时上游回 `41000`，
+此时会**如实返回「无收益」**而不是谎报成功。
+
+**c. buddy 续期保活（否则 28 天后必然失效）**
+
+腾讯系 access_token 有效期**以天计**（实测 60/30/28 天三批），而旧的 lead-time
+判据只在「距过期不足 1 小时」放行 ⇒ 每小时那轮 cron **全部跳过** ⇒
+`refresh_token` 闲置 28 天被服务端作废（`401 code:12153`）。
+
+⇒ 续期判据改为**两条腿取或**：到期腿 ∨ **保活腿**（距 `iat` 满 7 天）。
+三条取舍（都有单测钉住）：
+
+1. 用「距上次续期多久」而不是 TTL 百分比（TTL 在变，比例会贴到红线）；
+2. **`REFRESH_LEAD_MS` 一个字不改**（九家共用；改大会烧光一次性 refresh_token）；
+3. 保活**只对 buddy/workbuddy**（`KEEPALIVE_PROVIDERS` 白名单）。
+
+⚠️ 解不出 `iat` 时**退化**（不保活），而不是「立刻续」——后者会把所有
+解不出 JWT 的凭据每轮白刷一遍。
+
+#### ⑥ 未验证项（诚实登记）
+
+| 项 | 状态 |
+|---|---|
+| `LOBSTERAI_EXCHANGE_PATH` | ⚠️ **推断值，未实测**（见 ③） |
+| 各家的「手动回调」端到端 | ⚠️ 解析器有单测；**真实授权码换码未跑**（需真实账号） |
+| `qodercn` 的中国版端点 | ✅ 复用国际版同一套实现与既有实测；**新账号登录未跑** |
+| `minimaxintl` 设备码全流程 | ⚠️ 端点存在性已实测；**未用真实账号走完** |
+| raccoon `/authorize` 全流程 | ⚠️ 页面 200 已实测；**未用真实账号走完** |
 
 ### 9.2 第 1 步：出口 IP / WAF 前置验证（✅ 通过）
 

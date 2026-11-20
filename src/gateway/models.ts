@@ -5,7 +5,7 @@
  */
 
 import { resolveUpstream, type Env } from '../env.js'
-import { DEFAULT_PROVIDER } from '../providers/index.js'
+import { DEFAULT_PROVIDER, LEGACY_PROVIDER } from '../providers/index.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 
 /** 模型目录单条（OpenAI 兼容形状）。 */
@@ -63,7 +63,7 @@ export async function pickCredential(
   const accounts = await pool.listAccounts(realm, Date.now())
   for (const account of accounts) {
     if (account.disabled) continue
-    if ((account.provider ?? DEFAULT_PROVIDER) !== providerId) continue
+    if ((account.provider ?? LEGACY_PROVIDER) !== providerId) continue
     const credential = (await pool.getCredential(account.uid)) as { accessToken?: string } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
       return { uid: account.uid, credential: { accessToken: credential.accessToken } }
@@ -160,7 +160,11 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       id,
       object: 'model',
       created: 0,
-      owned_by: DEFAULT_PROVIDER,
+      // ⚠️ 这里是 **WorkBuddy 专用**的解析器（`/v3/config` 的 `data.models[]`），
+      // 故 `owned_by` 恒写 `buddy` —— 不能写 `DEFAULT_PROVIDER`。
+      // 默认值改成 Trae 之后，那会把腾讯的模型标成「属于 Trae」，
+      // 而 `owned_by` 是客户端判断模型归属的依据（显示与路由提示都用它）。
+      owned_by: LEGACY_PROVIDER,
       ...(str('name') === undefined ? {} : { name: str('name') as string }),
       // ⚠️ 这些字段上游**本来就下发**（实测 `/v3/config` 的 data.models[]），
       // 之前只取 id/name 是白丢信息 —— 面板因此显示不出上下文与图片能力。

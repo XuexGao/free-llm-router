@@ -30,7 +30,13 @@ import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { prepareChatBody, requestHasImage, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
-import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
+import {
+  DEFAULT_PROVIDER,
+  LEGACY_PROVIDER,
+  findProvider,
+  providerForCall,
+  providerIds,
+} from '../providers/index.js'
 // ⚠️ 裸名别名（官方拼写 → 聚合规范名）—— 与 canonical-models 共用同一张表，
 // 免得「面板显示的规范名」与「路由认识的别名」两处各写一份、慢慢分叉。
 import { aggregateAliasForBareModel } from '../providers/canonical-models.js'
@@ -490,7 +496,17 @@ export async function handleChatCompletions(
 
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
-  if (providerId !== DEFAULT_PROVIDER) {
+  //
+  // ## ⚠️ 判据是「**是不是 WorkBuddy 系**」，不是「是不是默认供应商」
+  //
+  // 改前写的是 `providerId !== DEFAULT_PROVIDER` —— 在默认值恰好是 buddy 时
+  // 两者等价，但它把「这段代码是腾讯私有协议」这一事实藏在了
+  // 「默认供应商」这个无关概念后面。把默认值改成 Trae 之后，这个分支会让
+  // **Trae 走进腾讯私有协议路径**：用 SOLO 请求体去 POST `/v2/chat/completions`，
+  // 拿到的是腾讯的错误信封，且会被记成 Trae 账号失败。
+  //
+  // ⇒ 判据改为「buddy / workbuddy 两个变体」，与默认供应商彻底解耦。
+  if (providerId !== 'buddy' && providerId !== 'workbuddy') {
     return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, subkey })
   }
 
@@ -548,8 +564,12 @@ export async function handleChatCompletions(
     // 会话粘性：只首轮用（换号后还粘回去会死循环）
     const buddyPreferred =
       tried.length === 0 && sessionKey !== '' ? await pool.getSession(sessionKey, now) : ''
+    // ⚠️ 这一段是 **WorkBuddy 专用**路径（见上面「非 WorkBuddy 走独立接口」
+    // 那个分支），故这里的供应商恒为 `buddy`，不能写 `DEFAULT_PROVIDER` ——
+    // 否则默认值一换成 Trae，这里就会去挑 **Trae 账号**然后用 WorkBuddy 的
+    // 私有协议发请求，拿到的是无意义的错误信封。
     const candidate = await pickCandidate(
-      pool, realm, model, tried, now, DEFAULT_PROVIDER,
+      pool, realm, model, tried, now, LEGACY_PROVIDER,
       buddyPreferred === undefined ? '' : buddyPreferred,
     )
     if (candidate === undefined) {
@@ -583,7 +603,9 @@ export async function handleChatCompletions(
         headers: referenceChatHeaders({
           uid: candidate.uid,
           accessToken: candidate.credential.accessToken,
-          variant: DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+          // ⚠️ 这一段只服务 WorkBuddy 系（见上面那个分支的说明），
+          // 故variant 直接按 providerId 判，不依赖 DEFAULT_PROVIDER。
+          variant: providerId === 'workbuddy' ? 'workbuddy' : 'buddy',
         }),
         body: prepared,
         signal: request.signal,
@@ -959,13 +981,13 @@ async function handleProviderChat(input: {
   {
     const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const hasHere = (await probe.listAccounts(realm, Date.now())).some(
-      (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+      (a) => (a.provider ?? LEGACY_PROVIDER) === providerId,
     )
     if (!hasHere) {
       const other = realm === 'cn' ? 'global' : 'cn'
       const probeOther = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
       const hasOther = (await probeOther.listAccounts(other, Date.now())).some(
-        (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
+        (a) => (a.provider ?? LEGACY_PROVIDER) === providerId,
       )
       if (hasOther) activeRealm = other
     }
@@ -1882,7 +1904,7 @@ async function listModelsForProvider(
 ): Promise<import('../providers/types.js').ProviderModel[]> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await pool.listAccounts(realm, Date.now())
-  const usable = accounts.filter((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled)
+  const usable = accounts.filter((a) => (a.provider ?? LEGACY_PROVIDER) === providerId && !a.disabled)
   if (usable.length === 0) return []
 
   const provider = findProvider(providerId)
@@ -1895,7 +1917,7 @@ async function listModelsForProvider(
   const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
   if (credential === undefined) return []
 
-  const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+  const bound = providerForCall(providerId, provider, () => bindBuddy(env))
   try {
     return await bound.listModels(credential, AbortSignal.timeout(20_000))
   } catch (error) {
@@ -1987,7 +2009,7 @@ async function probeExpiries(
     try {
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
       const accounts = await pool.listAccounts(realm, Date.now())
-      const account = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === c.provider && !a.disabled)
+      const account = accounts.find((a) => (a.provider ?? LEGACY_PROVIDER) === c.provider && !a.disabled)
       if (account === undefined) {
         out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)
         out.set(key, EXPIRY_UNUSABLE)
@@ -1999,7 +2021,7 @@ async function probeExpiries(
         out.set(key, EXPIRY_UNUSABLE)
         continue
       }
-      const bound = c.provider === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+      const bound = providerForCall(c.provider, provider, () => bindBuddy(env))
       const balanceFn = bound.balance
       if (balanceFn === undefined) {
         out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)

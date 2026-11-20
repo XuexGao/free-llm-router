@@ -254,9 +254,9 @@ const EXTRA_MACHINE_TOKEN = 'machineToken'
 const EXTRA_MACHINE_TYPE = 'machineType'
 
 /** 宽容读取：接受嵌套（`{credential:{…}}` / `{data:{…}}`）与扁平两种形态。 */
-function unwrapCredential(input: unknown): Record<string, unknown> {
+function unwrapCredential(input: unknown, variant: 'qoder' | 'qodercn' = 'qoder'): Record<string, unknown> {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-    throw new ProviderError({ provider: 'qoder', message: '凭据必须是 JSON 对象' })
+    throw new ProviderError({ provider: variant, message: '凭据必须是 JSON 对象' })
   }
   const record = input as Record<string, unknown>
   // 常见的三种包装层（面板导出、DSH 快照、本项目的存储条目）。
@@ -331,8 +331,11 @@ export function decodeJwtPayload(token: string): Record<string, unknown> | undef
  *
  * ⚠️ **绝不用空串兜底 access token**（`types.ts` 的硬要求）。
  */
-export function parseCredential(input: unknown): ProviderCredential {
-  const source = unwrapCredential(input)
+export function parseCredential(
+  input: unknown,
+  variant: 'qoder' | 'qodercn' = 'qoder',
+): ProviderCredential {
+  const source = unwrapCredential(input, variant)
 
   const accessToken = readString(source, [
     'security_oauth_token',
@@ -343,7 +346,7 @@ export function parseCredential(input: unknown): ProviderCredential {
   ])
   if (accessToken === undefined) {
     throw new ProviderError({
-      provider: 'qoder',
+      provider: variant,
       message: 'Qoder 凭据缺少访问令牌（需要 `access_token` 或 `security_oauth_token`）；'
         + '请用面板的设备码登录，或从 Qoder 客户端导出后粘贴完整 JSON',
     })
@@ -360,7 +363,7 @@ export function parseCredential(input: unknown): ProviderCredential {
     ?? (jwt === undefined ? undefined : readString(jwt, ['sub', 'user_id', 'userId', 'uid']))
   if (uid === undefined) {
     throw new ProviderError({
-      provider: 'qoder',
+      provider: variant,
       message: 'Qoder 凭据缺少账号 id（`uid` / `user_id`），且访问令牌里也解不出 `sub`。'
         + '加密推理必须知道 uid，请重新走一次设备码登录',
     })
@@ -377,7 +380,7 @@ export function parseCredential(input: unknown): ProviderCredential {
   if (machineType !== undefined) extras[EXTRA_MACHINE_TYPE] = machineType
 
   return {
-    provider: 'qoder',
+    provider: variant,
     uid,
     accessToken,
     refreshToken: readString(source, ['refresh_token', 'refreshToken']) ?? '',
@@ -565,6 +568,37 @@ export function unwrapQoderEnvelopePayload(payload: string): string | null {
 
 /** Qoder 的业务错误码（都来自参考实现与 AGENTS.md 的实测记录）。 */
 export const QODER_QUEUE_CODE = '10605'
+
+/**
+ * 额度类业务码 —— **它不是「一个值」，而是一条链**。
+ *
+ * ## 🔴 只认 `110` 会让换号**静默失效**（真实缺陷，本项目已移植修复）
+ *
+ * 上游的「额度用尽」不止一种码。参考实现记录过两次：
+ *
+ * | 码 | 报文特征 | 当年表现 |
+ * |---|---|---|
+ * | `110` | `billing daily count exceeded` / `billing_error` | 白重试 5 次 |
+ * | **`112`** | 只带一个 **`pricingUrl`** 字段 | **既不换号、也不换 provider** |
+ *
+ * 为什么 `112` 后果更重：码值判据与文案判据**都没命中** ⇒ 错误被归成
+ * 「服务端故障」⇒ ① 走白退避重试；② **不触发换号**。
+ * 用户看到的是「轮换没生效」，而实际是**我们没认出这是额度问题**。
+ *
+ * ⇒ 两条腿**必须同时在**（缺一条，下次上游换个码值就复发）：
+ * 1. **码值腿**：本集合；
+ * 2. **文案腿**：{@link looksLikeQoderBillingError} 认结构字段 `pricingUrl`。
+ *
+ * ⚠️ **证据强度如实标注**：`110` 当年读的是客户端产物原文；`112` 的依据是
+ * **报文语义**（带定价页链接 = 付费才能用）+ 兄弟码同类，**不是**产物实证。
+ */
+export const QODER_BILLING_CODES: readonly string[] = ['110', '112']
+
+/**
+ * 单值再导出（仅为对外 API 兼容）。
+ *
+ * ⚠️ **判据别用它** —— 用 {@link QODER_BILLING_CODES}，否则又回到「只认一个码」。
+ */
 export const QODER_BILLING_CODE = '110'
 
 /**
@@ -663,10 +697,27 @@ export function looksLikeQoderBillingError(value: unknown): boolean {
     return lower.includes('billing daily count exceeded')
       || lower.includes('daily count exceeded')
       || lower.includes('billing_error')
+      // ⚠️ **结构字段腿**：`112` 的报文只带这个字段（没有任何自然语言说明）。
+      // 判据是「认结构字段名」而不是「认主题词」—— 实测 `balance` / `quota`
+      // 以及正文里正常讨论 pricing 的句子都**不含** `"pricingUrl":` 这个键名，
+      // 故不会误伤（参考实现对此有反向断言）。
+      || /"pricingUrl"\s*:/.test(value)
   }
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
-  if (record.code === QODER_BILLING_CODE || record.code === Number(QODER_BILLING_CODE)) return true
+  // ⚠️ 判**集合**而不是单值：只认 110 会让 112 漏过去（见 QODER_BILLING_CODES）。
+  // 数字与字符串两种编码都认 —— 上游在不同的端点下发形态不同。
+  const code = record.code
+  if (typeof code === 'string' || typeof code === 'number') {
+    if (QODER_BILLING_CODES.includes(String(code).trim())) return true
+  }
+  // ⚠️ **对象形态也要认 `pricingUrl` 键** —— 上游可能把这段报文作为
+  // 解析后的对象交过来（而不是原始字符串）。只在字符串分支里查，
+  // 对象分支就会漏掉 `112`（本轮实测到：单测直接把对象喂进来时变红）。
+  //
+  // 判据仍是「**键存在**」而不是「值里含有 pricing 字样」—— 后者会误伤
+  // 正常讨论定价的正文。
+  if (typeof record.pricingUrl === 'string' && record.pricingUrl.trim() !== '') return true
   for (const key of ['message', 'body', 'result', 'data', 'error']) {
     if (looksLikeQoderBillingError(record[key])) return true
   }
@@ -807,15 +858,15 @@ const QUEUE_MAX_ATTEMPTS = 3
  */
 const QUEUE_TOTAL_BUDGET_MS = 45_000
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
+function sleep(ms: number, signal: AbortSignal, provider: string = 'qoder'): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(new ProviderError({ provider: 'qoder', message: '请求已取消' }))
+      reject(new ProviderError({ provider, message: '请求已取消' }))
       return
     }
     const onAbort = (): void => {
       clearTimeout(timer)
-      reject(new ProviderError({ provider: 'qoder', message: '请求已取消' }))
+      reject(new ProviderError({ provider, message: '请求已取消' }))
     }
     const timer = setTimeout(() => {
       signal.removeEventListener('abort', onAbort)
@@ -972,7 +1023,7 @@ async function chat(
       const wait = queue.retryAfterMs === undefined
         ? 1000
         : Math.min(queue.retryAfterMs, QUEUE_MAX_DELAY_MS)
-      await sleep(wait, request.signal)
+      await sleep(wait, request.signal, product.id)
       continue
     }
 
@@ -1511,7 +1562,13 @@ export function buildQoderProvider(product: QoderProduct): Provider {
         || (typeof input['machine_id'] === 'string' && typeof input['security_oauth_token'] === 'string')
       )
     },
-    parseCredential,
+    /**
+     * ⚠️ **必须传 `product.id`**：`parseCredential` 的默认值是 `'qoder'`，
+     * 直接挂函数引用会让**中国版**解析出的凭据写着 `provider:'qoder'` ——
+     * 于是 `qodercn` 账号全部落成 `qoder`，用中国版端点去请求国际版推理域，
+     * 必然 401（且症状是「凭据坏了」而不是「供应商选错了」）。
+     */
+    parseCredential: (input) => parseCredential(input, product.id),
     async listModels(_credential, _signal) {
       // ⚠️ **恒用静态表，不发网络请求**：远端 `GET /algo/api/v2/model/list`
       // 需 WASM 签名，而目录是只读能力 —— 付密码学代价换一张几乎不变的清单
@@ -1552,11 +1609,22 @@ export function buildQoderProvider(product: QoderProduct): Provider {
 export const qoderProvider: Provider = buildQoderProvider(buildQoderProduct('qoder'))
 
 /**
- * 中国版 provider —— **已可直接注册**（`buildQoderProduct('qodercn')` 只差配置）。
+ * 中国版 provider（`qodercn`）。
  *
- * 目前**不**放进 `src/providers/index.ts` 的 `PROVIDERS`（按任务要求只注册
- * `qoder`）；将来要加时，把它加进数组并给 `env` 无需改动 —— 没有任何
- * 实现文件需要复制。
+ * ## ⚠️ 与 `qoder` 共用一个实现，只差配置
+ *
+ * 差异全在 {@link buildQoderProduct} 的字段里（authBase / openApiBase /
+ * encryptedInferBase / clientId / 兜底目录）。**不要**复制一份实现文件。
+ *
+ * ## ⚠️ 它**不声明 `matchesShape`** —— 这是刻意的
+ *
+ * 两站的凭据形态**逐字段相同**（都是 `security_oauth_token` + `machine_id`），
+ * 形状上**无法区分**是哪一站。若给它声明判别式，自动识别会按注册顺序
+ * 把**国际版**凭据判成中国版（或反过来），结果是拿 A 站令牌打 B 站端点 ——
+ * 必然 401，而用户看到的是「凭据失效」，几乎不可能联想到「供应商选错了」。
+ *
+ * ⇒ 按 `types.ts` 的纪律「**宁可要求用户显式说明，也不要把凭据存错家**」：
+ * 中国版只能**显式声明**（`/admin/import` 带 `provider:'qodercn'`，或面板登录）。
  */
 export const qodercnProvider: Provider = buildQoderProvider(buildQoderProduct('qodercn'))
 

@@ -540,8 +540,12 @@ test('⚠️ 用户码样式必须白底深字且可整段选中（深色主题�
 
 test('⚠️ cline 的登录方式标签必须写明是「用户码」而不是笼统的「设备码登录」', () => {
   const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+  // ⚠️ 判据从「第一行」放宽为「表内任意位置」：
+  // 表已加长（2026-11-21 新增 lobsterai / gemini / minimaxintl），
+  // 而「必须写明是用户码」这个**实质要求**与它排在第几行无关。
   const start = js.indexOf('const LOGIN_KIND_LABEL')
-  const line = js.slice(start, js.indexOf('\n', start))
-  assert.ok(line.includes("cline: '用户码登录'"),
+  const end = js.indexOf('}', start)
+  const table = js.slice(start, end)
+  assert.ok(table.includes("cline: '用户码登录'"),
     'cline 要用户手抄代码，标签必须提前说清（否则用户点开才发现要抄码）')
 })

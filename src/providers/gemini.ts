@@ -2120,16 +2120,28 @@ export const geminiProvider: Provider = {
      * Workers **没有监听 socket** ⇒ 接不住回调，与 `lobsterai` / `trae` 同类。
      * 用户只能从已登录的客户端**导出凭据**后导入。
      */
-    login: false,
+    /**
+     * ✅ **可用** —— 走「**手动粘贴回调链接**」（2026-11-21 改）。
+     *
+     * ## ⚠️ 上面那条事实没有变
+     *
+     * Google 对原生应用**只允许 loopback 重定向**（RFC 8252），
+     * 且注册的 `redirect_uri` 就是 `http://localhost:<port>/oauth-callback`
+     * —— Workers 没有监听 socket，那一跳接不住。
+     *
+     * ## ⇒ 走的是另一条：让用户把地址栏**粘回来**
+     *
+     * 用户在本机完成 Google 授权后，浏览器虽然打不开那个端口，但**地址栏里
+     * 带着 `?code=…`**。`/admin/providers/login/submit-callback` 收下它，
+     * 由面板既有的轮询去令牌端点换存取令牌（`grant_type=authorization_code`）。
+     *
+     * ⚠️ 授权码**约 10 分钟过期且一次性** —— 会话 TTL 与之对齐。
+     */
+    login: true,
     listModels: true,
     chat: true,
     balance: true,
     checkin: false,
-    loginBlockedReason:
-      'Gemini 的登录是浏览器回调式 OAuth，回调地址必须是 `http://localhost:<端口>/oauth-callback`'
-      + '（Google 对原生应用只允许 loopback 重定向）—— Workers 没有监听 socket，接不住这个回调。'
-      + '请从已登录的 Antigravity / Cloud Code 客户端导出凭据后导入'
-      + '（至少含 `access_token`，带 `refresh_token` 才能自动续期）。',
     checkinBlockedReason:
       'Cloud Code Assist **没有每日签到接口** —— 它的额度是按 5 小时 / 周两个窗口滚动的'
       + '**配额比例**（见余额），不是可领取的积分。这是上游产品形态，不是本服务的缺失。',
@@ -2151,4 +2163,161 @@ export const geminiProvider: Provider = {
   chat,
   balance,
   refresh: refreshGeminiCredential,
+}
+
+// ───────────────────── 登录（手动粘贴回调链接） ─────────────────────
+
+/**
+ * Google OAuth 授权端点。
+ *
+ * ⚠️ 与 {@link GEMINI_TOKEN_URL} 是**两个不同的**端点：
+ * 这个给用户打开（返回授权码），那个用来换令牌。混用会得到 404。
+ */
+export const GEMINI_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
+
+/**
+ * 回调路径 —— **与 client 注册值逐字一致，改了就 `redirect_uri_mismatch`**。
+ *
+ * 参考实现 `gemini-oauth.ts:41` 记录的同一个值。
+ */
+export const GEMINI_CALLBACK_PATH = '/oauth-callback'
+
+/**
+ * 六项 scope（逐字照抄参考实现 `gemini-oauth.ts:58-66`）。
+ *
+ * ⚠️ `cloud-platform` **必需**（Cloud Code 的推理与配额都在它之下）；
+ * 后两项是 Cloud Code 自己的通道，缺了会让部分能力静默不可用。
+ */
+export const GEMINI_SCOPES: readonly string[] = [
+  'openid',
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/cclog',
+  'https://www.googleapis.com/auth/experimentsandconfigs',
+]
+
+/**
+ * 生成授权 URL（**纯函数**）。
+ *
+ * ## ⚠️ 两个参数不能省
+ *
+ * - `access_type=offline` —— 不带它 Google **不会**下发 `refresh_token`，
+ *   于是账号只能用一小时就废（这在本项目是「动不动就掉登录」的头号成因）。
+ * - `prompt=consent` —— 不带它，**已授权过**的用户再次登录时 Google
+ *   会跳过同意页、**同样不下发新的 refresh_token**。
+ *   表现是「重新登录了，但续期还是失败」。
+ *
+ * ⚠️ `redirect_uri` 的主机名**必须是 `localhost`**（不是 `127.0.0.1`）：
+ * Google 对原生应用只允许 loopback，且注册的是 `localhost` ——
+ * 换一个就 `redirect_uri_mismatch`。
+ */
+export function buildGeminiAuthUrl(state: string, port: number = 8845): string {
+  const redirectUri = `http://localhost:${port}${GEMINI_CALLBACK_PATH}`
+  const query = new URLSearchParams({
+    client_id: geminiOAuthClientId(),
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    scope: GEMINI_SCOPES.join(' '),
+    state,
+    access_type: 'offline',
+    include_granted_scopes: 'true',
+    prompt: 'consent',
+  })
+  return `${GEMINI_AUTH_URL}?${query.toString()}`
+}
+
+/**
+ * 从一段回调 URL 里取出 `code` 与 `state`（**纯函数**）。
+ *
+ * ## 形态
+ *
+ * `http://localhost:8845/oauth-callback?code=4/0A…&state=…&scope=…`
+ *
+ * ⚠️ 用户在 Google 页面上点「取消」时，回来的**没有 `code`**，而是
+ * `?error=access_denied`。那种情况必须**如实报错**，不能当成「还没授权」
+ * 让面板一直等（这是本项目在 loomy 上踩过的同型问题）。
+ */
+export function parseGeminiCallback(rawUrl: string): {
+  code: string
+  state: string
+  /** 上游明确返回的错误（如 `access_denied`），空串表示没有。 */
+  error: string
+} {
+  const text = rawUrl.trim()
+  const out = { code: '', state: '', error: '' }
+  if (text === '') return out
+  const marker = text.indexOf('?')
+  if (marker < 0) return out
+  const rest = text.slice(marker + 1)
+  // ⚠️ 截掉 hash 段（`?code=x#frag` 会把 `x#frag` 当成值）
+  const hashAt = rest.indexOf('#')
+  const search = new URLSearchParams(hashAt >= 0 ? rest.slice(0, hashAt) : rest)
+  out.code = (search.get('code') ?? '').trim()
+  out.state = (search.get('state') ?? '').trim()
+  out.error = (search.get('error') ?? '').trim()
+  return out
+}
+
+/**
+ * 用授权码换取令牌（`grant_type=authorization_code`）。
+ *
+ * ## ⚠️ 与续期（{@link refreshGeminiCredential}）是**两个不同的 grant**
+ *
+ * 那边是 `grant_type=refresh_token`，这边是 `authorization_code` ——
+ * 端点相同、字段不同。写错会得到 `invalid_grant`，而它**同时**也是
+ * 「refresh_token 已失效」的错误码，很容易把新手势误判成「凭据坏了」。
+ *
+ * ## ⚠️ `redirect_uri` 必须与授权时**逐个字符相同**
+ *
+ * Google 会比对它。端口不同、`localhost`/`127.0.0.1` 不同都会
+ * `redirect_uri_mismatch`。
+ */
+export async function exchangeGeminiAuthCode(
+  code: string,
+  redirectUri: string,
+  signal: AbortSignal,
+): Promise<ProviderCredential> {
+  const form = new URLSearchParams()
+  form.set('client_id', geminiOAuthClientId())
+  form.set('client_secret', geminiOAuthClientSecret())
+  form.set('code', code)
+  form.set('grant_type', 'authorization_code')
+  form.set('redirect_uri', redirectUri)
+
+  let response: Response
+  try {
+    response = await fetch(GEMINI_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    throw new ProviderError({
+      provider: 'gemini',
+      retryable: true,
+      message: `Gemini 换码请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await response.text().catch(() => '')
+  const payload = parseJsonObject(text)
+  if (!response.ok || payload === undefined) {
+    const detail = geminiErrorDetail(payload, text, response.status)
+    // ⚠️ `invalid_grant` 在这里意味着「授权码已用过 / 过期 / redirect_uri 不符」，
+    // **不是**「凭据坏了」。文案必须能区分，否则用户会去删一个没问题的账号。
+    throw new ProviderError({
+      provider: 'gemini',
+      httpStatus: response.status,
+      retryable: false,
+      message: `Gemini 换码失败（HTTP ${response.status}）：${detail}`
+        + '（授权码一次性、约 10 分钟过期；若反复失败请重新发起登录）',
+    })
+  }
+
+  // ⚠️ 走**同一个** parseCredential：保证登录与导入落成同一条账号记录。
+  // 换码响应字段（`access_token` / `refresh_token` / `expires_in`）正好是
+  // 它认识的形态。
+  return parseCredential(payload)
 }

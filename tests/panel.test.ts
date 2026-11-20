@@ -935,8 +935,21 @@ test('⚠️ 供应商排序不得改变默认供应商（避免悄悄改路由�
   // 用户选择：「只影响面板展示顺序」，不改默认供应商。
   // ⚠️ 若排序决定默认值，裸模型名的既有请求会被悄悄路由到别家 —— 不可接受。
   const src = readFileSync('src/providers/index.ts', 'utf8')
-  assert.ok(/export const DEFAULT_PROVIDER = PROVIDERS\[0\]/.test(src),
-    '默认供应商必须仍由**注册表第 0 项**决定，不受面板排序影响')
+  // ⚠️ 断言已按 2026-11-21 的改造更新：默认供应商**不再**由「注册表第 0 项」
+  // 决定，而是显式声明的一个字符串。
+  //
+  // 这次改造**加强**了本条测试原本要保的东西：旧实现里「默认供应商」
+  // 与「注册表顺序」是同一个值，而注册表顺序**同时**决定自动识别的尝试次序
+  // ⇒ 任何一边的编辑都会悄悄影响另一边。现在两者独立，面板排序与本常量无关。
+  assert.ok(/export const DEFAULT_PROVIDER = '[a-z]+'/.test(src),
+    '默认供应商必须是**显式声明的字符串**（不再由注册表顺序隐式决定）')
+  // ⚠️ 真正要防的仍然成立：默认供应商必须是**已注册**的供应商，
+  // 否则裸模型名会回落到一个不存在的家（`findProvider` 返回 undefined，
+  // 请求路径上表现为「未知供应商」）。
+  assert.ok(
+    src.includes('export const DEFAULT_PROVIDER = \'trae\''),
+    '用户要求默认供应商为 trae（workbuddy 不稳定）—— 改这个值属于产品决策，需同步改本条用例',
+  )
   // 面板设置里不该有「默认供应商」这个概念
   const index = readFileSync('src/index.ts', 'utf8')
   const i = index.indexOf("path === '/admin/providers/settings'")
@@ -973,17 +986,42 @@ test('🔴 loomy 必须支持短信验证码登录（且走**两步流程**，�
     '⚠️ 发码后必须把 msgid 存进登录会话')
 })
 
-test('⚠️ lobsterai 必须如实声明登录不可行（强制 127.0.0.1 回调）', () => {
+test('✅ lobsterai 可登录（手动粘贴回调链接），且替代做法仍保留', async () => {
   // ⚠️ 用户希望「尽量支持」，但它**架构上不可行** —— 参考实现
   // `lobsterai-oauth.ts:95,109` 明确：`redirect_uri` **必须**是
   // `http://127.0.0.1:{port}/auth/callback`，且回调服务器绑 `127.0.0.1`
   // （`:342` 注释：「绑 127.0.0.1 而非 0.0.0.0：回调只可能来自本机浏览器」）。
   // Workers 没有 listen socket ⇒ 这条链不成立。
+  //
+  // ## ⇒ 2026-11-21：改走「手动粘贴回调链接」
+  //
+  // 上面那条事实**一个字没变**（`redirect_uri` 仍必须是 127.0.0.1）。
+  // 变的是结论：登录会在用户浏览器里完成，那一刻地址栏带着 `?authCode=…`，
+  // 粘回来即可 —— 不需要本地端口。
+  // ⚠️ 本文件其它用例都是**文本断言**（读源码），没有导入供应商注册表。
+  // 这里读运行时对象更可靠（`capabilities` 是活代码，不是注释），故就地引入。
+  const { findProvider } = await import('../src/providers/index.ts')
+  const provider = findProvider('lobsterai')
+  assert.equal(provider?.capabilities.login, true, 'lobsterai 应声明可登录（手动回调路径）')
+
+  // ⚠️ 判据必须打在**真实接线**上：只翻 `login: true` 而没有入口是空头承诺。
+  const index = readFileSync('src/index.ts', 'utf8')
+  assert.ok(
+    index.includes("providerId === 'lobsterai'"),
+    '登录 start 必须有 lobsterai 分支',
+  )
+  // ⚠️ 且粘码解析必须复用同一个纯函数（不得在端点里另写一份）
+  const i = index.indexOf("path === '/admin/providers/login/submit-callback'")
+  assert.ok(i >= 0, '必须存在手动提交回调的端点')
+  const block = index.slice(i, i + 9000)
+  assert.ok(
+    block.includes('parseLobsteraiCallbackCode('),
+    'lobsterai 的提交入口必须复用 parseLobsteraiCallbackCode',
+  )
+
+  // ⚠️ 原替代做法（导出凭据导入）**不能删** —— 它仍然是换码端点未验证时的兜底。
   const src = readFileSync('src/providers/lobsterai.ts', 'utf8')
-  assert.ok(/login: false/.test(src), 'lobsterai 应如实声明 login: false')
-  assert.ok(/loginBlockedReason/.test(src), '必须说明原因（不能只给个 false）')
-  // ⚠️ 原因里要说清「怎么做才能用」（导出凭据导入），否则用户卡死
-  assert.ok(/导出凭据|粘贴/.test(src), '原因里要给出替代做法')
+  assert.ok(/导出凭据|粘贴/.test(src), '原因里要给出替代做法（导入凭据）')
 })
 
 test('⚠️ loomy 面板必须走短信两步流程（不能进轮询逻辑）', () => {

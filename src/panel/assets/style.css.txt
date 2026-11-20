@@ -1015,6 +1015,29 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   letter-spacing: 4px; user-select: all;
 }
 
+/**
+ * 「手动粘贴回调链接」区块（TRAE 这类**回调落在 127.0.0.1** 的家）。
+ *
+ * ⚠️ 输入框必须 `width: 100%` 且可换行：那条回调链接有**几百个字符**
+ * （`refreshToken` + `userInfo` + `userJwt` 全在里面）。定宽会让用户
+ * 看不到自己粘的是不是完整 —— 而「少粘一段」的表现是「凭证无效」，
+ * 用户完全看不出是自己只复制了一半。
+ */
+.manual-callback {
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+/* ⚠️ 只覆盖「宽度 / 字体 / 换行」，**不重设颜色与边框** —— 那些已由上面
+   `input, select, textarea, button` 的通用规则给好，且随主题切换。
+   这里重写一遍就等于把主题支持丢掉（深色/浅色下都会变回硬编码色）。 */
+.manual-callback input {
+  display: block; width: 100%; box-sizing: border-box; margin: 8px 0;
+  font-family: ui-monospace, monospace; font-size: 12px;
+  /* ⚠️ 用 `overflow-wrap: anywhere` 而不是 `word-break: break-all` ——
+     后者会把正常英文单词也拦腰截断（项目单测明确禁止，见 tests/panel.test.ts）。 */
+  overflow-wrap: anywhere;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
    移动端适配（用户报障：手机上界面超出屏幕、文字换行错乱）

@@ -63,23 +63,78 @@ import {
 
 // ─────────────────────────── 协议常量 ───────────────────────────
 
-/** 供应商 id（注册表键、`provider/model` 前缀）。 */
+/** 供应商 id（中国版；`provider/model` 前缀）。 */
 const ID = 'minimax'
+
+/**
+ * 一个 MiniMax 站点（中国版 / 国际版）的**全部差异**。
+ *
+ * ## ⚠️ 为什么用「显式参数」而不是「模块级可变当前站点」
+ *
+ * Workers 的 isolate 会被**并发复用**（同一个模块实例同时服务多个请求），
+ * 用 `let CURRENT_SITE` 之类的可变状态切换站点，会在两个站点并发时**串站**
+ * —— A 站请求拿到 B 站的 host，症状是随机 401/404，且无法复现。
+ *
+ * 故站点配置**逐调用传入**（闭包在 `buildMinimaxProvider` 里固定）。
+ */
+interface MinimaxSite {
+  /** provider id（`minimax` / `minimaxintl`）。 */
+  readonly id: string
+  /** 展示名。 */
+  readonly name: string
+  /** API 主机（目录 / 签到 / 积分 / 推理都挂它下面）。 */
+  readonly apiHost: string
+  /** 账号域（OAuth 专用，与 {@link apiHost} 不可混用）。 */
+  readonly accountHost: string
+  /** 目录查询参数 `region`（国内 `cn` / 国际 `en`）。 */
+  readonly region: string
+  readonly buildEnv: string
+}
+
+/**
+ * 中国版站点。
+ *
+ * 依据：`agent.minimax.cn` / `account.minimax.cn`（`src/minimax-product.ts:232-233`）。
+ */
+const SITE_CN: MinimaxSite = {
+  id: 'minimax',
+  name: 'MiniMax Code（中国版）',
+  apiHost: 'https://agent.minimax.cn',
+  accountHost: 'https://account.minimax.cn',
+  region: 'cn',
+  buildEnv: 'prod',
+}
+
+/**
+ * 国际版站点。
+ *
+ * ## ⚠️ 两个 host **不同源**（实测 2026-11-21）
+ *
+ * | 用途 | host | 实测 |
+ * |---|---|---|
+ * | 目录/推理/积分 | `agent.minimaxi.com` | `GET /mavis/api/v1/models?region=en` → **200** |
+ * | OAuth 设备码 | `account.minimax.io` | `POST /oauth2/device/code` → **400**（缺字段，端点存在） |
+ *
+ * ⚠️ **`agent.minimax.io` 是错的**：它回 **307** 跳到
+ * `agent.minimaxi.com` —— 而 `fetch` 默认跟随重定向，POST 推理请求经 307
+ * 转发时**方法会变**（且跨域重定向会丢 `Authorization`），表现为
+ * 「目录能读到、一发消息就 401」。故这里直接写**重定向终点**。
+ *
+ * ⚠️ 反过来 `account.minimaxi.com/oauth2/device/code` 是 **404** ——
+ * 两个 host 不可互换（与中国版同一条纪律）。
+ */
+const SITE_INTL: MinimaxSite = {
+  id: 'minimaxintl',
+  name: 'MiniMax Code（国际版）',
+  apiHost: 'https://agent.minimaxi.com',
+  accountHost: 'https://account.minimax.io',
+  region: 'en',
+  buildEnv: 'prod',
+}
 
 /** 单次续期超时（对齐参考实现 `MINIMAX_OAUTH_TIMEOUT_MS`）。 */
 const MINIMAX_REFRESH_TIMEOUT_MS = 30_000
 
-/** API 主机（目录 / 签到 / 积分 / 推理都挂它下面）。 */
-const API_HOST = 'https://agent.minimax.cn'
-
-/**
- * **账号域**（OAuth 专用）。
- *
- * ⚠️ 与 {@link API_HOST} **不是同一个 host，不可混用**：
- * 设备码与 token 轮询挂 `account.minimax.cn`，业务端点挂 `agent.minimax.cn`
- *（`src/minimax-product.ts:127-130`）。
- */
-const ACCOUNT_HOST = 'https://account.minimax.cn'
 /** 设备码申请路径。 */
 const DEVICE_CODE_PATH = '/oauth2/device/code'
 /** token 轮询 / 续期路径。 */
@@ -91,9 +146,7 @@ const MINIMAX_AUDIENCE = 'agent-backend'
 /** OAuth scope（**凭据校验要求必须含它**，否则 `invalid_token_response`）。 */
 const MINIMAX_SCOPE = 'agent.default'
 
-/** 目录查询参数（远端要求显式 region/buildEnv，否则目录为空）。 */
-const REGION = 'cn'
-const BUILD_ENV = 'prod'
+// ⚠️ 目录查询参数 `region` / `buildEnv` 随站点不同，见 `MinimaxSite`。
 
 /** 推理路径（**Anthropic Messages**，不是 OpenAI）。 */
 const INFER_PATH = '/mavis/api/v1/llm/v1/messages'
@@ -455,6 +508,13 @@ function mmNumber(source: Record<string, unknown>, key: string): number | undefi
 export async function startMinimaxLogin(
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
+  /**
+   * 站点（缺省中国版）。
+   *
+   * ⚠️ 放**第三个参数**而不是第二个：断言现有调用点（`startMinimaxLogin(signal)`）
+   * 与既有单测都不受影响；新增的国际版接线显式传第三个参数即可。
+   */
+  site: MinimaxSite = SITE_CN,
 ): Promise<MinimaxDeviceAuth> {
   const pkce = await createMinimaxPkce()
   const body = new URLSearchParams({
@@ -467,7 +527,7 @@ export async function startMinimaxLogin(
     code_challenge_method: 'S256',
   })
 
-  const res = await fetcher(`${ACCOUNT_HOST}${DEVICE_CODE_PATH}`, {
+  const res = await fetcher(`${site.accountHost}${DEVICE_CODE_PATH}`, {
     method: 'POST',
     headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -524,6 +584,8 @@ export async function pollMinimaxLoginOnce(
   auth: MinimaxDeviceAuth,
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
+  /** 站点（缺省中国版；见 {@link startMinimaxLogin} 的参数位置说明）。 */
+  site: MinimaxSite = SITE_CN,
 ): Promise<MinimaxPollOutcome> {
   const body = new URLSearchParams({
     grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
@@ -535,7 +597,7 @@ export async function pollMinimaxLoginOnce(
 
   let res: Response
   try {
-    res = await fetcher(`${ACCOUNT_HOST}${TOKEN_PATH}`, {
+    res = await fetcher(`${site.accountHost}${TOKEN_PATH}`, {
       method: 'POST',
       headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
@@ -857,11 +919,15 @@ function parseRemoteModels(payload: unknown): MinimaxModel[] {
  * 但这里**不静默** —— 用 `ProviderModel` 无法表达「这是兜底」，故保留一条
  * `console.warn`（面板/日志里能看出目录来自兜底，而不是「账号没有模型」）。
  */
-async function listModels(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderModel[]> {
+async function listModels(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+  site: MinimaxSite = SITE_CN,
+): Promise<ProviderModel[]> {
   const token = accessTokenOf(credential)
-  const url = new URL(`${API_HOST}${MODELS_PATH}`)
-  url.searchParams.set('region', REGION)
-  url.searchParams.set('buildEnv', BUILD_ENV)
+  const url = new URL(`${site.apiHost}${MODELS_PATH}`)
+  url.searchParams.set('region', site.region)
+  url.searchParams.set('buildEnv', site.buildEnv)
 
   let remote: MinimaxModel[] = []
   try {
@@ -1302,11 +1368,15 @@ export function buildMinimaxPayload(input: {
  * ⚠️ **402 必须能被识别成额度不足**（`retryable: true`）：参考实现记录过
  * 「归成 SERVER/AUTH 会让用户看不到『去充值』这个唯一有效动作」。
  */
-async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
+async function chat(
+  credential: ProviderCredential,
+  request: ChatRequest,
+  site: MinimaxSite = SITE_CN,
+): Promise<Response> {
   const token = accessTokenOf(credential)
   // ⚠️ 目录条目只在本地已知时才用于「默认 max_tokens」与档位白名单；
   // 拉目录失败**不能**让对话失败（那是把展示信息变成了硬依赖）。
-  const entry = await lookupModel(credential, request.model, request.signal)
+  const entry = await lookupModel(credential, request.model, request.signal, site)
 
   let payload: Record<string, unknown>
   try {
@@ -1319,7 +1389,7 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
     })
   }
 
-  const res = await fetch(`${API_HOST}${INFER_PATH}`, {
+  const res = await fetch(`${site.apiHost}${INFER_PATH}`, {
     method: 'POST',
     headers: inferHeaders(token),
     body: JSON.stringify(payload),
@@ -1399,14 +1469,15 @@ async function lookupModel(
   credential: ProviderCredential,
   model: string,
   signal: AbortSignal,
+  site: MinimaxSite = SITE_CN,
 ): Promise<MinimaxModel | undefined> {
   const fallback = FALLBACK_MODELS.find((item) => item.id === model)
   if (fallback !== undefined) return fallback
   try {
     const token = accessTokenOf(credential)
-    const url = new URL(`${API_HOST}${MODELS_PATH}`)
-    url.searchParams.set('region', REGION)
-    url.searchParams.set('buildEnv', BUILD_ENV)
+    const url = new URL(`${site.apiHost}${MODELS_PATH}`)
+    url.searchParams.set('region', site.region)
+    url.searchParams.set('buildEnv', site.buildEnv)
     const res = await fetch(url.toString(), {
       method: 'GET',
       headers: businessHeaders(token),
@@ -1424,8 +1495,8 @@ async function lookupModel(
 // ─────────────────────── 签到与余额的公共部分 ───────────────────────
 
 /** 带 `timezone_id` 的 URL（**query 参数，不是请求头**）。 */
-function withTimezone(path: string, timezoneId: string): string {
-  const url = new URL(`${API_HOST}${path}`)
+function withTimezone(path: string, timezoneId: string, site: MinimaxSite = SITE_CN): string {
+  const url = new URL(`${site.apiHost}${path}`)
   url.searchParams.set('timezone_id', timezoneId)
   return url.toString()
 }
@@ -1554,7 +1625,11 @@ async function requestEnvelope(
  * ⚠️ 四个常量必须**逐字一致**：`client_id` 是官方客户端硬编码值，
  * 换一个上游回 `invalid_client`；`scope` / `audience` 同理。
  */
-async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+async function refresh(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+  site: MinimaxSite = SITE_CN,
+): Promise<ProviderCredential> {
   const refreshToken = credential.refreshToken.trim()
   if (refreshToken === '') {
     // ⚠️ 文案必须含连续的「重新登录」四个字：调用方按该子串判定**终态**
@@ -1567,7 +1642,7 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
 
   let res: Response
   try {
-    res = await fetch(`${ACCOUNT_HOST}${TOKEN_PATH}`, {
+    res = await fetch(`${site.accountHost}${TOKEN_PATH}`, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -1645,9 +1720,13 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
   }
 }
 
-async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
+async function balance(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+  site: MinimaxSite = SITE_CN,
+): Promise<ProviderBalance> {
   const token = accessTokenOf(credential)
-  const result = await requestEnvelope(`${API_HOST}${CREDIT_DETAILS_PATH}`, token, { method: 'GET' }, signal)
+  const result = await requestEnvelope(`${site.apiHost}${CREDIT_DETAILS_PATH}`, token, { method: 'GET' }, signal)
   if (!result.ok || result.payload === undefined) {
     throw new ProviderError({
       provider: ID,
@@ -1719,10 +1798,14 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
  * 查询状态端点的存在见 `src/minimax-credits.ts:342-356`（状态面板用），
  * 但领没领**只能**以领取响应为准。
  */
-async function checkin(credential: ProviderCredential, signal: AbortSignal): Promise<CheckinResult> {
+async function checkin(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+  site: MinimaxSite = SITE_CN,
+): Promise<CheckinResult> {
   const token = accessTokenOf(credential)
   const timezoneId = timezoneOf(credential)
-  const url = withTimezone(SIGNIN_CLAIM_PATH, timezoneId)
+  const url = withTimezone(SIGNIN_CLAIM_PATH, timezoneId, site)
   // ⚠️ body 必须是 `{}`（实测客户端就是这么发的）。
   const result = await requestEnvelope(url, token, { method: 'POST', body: '{}' }, signal)
 
@@ -1758,22 +1841,37 @@ async function checkin(credential: ProviderCredential, signal: AbortSignal): Pro
 
 // ─────────────────────────── 导出 ───────────────────────────
 
-export const minimaxProvider: Provider = {
+/**
+ * 构造一个站点的 Provider。
+ *
+ * ⚠️ 两个站点（中国版 / 国际版）**共用这一份实现**，差异全部收敛在
+ * {@link MinimaxSite} 的字段里 —— **不要**复制实现文件（同 `qoder` / `qodercn`
+ * 的双变体纪律）。
+ *
+ * @param site 站点配置（缺省中国版）
+ */
+export function buildMinimaxProvider(site: MinimaxSite = SITE_CN): Provider {
+  return {
   /**
    * 对象判别式：`minimax` 独有的字段名。
    *
    * ⚠️ 只认 `minimax` 独有的键 —— 通用键（`accessToken`/`uid`）
    * 会被 WorkBuddy 等家共用，拿来判别必然抢错。
+   *
+   * ⚠️ **只有中国版声明判别式**：两站的凭据形态完全相同，若国际版也声明，
+   * 自动识别会按注册顺序把同一份凭据判给先注册的那家 —— 拿 A 站令牌打 B 站
+   * 端点，必然 401（而用户看到的是「凭据失效」）。国际版故只能**显式声明**。
    */
   matchesShape(input) {
+    if (site.id !== 'minimax') return false
     return readString(input, ['minimax_user_id', 'minimaxUserId', 'mavis_user_id']) !== undefined
   },
 
   /** 裸字符串判别式：三段式 JWT（MiniMax 只下发 JWT，无固定前缀）。 */
   bareStringPattern: /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
 
-  id: ID,
-  name: 'MiniMax Code（中国版）',
+  id: site.id,
+  name: site.name,
   capabilities: {
     /**
      * ✅ **OAuth 设备码 + PKCE，已接线**（`/admin/providers/login/{start,poll}`）。
@@ -1798,12 +1896,20 @@ export const minimaxProvider: Provider = {
      */
     checkin: true,
   },
-  parseCredential,
-  listModels,
-  chat,
-  balance,
-  checkin,
-  refresh,
+  /**
+   * ⚠️ 凭据里的 `provider` 必须是**本站点**的 id：`buildCredential` 内部写的是
+   * `ID`（中国版），直接把函数引用挂上来会让国际版账号全部落成 `minimax`，
+   * 于是拿国际版凭据打**国内**端点 —— 必然 401。
+   */
+  parseCredential: (input) => {
+    const parsed = parseCredential(input)
+    return { ...parsed, provider: site.id }
+  },
+  listModels: (credential, signal) => listModels(credential, signal, site),
+  chat: (credential, request) => chat(credential, request, site),
+  balance: (credential, signal) => balance(credential, signal, site),
+  checkin: (credential, signal) => checkin(credential, signal, site),
+  refresh: (credential, signal) => refresh(credential, signal, site),
   /**
    * 该失败是否值得**换号重试**。
    *
@@ -1819,7 +1925,29 @@ export const minimaxProvider: Provider = {
     const lower = bodyText.toLowerCase()
     return CREDIT_MARKERS.some((marker) => lower.includes(marker))
   },
+  }
 }
+
+/**
+ * 按 provider id 取站点配置（**未知 id 回落到中国版**）。
+ *
+ * ⚠️ 回落而不是抛错：调用点在登录流程里，抛错会让「未知 id」表现为
+ * 「登录失败」而不是「供应商不存在」—— 前者会误导排查方向。
+ * 未知 id 在别处（`findProvider`）已经会被如实拒绝。
+ */
+export function minimaxSiteFor(providerId: string): MinimaxSite {
+  return providerId === SITE_INTL.id ? SITE_INTL : SITE_CN
+}
+
+/** 中国版 Provider（注册表里的 `minimax`）。 */
+export const minimaxProvider: Provider = buildMinimaxProvider(SITE_CN)
+
+/**
+ * 国际版 Provider（注册表里的 `minimaxintl`）。
+ *
+ * ⚠️ 站点差异见 {@link SITE_INTL}。**只差 host 与 region**，协议逐字相同。
+ */
+export const minimaxIntlProvider: Provider = buildMinimaxProvider(SITE_INTL)
 
 /** 额度 / 限流文案标记（中英双通道）。 */
 const CREDIT_MARKERS: readonly string[] = [
