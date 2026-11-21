@@ -83,6 +83,19 @@ openssl rand -base64 32 | npx wrangler secret put API_KEY
 openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY
 ```
 
+## 其他可选配置
+
+这些**不是 secret**，直接写进 `wrangler.jsonc` 的 `vars`：
+
+| 配置项 | 缺省 | 说明 |
+|---|---|---|
+| `MAX_REQUEST_BYTES` | `8388608`（8 MiB） | 数据面请求体上限，**单位是字节**。`0` = 不限制。超限返回可读 413 |
+| `UPSTREAM_CHAT_BASE` / `UPSTREAM_BILLING_BASE` / `UPSTREAM_WEB_BASE` | 见 `wrangler.jsonc` | 上游域名（国内版）。国际版恒用官方域名，不走这里 |
+
+⚠️ `MAX_REQUEST_BYTES` 只接受**纯十进制整数**。`8MiB` / `1e9` 这类会被当作
+未设置而回落默认 —— 刻意不猜（`Number('0x10')` 是 16，那种「猜对了」反而危险）。
+超过 1 GiB 也按误填处理。
+
 ## 绑定 GitHub 自动部署（可选）
 
 Dashboard → Workers & Pages → `free-llm-router` → **Settings** → **Build** →
