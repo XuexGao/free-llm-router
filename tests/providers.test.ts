@@ -2394,3 +2394,62 @@ test('🔴 workbuddy 的存储 key 必须带前缀（只有 buddy 是裸 uid）'
   const ids = m[1].split(',').map((x) => x.trim().replace(/['"]/g, '')).filter(Boolean)
   assert.deepEqual(ids, ['buddy'], '⚠️ 只有 buddy 用裸 uid；workbuddy 必须带 workbuddy: 前缀')
 })
+
+test('🔴 腾讯系指纹：三枚 Conv 头必须全发，且 IDE 版本必须是 genieVersion', async () => {
+  // ## 缺陷一：Conv 三头缺一枚 ⇒ 特定账号 100% 400/11128
+  //
+  // 参考实现 IKM7SG：**部分账号**对 `X-Conversation-*` 做渠道校验，
+  // **缺任一枚即回 `{"code":11128,"msg":"request illegal"}`**
+  // （伪装成「内容未通过安全审核」），整条渠道不可用。
+  // 且**无法预先知道哪个账号会要求**（复验 2/5）⇒ 必须无条件全发。
+  //
+  // 本项目此前：`referenceChatHeaders`（对话主路径）**完全没发**这三枚；
+  // `cliChatHeaders` 只发两枚（`X-Conversation-ID` 只在「入站透传值非空」才发，
+  // 而 chat 路径两个调用点都不传 ⇒ **那一枚从来没发出去过**）。
+  const { referenceChatHeaders, cliChatHeaders } = await import('../src/upstream/headers.ts')
+
+  for (const variant of ['buddy', 'workbuddy'] as const) {
+    const h = referenceChatHeaders({ uid: 'u', accessToken: 't', variant })
+    const conv = ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']
+    for (const k of conv) {
+      assert.ok(typeof h[k] === 'string' && h[k].length > 0, `${variant}: ${k} 必须存在且非空`)
+    }
+    // ⚠️ 参考实现三枚**同值**（三行都是 set(..., conversationId)）；判据不校验值语义
+    assert.equal(new Set(conv.map((k) => h[k])).size, 1, `${variant}: 三枚应同值（与参考实现一致）`)
+  }
+
+  // cliChatHeaders 在没有入站 conversationId 时也必须发满三枚
+  const c = cliChatHeaders({
+    uid: 'u', machineId: 'm', sessionId: 's', accessToken: 't',
+    conversationRequestId: 'a'.repeat(32),
+  })
+  for (const k of ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']) {
+    assert.ok(typeof c[k] === 'string' && c[k].length > 0, `cliChatHeaders: ${k} 必须非空`)
+  }
+})
+
+test('🔴 IDE 版本必须是 genieVersion（不是 VS Code 基底 version）', async () => {
+  // ## 缺陷二：我们发的是 `product.json` 的 `version`，而客户端发 `genieVersion`
+  //
+  // 客户端 `getPlatformVersion()` 是
+  //   `if (product.genieVersion) return product.genieVersion; return version`
+  // **优先 genieVersion** —— `version` 只是缺失时的兜底。
+  //
+  // 本机实测：`version = 1.106.1`（VS Code 基底）而 `genieVersion = 4.12.2`（产品版本）
+  // ⇒ 我们此前发 `1.106.1` **等于报了一个客户端根本不会报的值**，
+  // 那不是「版本旧」，而是「另一个语义字段的值」—— 可聚类的异常指纹。
+  const { CODEBUDDY_CLIENT_VERSION, CODEBUDDY_USER_AGENT, CLIENT_VERSION_INTL, cliUserAgentIntl }
+    = await import('../src/upstream/headers.ts')
+
+  assert.equal(CODEBUDDY_CLIENT_VERSION, '4.12.2', '国内版必须用 genieVersion 4.12.2')
+  assert.equal(CODEBUDDY_USER_AGENT, 'CodeBuddyIDE/4.12.2', '⚠️ UA 必须与 X-IDE-Version 同值')
+  assert.equal(CLIENT_VERSION_INTL, '5.9.4', '国际版必须是 genieVersion 5.9.4')
+
+  // ⚠️ 反向：绝不能退回 VS Code 基底版本
+  assert.ok(!CODEBUDDY_USER_AGENT.includes('1.106'), '⚠️ 不得退回 VS Code 基底版本 1.106.1')
+
+  // ⚠️ 国际版 UA 三段必须同值（混用是国内/国际两个量，最容易露馅）
+  const ua = cliUserAgentIntl()
+  const parts = ua.match(/\d+\.\d+\.\d+/g) ?? []
+  assert.equal(new Set(parts).size, 1, `国际版 UA 三段必须同值，实际：${ua}`)
+})

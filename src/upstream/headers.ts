@@ -96,19 +96,54 @@ export function cliUserAgentIntl(): string {
  * 发错会让后台「使用端」归因错误（参考实现对此有专门注释：
  * 早年误发 `SaaS` 导致后台归因不到产品）。
  */
-export const CODEBUDDY_USER_AGENT = 'CodeBuddyIDE/1.106.1'
-
-/** 国内版的客户端版本号（`X-IDE-Version`）。 */
-export const CODEBUDDY_CLIENT_VERSION = '1.106.1'
+export const CODEBUDDY_USER_AGENT = 'CodeBuddyIDE/4.12.2'
 
 /**
- * 国际版的客户端版本号。
+ * 国内版的客户端版本号（`X-IDE-Version`）。
  *
- * ⚠️ 参考实现国际版用 **5.5.2**（`src/product.ts:484`），而国内版 CodeBuddy 用
- * `clientVersion: '1.106.1'` / `cliVersion: '2.137.1'`。
- * 我们此前对两个变体都用同一组国内版版本号 —— 那也是渠道指纹不匹配的来源之一。
+ * ## 🔴 `1.106.1` → **`4.12.2`**（2026-11-21 更正）
+ *
+ * **`1.106.1` 是「发错了字段」，不是「版本旧了」。**
+ *
+ * 客户端 `product.json` 里有两个版本字段：
+ *
+ * | 字段 | 本机实测值 | 含义 |
+ * |---|---|---|
+ * | `version` | `1.106.1` | **VS Code 基底**版本 |
+ * | `genieVersion` | **`4.12.2`** | **产品**版本（对外报的那个） |
+ *
+ * 而客户端 `extensions/genie` 的 `getPlatformVersion()` 是
+ * `if (product.genieVersion) return product.genieVersion; return version`
+ * —— **优先 `genieVersion`**，`version` 只在缺失时兜底。
+ *
+ * `CustomHeadersHttpProxyInterceptor` 里：
+ * `headers['X-IDE-Version'] = ci.platformVersion; setCodeBuddyVersion(ci.platformVersion)`
+ * ⇒ **`X-IDE-Version` 与 UA 同源**（都取 `platformVersion`，即 `genieVersion`）。
+ *
+ * ⚠️ 我们此前发 `1.106.1`，等于**报了一个客户端根本不会报的值** ——
+ * 那不是「旧版本」，而是「另一个语义字段的值」，属于可聚类的异常指纹。
+ *
+ * ⚠️ 交叉验证：国际版 `product.json` 的 `genieVersion = 5.9.4`，与客户端
+ * 「关于」里显示的 `版本: 5.9.4` 一致 ⇒ 该字段确实是对外版本。
  */
-export const CLIENT_VERSION_INTL = '5.5.2'
+export const CODEBUDDY_CLIENT_VERSION = '4.12.2'
+
+/**
+ * 国际版的客户端版本号（`X-IDE-Version`）。
+ *
+ * ## 🔴 `5.5.2` → **`5.9.4`**（2026-11-21 更正）
+ *
+ * 权威来源：国际版客户端 `app.asar.unpacked/cli/product.json` 的
+ * **`genieVersion = 5.9.4`**（与客户端「关于」显示一致）。取法同国内版 ——
+ * **优先 `genieVersion`，不是 `version`**。
+ *
+ * ⚠️ 两个变体的版本号**必须各自对**：混用会造出
+ * 「国际版端点 + 国内版版本号」这种不存在的组合，是最强的异常特征。
+ *
+ * ⚠️ `cliVersion`（`2.137.1`）是**另一个量**，只用在成长中心上报的
+ * `ideVersionCli`，不要与 IDE 版本混同。
+ */
+export const CLIENT_VERSION_INTL = '5.9.4'
 
 /** 桌面端 UA（`desktop.go:43`）。 */
 export function desktopUserAgent(): string {
@@ -236,8 +271,23 @@ export function referenceChatHeaders(input: {
   uid: string
   accessToken: string
   variant?: 'buddy' | 'workbuddy'
+  /**
+   * 本次请求的三枚 `X-Conversation-*` 值（**缺省自动生成**）。
+   *
+   * ⚠️ 显式传入的唯一用途是**换号重试时复用同一组的判定**——但注意：
+   * 上游把这三枚当「**逐请求**一次性 id」，且**换号重试本就是新请求**，
+   * 故**不要**跨重试复用（参考实现也是每次 `send()` 新生成）。
+   * 这里保留参数只为单测能锁定生成形态。
+   */
+  conversationId?: string
 }): HeaderMap {
   const intl = input.variant === 'workbuddy'
+  // 三枚 Conv 头统一用**同一个**非空值 —— 与参考实现逐字一致
+  //（它三行都是 `headers.set(..., conversationId)`）。
+  // ⚠️ 实测判据是「三枚同时存在且非空」，**不校验值语义**（填 `abc-123` 也 200）。
+  const conversationId = input.conversationId !== undefined && input.conversationId !== ''
+    ? input.conversationId
+    : randomHex32()
   const headers: HeaderMap = {
     Accept: 'text/event-stream',
     'Content-Type': 'application/json',
@@ -253,8 +303,25 @@ export function referenceChatHeaders(input: {
     'X-IDE-Version': intl ? CLIENT_VERSION_INTL : CODEBUDDY_CLIENT_VERSION,
     'X-Product': intl ? 'WorkBuddy' : 'CodeBuddy',
     // ⚠️ UA 是**完全不同的格式**（不是同一个模板换段）：
-    // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… WorkBuddy AI/…`。
+    // 国内版 `CodeBuddyIDE/4.12.2`，国际版 `WorkBuddy/… WorkBuddy AI/…`。
     'User-Agent': intl ? cliUserAgentIntl() : CODEBUDDY_USER_AGENT,
+    // ## ⚠️⚠️ 三枚 `X-Conversation-*` —— **必须发**（2026-11-21 补齐）
+    //
+    // 参考实现的对照表（本函数上方那张）记录的是「参考实现**只发 11 个**头」，
+    // 那是**旧快照**。参考实现当前在 `buddy-adapter.ts:3974-3976` **确实发** 这三枚。
+    //
+    // ⚠️ 这**不是**「多发无害」的锦上添花，而是**按账号的准入硬需求**：
+    // 部分账号缺任一枚即回 `{"code":11128,"msg":"request illegal"}`
+    //（伪装成「内容未通过安全审核」），整条渠道不可用；
+    // 且**无法预先知道哪个账号会要求**（参考实现复验 2/5）⇒ 必须无条件全发。
+    //
+    // ⚠️ 为什么以前的结论是「我们多发了这批头、所以 11128」：
+    // 那一轮对比的是**一整批**头（Origin/Referer/X-Machine-ID/Conv 族…），
+    // 后来定位到的真正差异是 `Accept`（必须精确 `text/event-stream`）与
+    // 归属头。**把 Conv 三头一起删掉是过度纠正** —— 现在按单项实测把它们补回来。
+    'X-Conversation-ID': conversationId,
+    'X-Conversation-Request-ID': conversationId,
+    'X-Conversation-Message-ID': conversationId,
   }
   if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
   return headers
@@ -292,7 +359,30 @@ export function cliChatHeaders(input: {
     // ⚠️ `X-Product` 发的是**产品归属名**，不是部署类型 `SaaS`。
     // Go 侧 `product.ts:113-118` 记录过：早年误发 `SaaS` 导致后台归因不到产品。
     'X-Product': 'WorkBuddy',
-    // 轮级聚合主键 + 消息级 id
+    // ## ⚠️⚠️ `X-Conversation-*` **三枚必须同时存在且非空**（否则某些账号直接 400）
+    //
+    // 这是本项目**最容易踩、也最难自查**的一条（真实报障，参考实现 IKM7SG）：
+    // 部分账号对这三枚头做**渠道校验**，缺任一枚即回
+    // `{"code":11128,"msg":"request illegal"}`（伪装成「内容未通过安全审核」）。
+    //
+    // ⚠️ **只有部分账号要求**（参考实现复验 2/5）：
+    // - 多数账号：三头非必需，缺了也 200；
+    // - **特定账号：缺任一枚即 400/11128**，整条渠道不可用。
+    // ⇒ 因为「无法预先知道哪个账号会要求」，**必须无条件全发**。
+    //
+    // ⚠️ 本文件此前只发了 `Request-ID` 与 `Message-ID` 两枚，而
+    // `X-Conversation-ID` **只在「入站透传值非空」时才发** ——
+    // 而 chat 路径的两个调用点**都不传** `conversationId` ⇒
+    // **那一枚从来没发出去过**。对「要求三头」的账号，这就是 100% 失败。
+    //
+    // ⚠️ 判据细节（实测）：**不校验值语义**，三枚同值 / 各自不同 / 填 `abc-123`
+    // 全部 200；**只有填空串才 400**。故这里统一用同一个请求级 id
+    // ——与参考实现逐字一致（它的三行都是 `headers.set(..., conversationId)`）。
+    'X-Conversation-ID': input.conversationId !== undefined && input.conversationId !== ''
+      // 有入站会话 id 就沿用它（保持会话语义）
+      ? input.conversationId
+      // 否则用**本次请求**的 id（逐请求新值；三枚同值即可满足校验）
+      : input.conversationRequestId,
     'X-Conversation-Request-ID': input.conversationRequestId,
     'X-Conversation-Message-ID': randomHex32(),
     'X-Root-Request-ID': input.conversationRequestId,
@@ -306,11 +396,6 @@ export function cliChatHeaders(input: {
     // 缺省字段用 X-No-* 约定（与官方 CLI 一致）
     headers['X-No-Authorization'] = '1'
     headers['X-No-User-Id'] = '1'
-  }
-
-  // ⚠️ 只有非空才发：空串会让上游误判为「显式要求空会话」
-  if (input.conversationId !== undefined && input.conversationId !== '') {
-    headers['X-Conversation-ID'] = input.conversationId
   }
 
   return headers

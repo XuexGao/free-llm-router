@@ -23,7 +23,13 @@ import {
   utc8DayKey,
   windowStartDayKey,
 } from '../src/store/usage.js'
-import { referenceChatHeaders } from '../src/upstream/headers.ts'
+import {
+  CLIENT_VERSION_INTL,
+  CODEBUDDY_CLIENT_VERSION,
+  CODEBUDDY_USER_AGENT,
+  referenceChatHeaders,
+  cliUserAgentIntl,
+} from '../src/upstream/headers.ts'
 import { classify } from '../src/upstream/client.ts'
 
 /**
@@ -1267,25 +1273,37 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   //
   // | 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
   // |---|---|---|
-  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+  // | `userAgent` | **`CodeBuddyIDE/4.12.2`** | `WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4` |
   // | `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
-  // | `clientVersion` | **`1.106.1`** | `5.5.2` |
+  // | `clientVersion`（= `genieVersion`） | **`4.12.2`** | `5.9.4` |
+  //
+  // ⚠️ 2026-11-21：两个版本号都更正过（`1.106.1`→`4.12.2`、`5.5.2`→`5.9.4`），
+  // 且**这个测试的实质要求不变** —— 「两套头不能互相套用」。
+  // 故下面的断言改为**引用常量**比较，避免每次版本升级都要改测试
+  //（写死字面量会让「升级版本」与「两套头串味」这两件事混淆）。
   // | `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
   // | `productCode` | `codebuddy` | `workbuddy` |
   const dom = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'buddy' })
   const intl = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'workbuddy' })
 
   // ⚠️ UA 是完全不同的格式（国内版不含 `WorkBuddy`）
-  assert.equal(dom['User-Agent'], 'CodeBuddyIDE/1.106.1', '国内版 UA 必须是 IDE 形态')
-  // ⚠️ 国际版 UA 逐字对齐参考实现（三段**同值** 5.5.2）
   assert.equal(
-    intl['User-Agent'], 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2',
-    '国际版 UA 三段都应是 5.5.2（我一度混了国内版段，导致与 X-IDE-Version 自相矛盾）',
+    dom['User-Agent'], CODEBUDDY_USER_AGENT,
+    '国内版 UA 必须是 IDE 形态（CodeBuddyIDE/<版本>）',
+  )
+  assert.ok(!String(dom['User-Agent']).includes('WorkBuddy'), '⚠️ 国内版 UA 不得含 WorkBuddy')
+  // ⚠️ 国际版 UA 三段**同值**（我一度混了国内版段，导致与 X-IDE-Version 自相矛盾）
+  assert.equal(
+    intl['User-Agent'], cliUserAgentIntl(),
+    '国际版 UA 必须是 WorkBuddy/<v> WorkBuddy AI/<v> CLI/<v>',
   )
   // ⚠️ UA 里的版本号必须与 X-IDE-Version 一致 —— 同一请求里两个版本号
   // 正是「渠道指纹」最容易露馅的地方。
-  assert.equal(intl['X-IDE-Version'], '5.5.2')
-  assert.ok(intl['User-Agent']?.includes('5.5.2'), 'UA 与 X-IDE-Version 必须同版本')
+  assert.equal(intl['X-IDE-Version'], CLIENT_VERSION_INTL)
+  assert.ok(
+    String(intl['User-Agent']).includes(CLIENT_VERSION_INTL),
+    'UA 与 X-IDE-Version 必须同版本',
+  )
 
   // ⚠️ 归属三头在国内版是 `CodeBuddy`
   assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
@@ -1293,9 +1311,10 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   assert.equal(dom['X-Product'], 'CodeBuddy')
   assert.equal(intl['X-IDE-Name'], 'WorkBuddy', '国际版归属名是 WorkBuddy')
 
-  // ⚠️ 版本号不同
-  assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
-  assert.equal(intl['X-IDE-Version'], '5.5.2', '国际版版本是 5.5.2')
+  // ⚠️ 版本号不同（且都不是 VS Code 基底版本 `1.106.x`）
+  assert.equal(dom['X-IDE-Version'], CODEBUDDY_CLIENT_VERSION, '国内版版本必须取 genieVersion')
+  assert.equal(intl['X-IDE-Version'], CLIENT_VERSION_INTL, '国际版版本必须取 genieVersion')
+  assert.notEqual(dom['X-IDE-Version'], intl['X-IDE-Version'], '两套头不得共用同一版本号')
 
   // X-Domain 必须与端点一致
   assert.equal(dom['X-Domain'], 'copilot.tencent.com')
@@ -1303,11 +1322,26 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   assert.equal(dom['X-Product-Code'], 'codebuddy')
   assert.equal(intl['X-Product-Code'], 'workbuddy')
 
-  // ⚠️ 参考实现只发这 11 个（多发的头是 Go 侧口径，国际版端点不认）
+  // ⚠️ 参考实现只发这 11 个**基础**头（多发的头是 Go 侧口径，国际版端点不认）
   assert.equal(dom['Accept'], 'text/event-stream', 'Accept 必须精确（不能带 json 偏好）')
   assert.ok(!('Origin' in dom), '⚠️ 不得发 Origin（Go 侧口径，参考实现不发）')
   assert.ok(!('X-Machine-ID' in dom), '⚠️ 不得发 X-Machine-ID')
-  assert.ok(!('X-Conversation-Request-ID' in dom), '⚠️ 不得发 X-Conversation-Request-ID')
+
+  // ## ⚠️ 2026-11-21 更正：Conv 三头**必须发**（旧断言在这里写反了）
+  //
+  // 上面那条「参考实现只发 11 个头」是**旧快照**。参考实现当前在
+  // `buddy-adapter.ts:3974-3976` **确实发**这三枚，而且它们是**按账号的准入硬需求**：
+  // 部分账号缺任一枚即回 `{"code":11128,"msg":"request illegal"}`
+  // （伪装成「内容未通过安全审核」），整条渠道不可用；且**无法预先知道哪个账号会要求**
+  //（参考实现复验 2/5）⇒ 必须无条件全发。
+  //
+  // ⚠️ 旧断言正是「过度纠正」的产物：那一轮定位到 11128 的真凶是 `Accept` 与归属头，
+  // 但把**一整批** Go 侧口径的头一起删了，Conv 族被误伤。
+  for (const k of ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']) {
+    assert.ok(typeof dom[k] === 'string' && dom[k].length > 0, `⚠️ 必须发 ${k}（非空）`)
+  }
+  // ⚠️ 但仍**不得**发这几枚 Go 侧口径的头（它们是另一批，与 Conv 族不同）
+  assert.ok(!('X-Session-ID' in dom), '⚠️ 不得发 X-Session-ID')
   assert.equal(dom['Authorization'], 'Bearer tok', '只保留 Authorization')
 })
 
