@@ -24,12 +24,12 @@
  *    - `11115`/`11135` 是**请求的问题**，不罚号、也不换号。
  */
 
-import { resolveUpstream, type Env } from '../env.js'
+import { resolveMaxRequestBytes, resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { prepareChatBody, requestHasImage, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
-import { jsonError, parseRetryAfterMs } from './http.js'
+import { jsonError, parseRetryAfterMs, readJsonCapped } from './http.js'
 import {
   DEFAULT_PROVIDER,
   LEGACY_PROVIDER,
@@ -379,12 +379,13 @@ export async function handleChatCompletions(
   subkey?: SubkeyContext,
 ): Promise<GatewayResult> {
   // ① 解析并准备请求体（一次性，不随换号重复）
-  let rawBody: unknown
-  try {
-    rawBody = await request.json()
-  } catch {
-    return { response: jsonError(400, '请求体必须是合法 JSON', 'invalid_request_error') }
-  }
+  //
+  // ⚠️ 走 `readJsonCapped` 而不是裸 `request.json()`：超大体必须变成
+  // **可读的 413**，而不是被平台掐断成含义不明的 500（见该函数的注释）。
+  // 上限来自 `MAX_REQUEST_BYTES`（缺省 8 MiB）。
+  const parsedBody = await readJsonCapped(request, resolveMaxRequestBytes(env))
+  if (!parsedBody.ok) return { response: parsedBody.response }
+  const rawBody: unknown = parsedBody.value
 
   // 会话粘性 key（空串 = 无法判定会话，此时不做粘性）。
   // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。

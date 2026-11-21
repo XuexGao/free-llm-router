@@ -48,6 +48,39 @@ export function bearerOf(request: Request): string {
 }
 
 /**
+ * 从请求里取**客户端凭据明文**，同时支持两种头（**Anthropic 客户端必需**）。
+ *
+ * ## 为什么必须支持 `x-api-key`（真实前提缺失）
+ *
+ * `Anthropic` 官方 SDK 与 **Claude Code** 发的是 **`x-api-key: <key>`**，
+ * 而**不是** `Authorization: Bearer`。我们此前只读后者 ⇒ 接了 `/v1/messages`
+ * 也进不来（Claude Code 拿来就会 401，而它不会告诉你「请换个头」）。
+ *
+ * ## 冲突策略：**同时给且值不同 ⇒ 拒绝**
+ *
+ * 两个头都带时，若值相同（有些客户端两个都发）就照收；**值不同则拒绝** ——
+ * 不允许「任选一个能过的」：那会让一把泄漏的头悄悄覆盖另一把，
+ * 也让「我以为用的是 A 密钥」变得不可验证。这与下游实现同口径。
+ *
+ * ⚠️ 只带一个头（任一）都接受 —— 这是绝大多数客户端的形态。
+ *
+ * @returns `key` 明文（空串 = 没带）；`conflict` 为真表示两个头值不同。
+ */
+export function clientKeyOf(request: Request): { key: string; conflict: boolean } {
+  const bearer = bearerOf(request)
+  // ⚠️ 大小写不敏感：`Headers.get` 本身不区分大小写，但这里显式取别名更清楚
+  const rawApiKey = request.headers.get('x-api-key') ?? ''
+  const apiKey = rawApiKey.trim()
+
+  if (bearer !== '' && apiKey !== '' && bearer !== apiKey) {
+    // 两个都带且不同 ⇒ 拒绝（见上）。返回空 key，由调用方翻译成 401。
+    return { key: '', conflict: true }
+  }
+  // 优先 `Authorization`（既有行为不变），没有才用 `x-api-key`
+  return { key: bearer !== '' ? bearer : apiKey, conflict: false }
+}
+
+/**
  * 取客户端 IP。
  *
  * ⚠️ 只认 `CF-Connecting-IP`：它是 Cloudflare 边缘**override** 上去的，
@@ -90,7 +123,15 @@ export async function authenticate(
   env: Env,
   model: string,
 ): Promise<AuthResult> {
-  const provided = bearerOf(request)
+  // ⚠️ 双头解析：Claude Code / Anthropic SDK 发 `x-api-key`，其余发 `Authorization`。
+  // 两个都带且值不同 ⇒ 一律拒绝（见 `clientKeyOf` 的冲突策略）。
+  const parsed = clientKeyOf(request)
+  if (parsed.conflict) {
+    // 退回 `none`（= 401）：**不**告诉调用方是「哪个头不对」——
+    // 那等于确认「另一个头是对的」，而滥用者可以据此判断密钥有效性。
+    return { kind: 'none' }
+  }
+  const provided = parsed.key
   if (provided === '') return { kind: 'none' }
 
   // ① 先比主密钥。⚠️ 顺序有意义：主密钥的处理**不碰 DO**

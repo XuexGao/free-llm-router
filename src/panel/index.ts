@@ -94,13 +94,35 @@ export const CSP_LOGIN =
   "frame-ancestors 'none'; " +
   "base-uri 'none'"
 
-/** 面板统一安全响应头（页面与静态资源都要）。 */
+/**
+ * 面板统一安全响应头（页面与静态资源都要）。
+ *
+ * ## 🔴 `X-Robots-Tag: noindex` —— 面板**绝不能被搜索引擎收录**
+ *
+ * 本服务的面板挂在**公网**上（自定义域或 `workers.dev`）。一旦被索引，
+ * 「`site:<域名> panel`」就能搜到管理界面 URL —— 虽然它**仍然要密钥**
+ * （`securityHeaders` 之外还有 `/admin/*` 的鉴权），但：
+ *
+ * 1. 管理入口本身是**不应公开**的资产（攻击面收窄原则）；
+ * 2. 页面标题/路径会出现在搜索结果里，等于对外宣告「这里跑着一个
+ *    多供应商账号池」—— 而本项目的定位是**个人自用**（§3.1 红线）；
+ * 3. `robots.txt` 对一个**还没被收录**的新域有效，但对已被收录的无效
+ *    （而且它可能压根不会被访问）。
+ *
+ * ⇒ 用**响应头**而非 `robots.txt`：头是每个响应都带的，与是否被抓
+ * `robots.txt` 无关。`noindex, nofollow` 同时禁止索引与沿链接爬取。
+ *
+ * ⚠️ 登录页（`loginSecurityHeaders`）继承了本函数 ⇒ 自动也带这个头，
+ * 那正是我们要的（登录页更不该被索引）。
+ */
 export function securityHeaders(): Record<string, string> {
   return {
     'content-security-policy': CSP,
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
+    // ⚠️ 见上：面板与登录页都不得被搜索引擎收录
+    'x-robots-tag': 'noindex, nofollow',
     'cache-control': 'no-store',
   }
 }

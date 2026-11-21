@@ -23,7 +23,7 @@
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关 + **Responses API**、**15 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **653 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **674 条单测通过**（`npm test`）；`npm run typecheck` 通过。
 
 > **第 11 轮（2026-11-21）**：新增 `qodercn` / `minimaxintl`；
 > **默认供应商改为 `trae`**（并把「默认供应商」与 env 绑定 / 存储 key / 兜底判据**彻底解耦**）；
@@ -537,7 +537,7 @@ TaskRunner DO
 
 ## 九、实施进度与实测发现
 
-**第 1–8 步全部完成；第 9–11 轮改造已交付。** `npm test` → **653/653 通过**；`npm run typecheck` → 通过。
+**第 1–8 步全部完成；第 9–11 轮改造已交付。** `npm test` → **674/674 通过**；`npm run typecheck` → 通过。
 
 > 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
 > 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
@@ -2230,6 +2230,72 @@ Go 侧口径的头一起删了，Conv 族被误伤。这次按**单项实测**�
 ⚠️ 诚实登记：**旧指纹当时也能通**（说明这两个账号不在「要求三头」那类里）。
 故本次修复的价值是「**消除可聚类特征 + 让要求三头的账号也能用**」，
 而不是「修好了当前报错」—— 不能用「改前也能通」来否定这条修复。
+
+### 9.1g 第 12 轮：Anthropic Messages API + `x-api-key` + noindex + 体上限
+
+**测试基线：674 条单测通过。** 参考下游 `NandaNg314/free-llm-router`（v1.2.0）。
+
+#### ① 🔴 `x-api-key` 鉴权（**Claude Code 的前提**）
+
+`Anthropic` 官方 SDK 与 Claude Code 发的是 **`x-api-key: <key>`**，不是
+`Authorization: Bearer`。我们此前只读后者 ⇒ **就算接了 `/v1/messages` 也进不来**，
+而且客户端**不会告诉你「请换个头」**（只显示 401）。
+
+`clientKeyOf()` 的冲突策略：两个头**值不同 ⇒ 一律拒绝**（返回空 key）。
+理由 —— 允许「任选一个能过的」会让一把泄漏的头悄悄覆盖另一把，
+也让「我以为用的是 A 密钥」不可验证。
+
+#### ② 🔴 原生 `/v1/messages` + `/v1/messages/count_tokens`
+
+与 `responses.ts` **完全同构**（`messagesToChatBody()` → `handleChatCompletions()`
+→ `toAnthropicSse()`），从而免费复用选号/轮转/冷却/续期/子密钥记账。
+
+**最容易写错的一处：`usage` 口径与 Responses 相反**
+
+| 协议 | `input_tokens` 含不含缓存命中 | 客户端怎么算 |
+|---|---|---|
+| Responses（OpenAI） | **含**（命中在 `input_tokens_details.cached_tokens`） | `input - cached` |
+| **Messages（Anthropic）** | **不含**（命中在 `cache_read_input_tokens`） | `input + cache_read` |
+
+上游给的是 OpenAI 口径。若 Messages 这边**原样透传**，Claude Code 会算
+`input + cache_read` ⇒ **虚高近一倍** ⇒ 才聊几句就触发自动压缩。
+⚠️ 两条腿必须**各自做对**，不能互相抄（单测里钉了不变式
+`input + cache_read === 上游 prompt_tokens`）。
+
+**另外三个协议点**：
+- `system` 是**顶层字段且可以是块数组** ⇒ 必须拼成文本（直接 `String()` 会得到
+  `[object Object]`，一条**看起来正常但内容全错**的 system）；
+- `tool_result` 是 **user 消息里的块** ⇒ 要拆成独立 `role:'tool'`，且必须
+  **先于**同轮 user 文本（反了上游报配对错误，而错误文案与「顺序」无关）；
+- `tool_use.input` 是**对象**、Chat 的 `arguments` 是 **JSON 字符串** ⇒ 双向转换，
+  且 parse 失败**不抛错**（一次畸形不该让整轮失败）。
+
+`count_tokens` **不碰上游**（纯本地估算）—— 拿不到官方 tokenizer 就**如实给保守估值**
+（宁高不低：低估会让客户端发出超限请求，高估只是更早压缩）。
+
+#### ③ `X-Robots-Tag: noindex, nofollow`（面板与登录页）
+
+面板挂在公网域上，被搜索引擎收录等于对外宣告「这里跑着多供应商账号池」。
+用**响应头**而非 `robots.txt`：头对每个响应都生效，与爬虫是否抓 `robots.txt` 无关。
+
+#### ④ `MAX_REQUEST_BYTES` 可配置（缺省 8 MiB）
+
+`readJsonCapped()` 两道闸：`content-length`（廉价、零 CPU）+ 读后按**实际字节数**
+复查（`content-length` 可能缺失/谎报/chunked；且必须用字节数而非
+`text.length` —— 后者是 UTF-16 码元数，对中文会**低估三分之一**）。
+
+⚠️ 解析严格遵守 §6.8：**绝不写 `parseInt(x) || 默认`**。`0` 在这里是
+「不限制」的合法配置，而 `parseInt('0') || 默认` 会把它当没配置。
+
+#### ⑤ 实测（线上）
+
+| 项 | 结果 |
+|---|---|
+| 非流式 `/v1/messages`（`x-api-key`） | ✅ Anthropic 形状，usage `{input:12,output:1}` |
+| 流式事件序列 | ✅ `message_start→content_block_start→delta→stop→message_delta→message_stop` |
+| 工具调用 | ✅ `stop_reason:tool_use` + `input` 是对象 |
+| `count_tokens` | ✅ `{input_tokens:26}` |
+| `Authorization` 旧形态 | ✅ 仍可用（向后兼容） |
 
 ### 9.2 第 1 步：出口 IP / WAF 前置验证（✅ 通过）
 

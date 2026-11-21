@@ -86,6 +86,7 @@ import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
+import { handleCountTokens, handleMessages } from './gateway/messages.js'
 import { handleChatCompletions } from './gateway/server.js'
 import {
   type AuthResult,
@@ -4063,6 +4064,35 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     if (guard.denied !== undefined) return guard.denied
     const result = await handleResponses(request, env, realm, ctx, guard.key)
     // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
+    return result.response
+  }
+
+  // ── Anthropic **Messages API**（Claude Code / Anthropic SDK 原生协议） ──
+  //
+  // 与 `/v1/responses` 同一条思路：**并存而不是二选一** —— 客户端用哪套协议
+  // 由它请求的 URL 决定，三者共用同一份 provider 路由、账号池与子密钥记账。
+  //
+  // ⚠️ 鉴权已支持 `x-api-key`（见 `authz.ts` 的 `clientKeyOf`）——
+  // Claude Code 发的正是这个头，不是 `Authorization`。
+  if ((path === '/v1/messages' || path === '/messages') && request.method === 'POST') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const guard = await guardV1(request, env, v1Auth)
+    if (guard.denied !== undefined) return guard.denied
+    const result = await handleMessages(request, env, realm, ctx, guard.key)
+    // 流式响应**原样返回**（不包装、不缓冲）
+    return result.response
+  }
+
+  // `count_tokens` 是 Claude Code 启动时会调的**估算**端点。
+  //
+  // ⚠️ 它**不碰上游**（纯本地估算，见 `handleCountTokens` 的说明）——
+  // 故不需要 realm，也不消耗任何配额。但仍要走子密钥的模型白名单，
+  // 否则一把受限的子密钥能借它探测「哪些模型存在」。
+  if ((path === '/v1/messages/count_tokens' || path === '/messages/count_tokens')
+    && request.method === 'POST') {
+    const guard = await guardV1(request, env, v1Auth)
+    if (guard.denied !== undefined) return guard.denied
+    const result = await handleCountTokens(request)
     return result.response
   }
 
