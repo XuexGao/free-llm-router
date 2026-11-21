@@ -2377,3 +2377,20 @@ test('🔴 TRAE / LobsterAI / OpenCode 都必须交出真实倍率（上游一�
   assert.ok(/await refreshCapabilities\(\)/.test(oc),
     '⚠️ 能力表冷启动必须主动拉取（原实现只被自己的 stale 分支调用 ⇒ 永远不拉）')
 })
+
+test('🔴 workbuddy 的存储 key 必须带前缀（只有 buddy 是裸 uid）', async () => {
+  // ## 真实缺陷（本轮实测到）
+  //
+  // 我把 `workbuddy` 也写进了「裸 uid」白名单（理由「两个腾讯变体同族」）——
+  // 那是错的。旧规则是 `providerId === DEFAULT_PROVIDER ? uid : `p:uid``，
+  // 而当时默认供应商是 **buddy** ⇒ **buddy 裸 uid、workbuddy 带前缀**。
+  //
+  // 后果（线上实测）：同一个 `zihang518@gmail.com` 在 global 分片里出现**两条**
+  // 记录（`workbuddy:46a2…` 旧的 + `46a2…` 新导的），而停用/冷却标记仍挂在
+  // 旧 key 上 —— 表现是「禁用了旧的那条，新的照旧可用」。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const m = /const BARE_UID_PROVIDERS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(src)
+  assert.ok(m !== null, '应有 BARE_UID_PROVIDERS')
+  const ids = m[1].split(',').map((x) => x.trim().replace(/['"]/g, '')).filter(Boolean)
+  assert.deepEqual(ids, ['buddy'], '⚠️ 只有 buddy 用裸 uid；workbuddy 必须带 workbuddy: 前缀')
+})

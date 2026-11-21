@@ -437,15 +437,23 @@ function toProviderCredential(providerId: string, cred: LoginCredential): Provid
  *
  * ## ⇒ 现行规则：**按供应商 id 白名单**，与默认供应商彻底无关
  *
- * - `buddy` / `workbuddy`：**裸 uid**（历史数据就是这么存的，不能变）。
- *   这两个变体的 uid 本身就是互补的（国内 JWT 的 `sub` 与国际化账号体系不同），
- *   且历史实现里从未加过前缀。
+ * - **只有 `buddy`**：**裸 uid**。
+ *   它在「默认供应商 = buddy」时期就是裸 uid（当时的规则是
+ *   `providerId === DEFAULT_PROVIDER ? uid : \`+p+:+\`+uid+\``），
+ *   既有国内账号全部是这个形状。
+ * - **`workbuddy`（国际版）**：**带前缀** `workbuddy:<uid>`。
+ *   ⚠️ 它在旧规则下**不是**默认供应商 ⇒ 历史数据一直是**带前缀**的。
+ *   本轮我一度把它也写进「裸 uid」白名单（理由是「两个腾讯变体同族」）——
+ *   那是**错的**，后果是实测到的真实现象：
+ *   同一个 `zihang518@gmail.com` 在 `global` 分片里出现**两条**记录
+ *   （`workbuddy:46a2…` 是旧的、`46a2…` 是本次新导的），
+ *   而停用/冷却标记仍挂在旧 key 上（表现：禁用了旧的那条，新的照旧可用）。
  * - 其余所有供应商：`<provider>:<uid>`。
  *
  * ⚠️ 这条规则**是持久化格式**：改动它等于改数据的物理地址。改之前必须
  * 同时提供迁移（读写两侧都要认旧 key），否则就是把既有账号「弄丢」。
  */
-const BARE_UID_PROVIDERS: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+const BARE_UID_PROVIDERS: ReadonlySet<string> = new Set(['buddy'])
 
 /** 构造账号的存储 key（见 {@link BARE_UID_PROVIDERS} 的规则说明）。 */
 function storageUidFor(providerId: string, uid: string): string {
