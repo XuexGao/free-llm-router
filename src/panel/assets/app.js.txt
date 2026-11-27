@@ -2144,9 +2144,35 @@ async function loadModalModels() {
   }
   // 模型列表 + 开关（打开/关闭）
   const head = document.createElement('p'); head.className = 'hint'
-  head.textContent = '共 ' + models.length + ' 个模型，已关闭 ' + (res.body.disabledCount || 0) + ' 个。'
-    + '关闭后该模型会从 /v1/models 消失，客户端拿不到也调不到。'
+  // ⚠️ 计数要能**就地刷新**（见 refreshModelCountHint），故抽成函数，
+  // 而不是渲染时定死字符串 —— 否则关掉五个后文案还写着「已关闭 0 个」。
+  const refreshModelCountHint = () => {
+    const off = models.filter((m) => m.disabled).length
+    head.textContent = '共 ' + models.length + ' 个模型，已关闭 ' + off + ' 个。'
+      + '关闭后该模型会从 /v1/models 消失，客户端拿不到也调不到。'
+  }
+  refreshModelCountHint()
   box.appendChild(head)
+
+  // 开关按钮的**唯一**视觉真源：只根据 `disabled` 布尔值设置类名与提示。
+  //
+  // ⚠️ 必须集中在一处：单个开关、批量开关、失败回滚三条路径都要用同一套判定，
+  // 否则很容易出现「回滚了数组但没回滚类名」这类状态撕裂（界面与数据不一致）。
+  const applySwitchVisual = (btn, disabled) => {
+    btn.className = 'switch' + (disabled ? '' : ' on')
+    btn.title = disabled ? '已关闭，点击打开' : '已打开，点击关闭'
+  }
+  // 批量操作后按数组重刷**所有**已渲染的开关。
+  // ⚠️ 用按钮上记的模型 id 反查，不依赖 DOM 顺序 —— 顺序一旦与数组错位，
+  //    就会把 A 的状态写到 B 的按钮上（那比不刷新危险得多）。
+  const applyAllSwitchVisuals = () => {
+    for (const btn of box.querySelectorAll('.switch')) {
+      const id = btn.dataset.modelId
+      if (id === undefined) continue
+      const m = models.find((x) => x.id === id)
+      if (m !== undefined) applySwitchVisual(btn, m.disabled)
+    }
+  }
 
   // 工具条：一键关闭全部 / 一键开启全部
   const bar = document.createElement('div'); bar.className = 'model-toolbar'
@@ -2155,12 +2181,24 @@ async function loadModalModels() {
   // ⚠️ 用**批量**接口（一次往返），不在前端循环调 toggle ——
   // 那会产生 N 次 DO 往返，中途失败还会留下「关了一半」的不一致状态。
   const bulk = async (enabled) => {
+    // ⚠️ 一次性快照旧值：失败时要能**完整回滚**（批量请求可能中途部分生效，
+    //    但接口是原子的；无论如何不能让界面停在「以为成功」的状态）。
+    const before = models.map((m) => m.disabled)
     const r = await api('/admin/providers/models/bulk', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ provider: modalProviderId, models: models.map((m) => m.id), enabled }),
     })
-    if (!r.ok) { alert('操作失败：' + JSON.stringify(r.body)); return }
-    loadModalModels()
+    if (!r.ok) {
+      alert('操作失败：' + JSON.stringify(r.body))
+      // 回滚（正常情况下 models 一行都没改，这里只是防御）
+      models.forEach((m, i) => { m.disabled = before[i] })
+      applyAllSwitchVisuals()
+      return
+    }
+    // 就地更新：不发第二次请求、不重建 DOM（理由同单个开关）
+    for (const m of models) m.disabled = !enabled
+    applyAllSwitchVisuals()
+    refreshModelCountHint()
   }
   offAll.onclick = async () => {
     if (!confirm('关闭该供应商的全部 ' + models.length + ' 个模型？关闭后客户端在 /v1/models 里看不到它们。')) return
@@ -2181,16 +2219,43 @@ async function loadModalModels() {
     row.appendChild(mid); row.appendChild(mname)
 
     const sw = document.createElement('button')
-    sw.className = 'switch' + (m.disabled ? '' : ' on')
-    sw.title = m.disabled ? '已关闭，点击打开' : '已打开，点击关闭'
+    sw.dataset.modelId = m.id
+    applySwitchVisual(sw, m.disabled)
+    // ── 就地更新，**不重新拉取整个列表** ──
+    //
+    // ## 🔴 用户报障：「关很多模型的时候特别慢」
+    //
+    // 原实现在每次切换后调 `loadModalModels()` —— 那是**整页重建**：
+    // 1. 一次 `/admin/providers/models` 往返（要逐账号打上游，实测可达数秒）；
+    // 2. `clear(box)` 销毁**全部** DOM，包括用户正在看的位置；
+    // 3. 滚动位置丢失 —— 关到第 20 个时视图跳回顶部，必须重新往下找。
+    //
+    // 而切换一个开关**根本不需要重新知道有哪些模型**：我们早就有了。
+    // ⇒ 只翻转这一个按钮的类名 + 本地数组里的标记，覆盖面与「重载」完全等价，
+    //    但**零网络往返、零重绘、零滚动跳动**。
+    //
+    // ⚠️ 失败时**不能**只弹窗就完事：必须把按钮状态**回滚**，否则界面显示
+    //    「已关闭」而服务端仍是「开启」——那是最糟的不一致（用户以为关了，实际没关）。
     sw.onclick = async () => {
       const nextEnabled = m.disabled === true // 当前关闭 → 打开
+      const before = m.disabled
+      // 乐观更新：先翻转，请求失败再回滚（感知延迟为零）
+      m.disabled = !nextEnabled
+      applySwitchVisual(sw, m.disabled)
+      sw.disabled = true
       const r = await api('/admin/providers/models/toggle', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ provider: modalProviderId, model: m.id, enabled: nextEnabled }),
       })
-      if (!r.ok) { alert('切换失败：' + JSON.stringify(r.body)); return }
-      loadModalModels()
+      sw.disabled = false
+      if (!r.ok) {
+        // ⚠️ 回滚到请求前的真实状态（不是「翻转回来」—— 中途可能被批量操作改过）
+        m.disabled = before
+        applySwitchVisual(sw, before)
+        alert('切换失败：' + JSON.stringify(r.body))
+        return
+      }
+      refreshModelCountHint()
     }
     row.appendChild(sw)
     box.appendChild(row)

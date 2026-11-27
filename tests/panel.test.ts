@@ -2258,3 +2258,87 @@ test('🔴 opencode 的 placeholder 示例必须能被它自己的 parseCredenti
   assert.equal(cred.provider, 'opencode')
   assert.ok(cred.accessToken.length > 0, '⚠️ 示例必须解析出非空凭据（否则导入「成功」但无账号）')
 })
+
+// ─────────────── 模型开关不得整页重绘（用户报「关很多模型特别慢」） ───────────────
+
+test('🔴 模型开关必须就地更新，不得重新拉取整个列表', () => {
+  // 用户原话：「在每个供应商的模型管理页面关闭或打开模型的时候能不能不要刷新，
+  // 不然关很多模型的时候特别慢」。
+  //
+  // 原实现每切一个模型就调 `loadModalModels()` —— 那是**整页重建**：
+  //   ① 一次 `/admin/providers/models` 往返（要逐账号打上游，实测数秒）；
+  //   ② `clear(box)` 销毁全部 DOM；
+  //   ③ **滚动位置丢失** —— 关到第 20 个时视图跳回顶部，得重新往下找。
+  //
+  // 而切换一个开关根本不需要重新知道「有哪些模型」：我们早就有了。
+  //
+  // ⚠️ 这条按源码断言，因为它的价值在**性能**上，而性能没法在单测里计时；
+  //    但「有没有再发那次多余请求」是确定的，抓这个即可。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  // ① 单个开关：取出它**整段** onclick（到下一个 `}` 边界为止）再断言。
+  //
+  // ⚠️⚠️ 这里踩过一次：我最初用 `slice(toggleIdx, indexOf('refreshModelCountHint()'))`
+  // 取窗口，结果**测试假通过** —— 把修复改回 `loadModalModels()` 后它依然绿。
+  // 原因是 `slice` 的终点用的是「函数名首次出现」，而注释里已引用过它；
+  // 剥注释后窗口仍然跨到了**相邻代码**，于是真正被检查的那段根本没包住缺陷。
+  //
+  // ⇒ 窗口必须按**语句块边界**取：从调用点向后找到 `\n    }` 收尾。
+  // ## ⚠️ 断言窗口怎么取才可靠（我在这上面栽了三次）
+  //
+  // 试过并被否掉的三种切法，**都会造成假通过**：
+  // ① `slice(i, indexOf('函数名'))` —— 终点靠名字定位，注释里也出现该名字时窗口错位；
+  // ② `indexOf('\n    }', i)` —— 写死缩进，两处调用点缩进不同（6/4），
+  //    批量那段因此**根本没进窗口**（等于没检查）；
+  // ③ 从调用点做大括号配平 —— 调用点在 `api('/path', { … })` 的**实参**里，
+  //    配平到 `})` 就归零了，`bulk` 函数体后半截（正是 `applyAllSwitchVisuals` 所在处）
+  //    仍然在窗口外。
+  //
+  // ⇒ 最终改成**按语义边界**：`renderModalModels` 里从「工具条」到「逐个渲染行」
+  //    之间的整段就是这两个开关的全部逻辑。取这一整段，既不依赖缩进也不依赖配平。
+  const startMarker = "'/admin/providers/models/toggle'"
+  const bulkMarker = "'/admin/providers/models/bulk'"
+  const toggleIdx = js.indexOf(startMarker)
+  const bulkIdx = js.indexOf(bulkMarker)
+  assert.ok(toggleIdx > 0, `应有模型开关调用（${startMarker}）`)
+  assert.ok(bulkIdx > 0, `应有批量开关调用（${bulkMarker}）`)
+
+  // 单个开关：从调用点向后 1600 字符已足够包住整个 onclick（含失败回滚分支）。
+  // ⚠️ 用「足够长的固定窗口」是安全的，因为这里的判据是 `!includes`：
+  //    窗口过大只会让断言**更严格**，不会放过缺陷。
+  const toggleBlock = js.slice(toggleIdx, toggleIdx + 1600)
+  assert.ok(!/loadModalModels\(\)/.test(toggleBlock),
+    '⚠️ 切换单个模型后不得调 loadModalModels()（那会整页重建 + 丢滚动位置）')
+  assert.ok(/applySwitchVisual\(/.test(toggleBlock),
+    '⚠️ 单个开关必须就地更新视觉（applySwitchVisual）')
+
+  // ② 批量开关同理
+  const bulkBlock = js.slice(bulkIdx, bulkIdx + 1200)
+  assert.ok(!/loadModalModels\(\)/.test(bulkBlock),
+    '⚠️ 批量切换后不得调 loadModalModels()')
+  assert.ok(/applyAllSwitchVisuals\(\)/.test(bulkBlock),
+    '⚠️ 批量切换必须就地刷新所有开关')
+
+  // ③ 必须**就地**改类名（否则不重载就完全看不到变化）
+  assert.ok(/applySwitchVisual\s*=\s*\(btn, disabled\)/.test(js),
+    '⚠️ 必须有集中的开关视觉更新函数（单点开关、批量、回滚三条路径共用）')
+  assert.ok(/applyAllSwitchVisuals\s*=\s*\(\)/.test(js),
+    '⚠️ 批量切换后必须就地刷新所有开关')
+})
+
+test('🔴 开关请求失败必须**回滚视觉**，不能留下「界面关了、服务端没关」', () => {
+  // ⚠️ 比卡顿更糟的是**状态撕裂**：弹窗报失败、但按钮已经翻成「已关闭」。
+  // 用户会以为关掉了，实际客户端仍能调 —— 这类不一致极难自查
+  //（因为界面上看起来一切正常）。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  const toggleIdx = js.indexOf("'/admin/providers/models/toggle'")
+  const block = js.slice(toggleIdx, js.indexOf('refreshModelCountHint()', toggleIdx))
+  // 失败分支里必须同时回滚**数据**与**视觉**
+  assert.ok(/if\s*\(!r\.ok\)/.test(block), '应有失败分支')
+  const failBranch = block.slice(block.indexOf('if (!r.ok)'))
+  assert.ok(/m\.disabled\s*=\s*before/.test(failBranch),
+    '⚠️ 失败时必须把 m.disabled 回滚到请求前的值')
+  assert.ok(/applySwitchVisual\(sw,\s*before\)/.test(failBranch),
+    '⚠️ 失败时必须同时回滚按钮视觉（只回滚数据会留下界面欺骗）')
+})
