@@ -2543,3 +2543,62 @@ test('⚠️ IAM 确认失败不得抛出，要让**重发的业务请求**决�
   assert.ok(/catch\s*\(/.test(body), '⚠️ 确认失败必须被 catch 住')
   assert.ok(!/throw /.test(body), '⚠️ 确认失败不得抛出（否则真实业务错误被掩盖）')
 })
+
+test('🔴 Raccoon IAM 自愈的**端到端**行为（真实执行，非文本断言）', async () => {
+  // 上面那条是源码断言（快，但只能证明「代码长得对」）。
+  // 这条**真的跑一遍**：用假 fetch 复现上游两种响应，验证
+  //   ① 首个业务请求回 400 IAM_CONFIRM_REQUIRED；
+  //   ② 代码自动 POST /iam/confirm；
+  //   ③ 随后**重发**业务请求并成功拿到数据。
+  //
+  // ⚠️ 为什么非要有这条：`raccoonProvider.balance` 会走 `raccoonRequest`，
+  // 而自愈逻辑藏在那一层。只做文本断言的话，「自愈被挪到别处」「重发漏了
+  // 返回值」这类改动都可能表面正确、实际不工作。
+  const calls: Array<{ url: string; method: string }> = []
+  const realFetch = globalThis.fetch
+  // @ts-expect-error 测试桩：只为记录调用顺序与模拟上游
+  globalThis.fetch = async (url: unknown, init: { method?: string } | undefined) => {
+    const u = String(url)
+    calls.push({ url: u, method: init?.method ?? 'GET' })
+    if (u.includes('/iam/confirm')) {
+      return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
+    }
+    const confirmed = calls.some((c) => c.url.includes('/iam/confirm'))
+    if (!confirmed) {
+      return new Response(JSON.stringify({
+        biz_code: 'IAM_CONFIRM_REQUIRED',
+        // ⚠️ 这里必须写字面量：上面 `const { RACCOON_IAM_CONFIRM_CODE } = await import(...)`
+        // 在本函数**后面**才执行，桩函数里引用它会命中 TDZ 直接抛
+        // `is not defined`（我第一版就这么错的）。
+        code: 200901,
+        message: 'iam_confirm_required',
+        details: 'IAM confirmation required',
+      }), { status: 400 })
+    }
+    return new Response(JSON.stringify({
+      biz_code: 'OK', code: 0, message: 'success',
+      data: { available_points: 2854 },
+    }), { status: 200 })
+  }
+  try {
+    const { raccoonProvider, RACCOON_IAM_CONFIRM_CODE } = await import('../src/providers/raccoon.ts')
+    // `parseCredential` 不在顶层导出，走 provider 上挂的那份（同一实现）
+    const cred = raccoonProvider.parseCredential({
+      access_token: 'eyJhbGciOiJI.eyJpc3MiOiJ4aWFvaHVhbnhpb25nLmNvbS9pYW0iLCJzdWIiOiJwdS0xIn0.sig',
+      refresh_token: '',
+      user_id: 'pu-test',
+    })
+    const bal = await raccoonProvider.balance(cred, AbortSignal.timeout(5_000))
+    assert.equal(bal.total, 2854, '确认后应拿到真实余额（证明重发成功）')
+    assert.ok(
+      calls.some((c) => c.url.includes('/iam/confirm') && c.method === 'POST'),
+      '⚠️ 必须自动 POST /api/web/auth/v1/iam/confirm（GET 会 404）',
+    )
+    assert.equal(
+      calls.filter((c) => c.url.includes('/points/v1/balance')).length, 2,
+      '⚠️ 确认后必须**重发**原业务请求',
+    )
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
