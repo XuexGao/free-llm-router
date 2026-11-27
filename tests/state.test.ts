@@ -15,6 +15,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import {
   createAccountState,
@@ -167,4 +168,69 @@ test('过期的模型冷却被剪枝后不算限流', () => {
   pruneExpired(s, now, 6 * 3600_000)
   assert.equal(modelExempt(s, now), false)
   assert.equal(Object.keys(s.modelCooldowns).length, 0, '过期条目应被删除')
+})
+
+// ───────────── 清惩罚态必须连 `reason` 一起清（陈旧文案会误导归因） ─────────────
+
+test('🔴 清惩罚态的每一条路径都必须同时清 `reason`（陈旧失败文案会误导归因）', async () => {
+  // ## 真实缺陷（线上实测，2026-11-27）
+  //
+  // 一个 buddy 账号的实际状态是
+  // `coolKind:''` `until:0` `fails:0` `breakerUntil:0`（**完全健康**），
+  // 但 `reason` 仍挂着 **10-17 的**
+  // `waf_blocked: Illegal API invocation from an unapproved channel`。
+  //
+  // 根因：`reason` 只是惩罚态的**附注**，而 `noteSuccess` 清了 9 个失败态字段
+  // **唯独漏了它**；`clearCooldowns` 同样漏。
+  //
+  // ⚠️ 后果不是「少显示一个字段」，而是**主动误导**：
+  // 我据此判定「国内版 11-21 之后全挂了、疑似指纹回退」，
+  // 实际它只是因为被手动关闭而没再发请求 —— 一开启立刻 4/4 成功。
+  // 一个六周前的失败原因被当成「当前状态」来归因，这类缺陷极难自查。
+  //
+  // ⚠️ 这个测试**按源码结构断言**（AccountPoolDO 依赖 DO storage，无法直接跑）：
+  // 找出所有「把 coolKind 清成空串」的代码块，要求同一块里必须出现
+  // `state.reason = ''`。新增一条清惩罚态的路径却忘了清 reason 时，
+  // 这里会立刻变红 —— 那正是我要防的「同一个 bug 只修一半」。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')   // 剥块注释
+    .replace(/^\s*\/\/.*$/gm, '')       // 剥行注释
+
+  // 以 `coolKind = ''` 为锚点，取它所在的「语句块」（前后各 12 行）判断。
+  // ⚠️ 不能用固定长度窗口切文件（注释一长就会切偏）——这里按行号聚合更稳。
+  const lines = src.split('\n')
+  const anchors = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => /state\.coolKind\s*=\s*''/.test(l))
+  assert.ok(anchors.length >= 3, `应至少有 3 处清 coolKind（实得 ${anchors.length}）`)
+
+  for (const { i } of anchors) {
+    // 取该锚点所在的语句块：向上找到最近一个 `{` 或空行/函数边界，向下 12 行
+    const window = lines.slice(Math.max(0, i - 6), i + 13).join('\n')
+    assert.ok(/state\.reason\s*=\s*''/.test(window),
+      `⚠️ 第 ${i + 1} 行清 coolKind 的代码块里没有清 state.reason ——\n`
+      + '清了惩罚态却留下失败文案，面板会把一条已不成立的原因当成当前状态显示，\n'
+      + '而这会把人引向完全错误的归因方向（实测代价：误判「指纹回退」）。')
+  }
+
+  // 反向：`noteSuccess` 里必须明确清 reason（它是**正常成功路径**，
+  // 恰恰是陈旧 reason 最常见的残留来源 —— 账号一直好着，文案却一直是坏的）。
+  const successIdx = src.indexOf('async noteSuccess')
+  assert.ok(successIdx > 0, '应有 noteSuccess')
+  const successBody = src.slice(successIdx, src.indexOf('\n  }', successIdx))
+  assert.ok(/state\.reason\s*=\s*''/.test(successBody),
+    '⚠️ noteSuccess 必须清 reason（成功一次就说明上次失败原因已不成立）')
+})
+
+test('⚠️ 判「是否被惩罚」只能看时间语义字段，不能看 reason', () => {
+  // 这条把上面那条的**判据纪律**钉死：`reason` 是自由文本附注，
+  // 判据必须只用 `isActive(until)` / `coolKind` / `fails` / `breakerUntil`。
+  //
+  // 一个健康账号完全可以带着非空 `reason`（历史遗留），
+  // 故任何 `reason !== ''` 形式的「是否被限」判断都是错的。
+  const st = make()
+  assert.equal(st.reason, '', '新建账号 reason 应为空')
+  st.reason = 'waf_blocked: 六周前的失败'
+  // ⚠️ 即使 reason 非空，健康判据仍须为「可用」—— 两者必须解耦
+  assert.equal(healthy(st, NOW), true, '⚠️ reason 非空不得影响健康判定')
 })

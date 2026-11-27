@@ -645,6 +645,26 @@ export class AccountPoolDO extends DurableObject<Env> {
 
     state.successCount += 1
     state.lastSuccess = now
+    /**
+     * ⚠️ **必须清 `reason`** —— 它是上一次失败的**遗留文案**，不是当前状态。
+     *
+     * ## 真实缺陷（线上实测，2026-11-27）
+     *
+     * 一个 buddy 账号的实际状态是：
+     * `coolKind:''` `until:0` `fails:0` `breakerUntil:0`（**完全健康**），
+     * 但 `reason` 仍挂着 **10-17 的**
+     * `waf_blocked: Illegal API invocation from an unapproved channel`。
+     *
+     * ⇒ `/admin/accounts` 把这条**六周前的**失败原因当成当前状态显示，
+     * 而 `reason` 只在 `revive()` / `setDisabled()` 里被清 ——
+     * **正常成功路径从来不清它**。我据此差点判定「国内版 11-21 之后全挂了」，
+     * 实际它只是因为被手动关闭而没再走请求，一开启立刻 4/4 成功。
+     *
+     * ⚠️ 这类陈旧字段比缺字段更危险：**它会主动误导归因**。
+     * 判「当前是否被惩罚」只能看 `coolKind` / `until` / `fails` /
+     * `breakerUntil` 这些**带时间语义**的字段，`reason` 只是它们的附注。
+     */
+    state.reason = ''
     state.fails = 0
     state.retryCount = 0
     state.breakerUntil = 0
@@ -938,6 +958,9 @@ export class AccountPoolDO extends DurableObject<Env> {
         state.breakerUntil = 0
         state.degradeUntil = 0
         state.coolKind = ''
+        // ⚠️ 与 `noteSuccess` 同理：清了惩罚态就必须清掉附注文案，
+        // 否则「冷却已清、reason 还在」——面板会显示一条已不成立的失败原因。
+        state.reason = ''
         state.fails = 0
         state.retryCount = 0
         state.softStreak = 0
