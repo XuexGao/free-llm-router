@@ -201,6 +201,7 @@ import {
 import {
   buildTraeCallbackUrl,
   buildTraeLoginURL,
+  TRAE_LOCAL_CALLBACK_URL,
   exchangeTraeCallback,
   generateMachineId,
   generateDeviceId,
@@ -1716,9 +1717,18 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const state = generateTraeLoginState()
       const machineId = generateMachineId()
       const deviceId = generateDeviceId()
-      // 回调地址取**本次请求的 origin** —— 自定义域与 workers.dev 都自动正确。
+      // 🔴 **发给 TRAE 的回调地址必须是 `127.0.0.1:18080/authorize`**，
+      // **不能**是本服务的 URL（用户报障「授权页显示 TRAE 自己的网络错误」的真因）。
+      //
+      // 见 `TRAE_LOCAL_CALLBACK_URL` 的完整说明：TRAE 的 `auth_type=local`
+      // 就是「本机回调」，非回环地址在浏览器那一程会停在 TRAE 的报错页。
+      //
+      // ⚠️ 注意两者的分工：
+      // - `authCallbackUrl` → 发给 TRAE（**固定回环地址**）；
+      // - `callbackUrl` → 只写进会话载荷供诊断（用户该粘回的链接形态）。
+      const authCallbackUrl = TRAE_LOCAL_CALLBACK_URL
       const callbackUrl = buildTraeCallbackUrl(url.origin, state)
-      const authUrl = buildTraeLoginURL(machineId, deviceId, callbackUrl)
+      const authUrl = buildTraeLoginURL(machineId, deviceId, authCallbackUrl)
       const expiresAt = Date.now() + TRAE_LOGIN_STATE_TTL_MS
       // ⚠️ `expiresAt` 也存进载荷：回调回写凭证时要沿用它（否则每次回跳都会把
       // 窗口续满 —— `getLoginSession` 不回传 expires_at，见 store/db.ts:128）。
@@ -1731,6 +1741,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           machineId,
           deviceId,
           callbackUrl,
+          authCallbackUrl,
           createdAt: Date.now(),
           expiresAt,
         },

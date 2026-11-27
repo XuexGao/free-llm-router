@@ -1948,12 +1948,41 @@ export function buildTraeLoginURL(
 }
 
 /**
- * 生成本服务接收浏览器回跳的 URL。
+ * TRAE **强制要求**的回调地址（`127.0.0.1:18080/authorize`）。
  *
- * `origin` 取**收到本次请求的那个 origin**（`url.origin`），故自定义域与
- * `workers.dev` 域都自动正确，无需配置（与 `buildCodeArtsCallbackUrl` 同款）。
+ * ## 🔴 这**不是**可配置项，也不是「本服务的接收地址」
  *
- * ⚠️ 与 codearts 一样**不带 query**：见 {@link TRAE_LOGIN_CALLBACK_PATH}。
+ * 用户报障「TRAE 登录时，授权页显示 TRAE 自己的**网络错误**」。
+ * 根因就是我们曾把 `auth_callback_url` 填成本服务的 URL：
+ *
+ * - 登录 URL 里 `auth_type=local` 字面含义就是「**本机回调**」；
+ * - 参考实现 `trae-oauth.ts:4-11` 明写 **TRAE 强制回调 `127.0.0.1`**，
+ *   并在同文件自己 `startCallbackServer(18080)` 接收；
+ * - 我们服务端**收不到**这个回环地址，但更关键的是：**TRAE 侧不认非回环地址**，
+ *   浏览器那一程会直接停在 TRAE 页面的「网络错误」——
+ *   用户看到的是 TRAE 的报错页，而不是我们的错误，所以极难归因。
+ *
+ * ⚠️ 我实测过对照：把 `auth_callback_url` 换成 `https://<本服务>/login/trae/callback/<state>`
+ * 与换成 `http://127.0.0.1:18080/authorize`，**授权页首屏都能打开**
+ * （服务端不做前置校验），所以**靠 curl 看不出差异** —— 这是它能一路漏到线上的原因。
+ *
+ * ## ⇒ 所以这里**故意**不回填服务地址
+ *
+ * 回调**不会**落到我们这里，但会停在用户浏览器的**地址栏**里，
+ * 且带着完整的凭证材料。那条路径由「手动粘贴回调链接」承接
+ * （`/admin/providers/login/submit-callback`）。
+ * 把这里改成回环地址，用户看到的才是 TRAE **真正的授权页**
+ * 而不是「网络错误」；否则连授权这一步都走不完，也就永远没东西可粘。
+ */
+export const TRAE_LOCAL_CALLBACK_URL = 'http://127.0.0.1:18080/authorize'
+
+/**
+ * 生成本服务接收浏览器回跳的 URL（**仅用于展示/诊断，不发给 TRAE**）。
+ *
+ * ⚠️ 发给 TRAE 的 `auth_callback_url` **必须**用 {@link TRAE_LOCAL_CALLBACK_URL}。
+ * 这个函数保留是因为：
+ * 1. 登录会话载荷里仍记录 `callbackUrl`，便于排查「用户粘回的链接该长什么样」；
+ * 2. 万一 TRAE 将来放开回调白名单，改回这里只需改一处调用点。
  */
 export function buildTraeCallbackUrl(origin: string, state: string): string {
   return `${origin.replace(/\/+$/, '')}${TRAE_LOGIN_CALLBACK_PATH}/${encodeURIComponent(state)}`
