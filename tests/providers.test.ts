@@ -2602,3 +2602,46 @@ test('🔴 Raccoon IAM 自愈的**端到端**行为（真实执行，非文本�
     globalThis.fetch = realFetch
   }
 })
+
+test('🔴 Gemini 的 VALIDATION_REQUIRED 不得被判为「可换号重试」', () => {
+  // 线上实测（2026-11-27）：
+  //   `403 [VALIDATION_REQUIRED / PERMISSION_DENIED] Verify your account to continue.`
+  //
+  // 这是 Google 要求**账号本人**去网页完成验证 —— 换号无用（只有那一个号）、
+  // 重试永远同一结果、续期也无效。若判成「可重试」，网关会做无意义的换号循环，
+  // 并把真实原因埋进噪音里。
+  //
+  // ⚠️ 与 `SUBSCRIPTION_REQUIRED` / `quota` 必须**分开**：那些换号是有效的
+  //（别的账号可能还有额度）。这两类混为一谈会得出相反的错误处置。
+  return import('../src/providers/gemini.ts').then((g) => {
+    const body = '{"error":{"code":403,"message":"Verify your account to continue.",'
+      + '"status":"PERMISSION_DENIED","details":[{"reason":"VALIDATION_REQUIRED"}]}}'
+    // ⚠️ 关键：这句断言本身**无法区分「有显式排除」与「正则恰好没匹配」** ——
+    // 我实测过：把 `VALIDATION_REQUIRED` 那行排除删掉，这条仍然绿
+    // （因为原正则 `quota|subscription|…` 本来就不含它）。
+    //
+    // ⇒ 必须构造一个**同时含两类关键词**的响应体，才能证明「排除优先于包含」。
+    //   上游完全可能这样下发（`details` 里既有 VALIDATION_REQUIRED，
+    //   `message` 里又提到 quota），那时若排除写漏就会误判成可换号。
+    assert.equal(g.isGeminiRetryable(403, body), false,
+      '⚠️ VALIDATION_REQUIRED 不得可重试（换号/重试都无用）')
+    const mixed = '{"error":{"code":403,"message":"quota validation failed",'
+      + '"status":"PERMISSION_DENIED","details":[{"reason":"VALIDATION_REQUIRED"}]}}'
+    assert.equal(g.isGeminiRetryable(403, mixed), false,
+      '⚠️ 同时含 quota 字样时仍须排除（排除必须优先于包含匹配）')
+
+    // 反向：真正值得换号的 403 仍须可重试，别把筛子开太大
+    assert.equal(g.isGeminiRetryable(403, '{"error":{"status":"SUBSCRIPTION_REQUIRED"}}'), true,
+      '⚠️ SUBSCRIPTION_REQUIRED 应仍可换号')
+    assert.equal(g.isGeminiRetryable(403, '{"error":{"message":"quota exceeded"}}'), true,
+      '⚠️ quota 应仍可换号')
+
+    // 提示必须可执行（说清「去哪验」、「续期无效」）
+    const hint = g.geminiActionableHint(body)
+    assert.ok(hint !== undefined, 'VALIDATION_REQUIRED 应给出提示')
+    assert.ok(/accounts\.google\.com/.test(hint), '⚠️ 提示里必须给出具体地址')
+    assert.ok(/续期|重新登录/.test(hint), '⚠️ 必须说清「续期/重登无效」，否则用户会白试')
+    assert.equal(g.geminiActionableHint('{"error":{"message":"quota exceeded"}}'), undefined,
+      '其它错误不应附这条提示')
+  })
+})

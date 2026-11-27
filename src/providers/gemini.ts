@@ -643,9 +643,37 @@ export function isRetryableStatus(status: number): boolean {
 export function isGeminiRetryable(status: number, body: string): boolean {
   if (isRetryableStatus(status)) return true
   if (status === 403) {
+    // ⚠️ `VALIDATION_REQUIRED` **必须排除**：它是「该 Google 账号需要用户本人
+    // 去网页完成验证」，换任何账号都没用（只有那一个号），重试也永远同一结果。
+    // 归到「可重试」会让网关做无意义的换号循环，并把真实原因埋进噪音里。
+    if (/VALIDATION_REQUIRED/i.test(body)) return false
     return /quota|subscription|license|resource[_ ]?exhausted|rate limit|exceeded/i.test(body)
   }
   return false
+}
+
+/**
+ * 把「需要用户本人处理」的上游错误翻成**可执行**的提示。
+ *
+ * ## 为什么值得单独做（线上实测 2026-11-27）
+ *
+ * 原样透传的文案是：
+ * `[VALIDATION_REQUIRED / PERMISSION_DENIED] Verify your account to continue.`
+ *
+ * 用户看到「Verify your account」，但**不知道该去哪儿验、验完要不要重启**。
+ * 而这一条**恰恰是代码无法自动修复的**（与 raccoon 的 IAM 确认不同 —— 那里
+ * 有 `POST /iam/confirm` 端点，这里只有网页流程）。
+ *
+ * ⇒ 与其让人去猜，不如直接说清「这需要你本人操作，且我们无能为力」。
+ *
+ * @returns 补充提示；不需要补充时返回 `undefined`（保持原样透传）。
+ */
+export function geminiActionableHint(body: string): string | undefined {
+  if (!/VALIDATION_REQUIRED/i.test(body)) return undefined
+  return '这是 Google 侧要求**账号本人**完成的验证（与凭据是否过期无关，'
+    + '续期/重新登录都无效）：请用该 Google 账号登录 '
+    + 'https://accounts.google.com 完成身份验证（常见为手机号或辅助邮箱确认），'
+    + '然后在面板对该账号点一次「解冻」或稍等下一轮自动探测即可恢复。'
 }
 
 // ─────────────────────────── 字母序序列化 ───────────────────────────
@@ -1868,7 +1896,10 @@ export async function chat(credential: ProviderCredential, request: ChatRequest)
       provider: 'gemini',
       httpStatus: response.status,
       retryable: isGeminiRetryable(response.status, text),
-      message: `Gemini 推理失败：http=${response.status} ${detail}`,
+      // ⚠️ 附上「需要人去做」的提示（`VALIDATION_REQUIRED` 这类代码修不了）。
+      // 不附的话用户只看到 "Verify your account"，不知道该去哪儿验。
+      message: `Gemini 推理失败：http=${response.status} ${detail}`
+        + (geminiActionableHint(text) === undefined ? '' : `\n提示：${geminiActionableHint(text)}`),
     })
   }
   if (response.body === null) {
