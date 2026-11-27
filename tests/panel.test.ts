@@ -2220,3 +2220,41 @@ test('⚠️ 顶栏图标按钮缩小但触控区不得低于 34px', () => {
   const html = panelAsset('/panel/')?.body ?? ''
   assert.ok(!/width="16"/.test(html), '图标 SVG 也应缩小（16 → 14）')
 })
+
+// ─────────────── 粘贴凭据的 placeholder 必须与解析字段一致 ───────────────
+
+test('🔴 粘贴凭据示例必须与**该供应商实际解析的字段**一致（PR #1 的真实缺陷）', () => {
+  // 用户报：在面板按 placeholder 粘贴 `{"accessToken":"...","uid":"..."}` 添加
+  // OpenCode，弹窗提示「导入成功」，但后台账号列表**不新增**。
+  //
+  // 根因：`opencode` 的 `parseCredential` **只认** `api_key` / `apiKey` / `key`
+  // （且**刻意不收** `accessToken` —— 那是 WorkBuddy 的字段，收下会把别家凭据抢走），
+  // 而 placeholder 恒写通用形态 ⇒ 照着提示粘贴必然解析出空凭据。
+  //
+  // ⚠️ 这类缺陷**文案与代码各改一处不算修好**：将来新增一家不支持通用形态的
+  // 供应商时会**再犯一次**。故这里锁两件事：
+  //   1. opencode 的示例确实是 `api_key` 形态；
+  //   2. 示例来自**表驱动**（不再是一串 if），使新增家必须显式登记。
+  //
+  // ⚠️ 断言前先剥注释：本仓库注释习惯逐字引用反例，不剥会产生假失败。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  assert.ok(/IMPORT_PLACEHOLDER\s*=\s*\{/.test(js),
+    '⚠️ 示例必须来自表驱动的 IMPORT_PLACEHOLDER（否则新增供应商时又会漏改）')
+  assert.ok(/opencode:\s*'\{[^']*"api_key"/.test(js),
+    '⚠️ opencode 的示例必须含 `api_key` 字段（它不认 `accessToken`）')
+  assert.ok(/ta\.placeholder\s*=\s*IMPORT_PLACEHOLDER\[modalProviderId\]/.test(js),
+    '⚠️ placeholder 必须按当前供应商查表，而不是写死通用形态')
+})
+
+test('🔴 opencode 的 placeholder 示例必须能被它自己的 parseCredential 解析', async () => {
+  // ⚠️ 上一条只证明「文案里有 api_key」，不能证明**它就是对的**。
+  // 这条直接把示例串喂给真实解析器 —— 文案与解析器脱节时立刻失败。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const m = /opencode:\s*'(\{[^']*\})'/.exec(js)
+  assert.ok(m, '应能从表里取出 opencode 的示例串')
+  const oc = await import('../src/providers/opencode.ts')
+  const cred = oc.parseCredential(JSON.parse(m[1]))
+  assert.equal(cred.provider, 'opencode')
+  assert.ok(cred.accessToken.length > 0, '⚠️ 示例必须解析出非空凭据（否则导入「成功」但无账号）')
+})
