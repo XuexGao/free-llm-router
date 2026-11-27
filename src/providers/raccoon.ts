@@ -174,6 +174,21 @@ export const RACCOON_TOKEN_REFRESH_WINDOW_SECONDS = 300
  * ⚠️ 确认是**幂等**的：对已确认的会话再发一次仍回 `code:0`，
  * 故可以在错误路径上无条件补一次，无需先查状态（也没有可查的状态端点）。
  */
+/**
+ * ⚠️ **Raccoon 的 refresh_token 通常为空**（扫码登录时服务端只下发
+ * access_token），故这条渠道**实际上没有续期能力**。
+ *
+ * 实测（2026-11-27）：两个账号的凭据里 `refresh_token: ''`，
+ * 而 `refreshRaccoonCredential` 开头就判空抛错 —— 也就是**永远不会**续期成功。
+ * 这不是代码缺陷（上游就没给），但有两个后果必须记住：
+ *
+ * 1. **别把「过期日还远」当成「不会失效」** —— 真正决定可用性的是 IAM 会话
+ *    状态（见 {@link RACCOON_IAM_CONFIRM_PATH}），不是 JWT 的 `exp`；
+ * 2. 真到 token 失效那天，唯一出路是**重新扫码登录**，不是等续期。
+ *
+ * ⇒ 所以 IAM 确认自愈才格外重要：它能救回「token 还有效但会话需确认」
+ *   这种最常见的失效形态（用户体感就是「昨天还能用，今天全挂」）。
+ */
 export const RACCOON_IAM_CONFIRM_PATH = '/api/web/auth/v1/iam/confirm'
 
 /** 触发 IAM 确认的业务错误码（`biz_code` 与 `code` 双判据）。 */
