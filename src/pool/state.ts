@@ -320,3 +320,46 @@ export function pruneExpired(state: AccountState, now: number, costTtlMs: number
 
   return changed
 }
+
+/**
+ * 现有昵称是否**值得**被新值替换。
+ *
+ * ## 线上实况（2026-11-27）：uuid 当名字
+ *
+ * qoder / qodercn / raccoon 的账号卡片显示的是
+ * `qoder:019fabe2-ab88-7163-ba53-ca4381d67b38`、`Raccoon pu-01a1365c-…`
+ * 这样一串 uuid，而**凭据里明明有真实昵称**。
+ *
+ * 根因在 `createAccount`：它对已存在的账号**直接 return**，昵称永不更新
+ * ⇒ 重复导入修不好名字，且**不报错**（用户只觉得「导入了但名字没变」）。
+ *
+ * ## 取舍：只在「现有的没有信息量」时才换
+ *
+ * 这是为了同时避免两种相反的错误：
+ * ① 永不更新 ⇒ 修不好「uuid 当名字」；
+ * ② 无条件更新 ⇒ 用户在面板上手工改过的昵称被下一次导入冲掉。
+ *
+ * 「没有信息量」的判据（任一命中即可换）：空串、等于 uid（或去掉供应商
+ * 前缀后的裸 uid —— 那正是 `nickname ?? uid` 兜底的产物）、纯 hex/uuid 形状、
+ * 或 `Raccoon pu-…` 这类「名字 + uuid」拼接。
+ *
+ * ⚠️ 新值本身也必须「有信息量」，否则会把好不容易拿到的名字覆盖成 uid。
+ */
+export function nicknameWorthUpdating(current: string, next: string, uid: string): boolean {
+  const trimmedNext = next.trim()
+  // 新值没信息量 / 与现值相同 ⇒ 不写
+  if (trimmedNext === '' || trimmedNext === current) return false
+
+  const trimmedCurrent = current.trim()
+  const bareUid = uid.includes(':') ? uid.slice(uid.indexOf(':') + 1) : uid
+  // 新值也不能是 uid 本身（那等于「把名字换成编号」）
+  if (trimmedNext === uid || trimmedNext === bareUid) return false
+
+  return trimmedCurrent === ''
+    || trimmedCurrent === uid
+    || trimmedCurrent === bareUid
+    || /^[0-9a-f]{32,}$/i.test(trimmedCurrent)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmedCurrent)
+    // `Raccoon pu-01a1365c-9780-…` / `qoder:pu-…` 这类「名字 + uuid」拼接
+    || /^(Raccoon|qoder|qodercn|gemini)\s*[: ]?\s*(pu-)?[0-9a-f]{8}-[0-9a-f]{4}/i.test(trimmedCurrent)
+}

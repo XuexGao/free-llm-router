@@ -32,6 +32,7 @@ import {
   healthyForModel,
   isActive,
   modelExempt,
+  nicknameWorthUpdating,
   normalizeAccountState,
   pruneExpired,
 } from './state.js'
@@ -786,7 +787,28 @@ export class AccountPoolDO extends DurableObject<Env> {
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
   }
 
-  /** 创建账号（供导入 / 登录流程调用）。已存在则覆盖凭证以外的状态。 */
+  /**
+   * 创建账号（供导入 / 登录流程调用）。
+   *
+   * ## 已存在时：**只补昵称，运行状态一律保留**
+   *
+   * ⚠️ 原注释写着「已存在则覆盖凭证以外的状态」，但实现是**直接 return**，
+   * 什么都不覆盖 —— 注释与代码不符（真实缺陷，2026-11-27）。
+   *
+   * 后果：**重复导入同一个账号永远修不好它的昵称**。线上实况：qoder /
+   * qodercn / raccoon 的卡片显示 `qoder:019fabe2-…` 这样一串 uuid，
+   * 而凭据里明明有真实昵称。第一次导入时账户已建、昵称取的是当时的
+   * 兜底值，之后再导入就被这里 `return` 丢掉，且**不报错**。
+   *
+   * ## 为什么不覆盖整个 state
+   *
+   * 「重新导入凭据」**不该重置运行状态** —— 冷却、熔断、失败计数、
+   * `disabled`、签到记录都是运行期积累的。覆盖等于「重导入就洗白账号」，
+   * 会让被风控的号看起来又健康了（`AGENTS.md §7.2` 幂等纪律）。
+   *
+   * ⇒ 只补**展示态**（昵称），且只在「现有值没有信息量」时才补
+   *（判据见 `nicknameWorthUpdating`）。
+   */
   async createAccount(
     input: { uid: string; nickname: string; realm: string; provider?: string },
     now: number,
@@ -794,7 +816,15 @@ export class AccountPoolDO extends DurableObject<Env> {
     const existing = readAccount(this.ctx.storage.sql, input.uid)
     if (existing !== undefined) {
       const parsed = normalizeAccountState(JSON.parse(existing))
-      if (parsed !== undefined) return parsed
+      if (parsed !== undefined) {
+        // ⚠️ 只在「现有昵称没信息量」时补 —— 否则用户在面板上改过的名字
+        // 会被下一次导入悄悄冲掉。
+        if (nicknameWorthUpdating(parsed.nickname, input.nickname, parsed.uid)) {
+          parsed.nickname = input.nickname
+          writeAccount(this.ctx.storage.sql, parsed.uid, parsed.realm, JSON.stringify(parsed), now)
+        }
+        return parsed
+      }
     }
     const state = createAccountState(input)
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)

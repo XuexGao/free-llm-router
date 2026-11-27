@@ -19,6 +19,7 @@ import { readFileSync } from 'node:fs'
 
 import {
   createAccountState,
+  nicknameWorthUpdating,
   healthy,
   healthyForModel,
   isActive,
@@ -265,4 +266,41 @@ test('🔴 /admin/accounts 的 reason 必须按「当前是否真被惩罚」过
       `⚠️ 过滤条件必须覆盖 ${k}（只看 coolKind 会漏掉按截止时刻生效的惩罚态）`)
   }
   assert.ok(cond.includes('a.disabled'), '⚠️ 手动停用也要回 reason（那是当前有效状态）')
+})
+
+// ─────────────── 昵称补全：重复导入必须能修好「uuid 当名字」 ───────────────
+
+test('🔴 nicknameWorthUpdating：uuid 当昵称属「没信息量」，应被真名替换', () => {
+  // ## 线上实况（2026-11-27）
+  //
+  // qoder / qodercn / raccoon 的账号卡片显示的是
+  //   `qoder:019fabe2-ab88-7163-ba53-ca4381d67b38`
+  //   `Raccoon pu-01a1365c-9780-7c79-bf54-fa2148ea567d`
+  // 这样一串 uuid，而**凭据里明明有真实昵称**。
+  //
+  // 根因：`createAccount` 对已存在账号**直接 return**，昵称永不更新
+  // ⇒ 重复导入修不好名字，且**不报错**（用户只觉得「导入了但名字没变」）。
+  const uid = 'qoder:019fabe2-ab88-7163-ba53-ca4381d67b38'
+
+  // ① uuid / uid / 空串当名字 ⇒ 值得换成真名
+  assert.equal(nicknameWorthUpdating('019fabe2-ab88-7163-ba53-ca4381d67b38', 'g', uid), true,
+    'uuid 当昵称应被真名替换')
+  assert.equal(nicknameWorthUpdating(uid, 'g', uid), true, '等于完整 uid 应被替换')
+  assert.equal(nicknameWorthUpdating('', 'g', uid), true, '空串应被替换')
+  assert.equal(nicknameWorthUpdating('a'.repeat(32), 'g', uid), true, '32 位 hex 应被替换')
+  // ② 「名字 + uuid」拼接
+  assert.equal(
+    nicknameWorthUpdating('Raccoon pu-01a1365c-9780-7c79-bf54-fa2148ea567d', '高显军',
+      'raccoon:pu-01a1365c-9780-7c79-bf54-fa2148ea567d'),
+    true, '「名字 + uuid」拼接也应被替换',
+  )
+
+  // ③ ⚠️ 反向：用户手工改过的真名**不得**被冲掉
+  assert.equal(nicknameWorthUpdating('我的主账号', 'g', uid), false,
+    '⚠️ 有信息量的现有昵称不得被下一次导入覆盖')
+  // ④ 新值本身没信息量时也不换
+  assert.equal(nicknameWorthUpdating('019fabe2-ab88-7163-ba53-ca4381d67b38', uid, uid), false,
+    '⚠️ 新昵称等于 uid 时不得覆盖')
+  assert.equal(nicknameWorthUpdating('old-name', '', uid), false, '空新值不得覆盖')
+  assert.equal(nicknameWorthUpdating('same', 'same', uid), false, '相同值无需写入')
 })
