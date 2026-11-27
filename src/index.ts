@@ -81,7 +81,7 @@ const LOBSTERAI_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
  * 故会话设更长没有意义（粘回来也换不到令牌，只会得到 `invalid_grant`）。
  */
 const GEMINI_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
-import type { AccountState } from './pool/state.js'
+import { isActive, type AccountState } from './pool/state.js'
 import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
@@ -3684,7 +3684,31 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         provider: a.provider ?? LEGACY_PROVIDER,
         nickname: a.nickname,
         disabled: a.disabled,
-        reason: a.reason,
+        /**
+         * ⚠️ **`reason` 必须按「当前是否真的被惩罚」过滤后再回** ——
+         * 它是一个**自由文本附注**，历史上不会在成功时被清
+         *（`noteSuccess` / `clearCooldowns` 都漏了，已修，但**存量数据仍是脏的**）。
+         *
+         * 线上实例（2026-11-27）：一个 buddy 账号 `coolKind:''` `until:0`
+         * `fails:0`，完全健康，`reason` 却挂着 **10-17 的**
+         * `waf_blocked: Illegal API invocation from an unapproved channel`。
+         *
+         * ⇒ 直接回原值等于把一条六周前的失败原因当成**当前状态**展示，
+         * 而这会把排查引向完全错误的方向（我据此差点去改一个没坏的指纹）。
+         *
+         * 判据只用**带时间语义**的字段：`disabled` / `coolKind` / `until` /
+         * `breakerUntil` / `degradeUntil` / `fails`。任一为「当前仍在生效」
+         * 才回 `reason`；否则它必然是陈旧残留，回空串。
+         *
+         * ⚠️ 这里**不改存储**，只改呈现 —— 清理存量是写入侧的事，
+         * 而读侧必须自证，否则「已修但旧数据还在」这种状态会一直误导人。
+         */
+        reason: (a.disabled
+          || isActive(a.until, Date.now())
+          || isActive(a.breakerUntil, Date.now())
+          || isActive(a.degradeUntil, Date.now()))
+          ? a.reason
+          : '',
         credits: a.credits,
         coolKind: a.coolKind,
         until: a.until,

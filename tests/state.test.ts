@@ -234,3 +234,35 @@ test('⚠️ 判「是否被惩罚」只能看时间语义字段，不能看 rea
   // ⚠️ 即使 reason 非空，健康判据仍须为「可用」—— 两者必须解耦
   assert.equal(healthy(st, NOW), true, '⚠️ reason 非空不得影响健康判定')
 })
+
+test('🔴 /admin/accounts 的 reason 必须按「当前是否真被惩罚」过滤（存量脏数据）', () => {
+  // ## 为什么**只修写入侧不够**
+  //
+  // 上一轮改了 `noteSuccess` / `clearCooldowns` 会清 `reason`，
+  // 但**存量数据仍然是脏的** —— 那个账号在下次成功之前，`reason`
+  // 依旧挂着六周前的 WAF 文案。而「下一次成功」可能永远不会来
+  //（账号被手动关闭、或已经不再使用）。
+  //
+  // ⇒ 读侧必须**自证**：只有当某个惩罚态**当前仍在生效**时，`reason`
+  // 才有展示意义；否则它必然是陈旧残留，一律回空串。
+  //
+  // ⚠️ 这条特别值得写死，因为缺陷形态是「界面显示得很正常」——
+  // 一条历史失败原因看起来和当前失败原因**长得一模一样**，
+  // 只有对照 `until` / `coolKind` 才分得出来。
+  const src = readFileSync('src/index.ts', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+
+  // 找到账号列表里回 reason 的那一行
+  const m = /reason:\s*\(([\s\S]{0,400}?)\)\s*\n\s*\?\s*a\.reason\s*\n\s*:\s*''/.exec(src)
+  assert.ok(m !== null,
+    '⚠️ /admin/accounts 的 reason 必须带「当前是否被惩罚」的条件判断，'
+    + '不能直接回 `reason: a.reason`（那会把陈旧文案当成当前状态）')
+
+  const cond = m[1]
+  for (const k of ['isActive(a.until', 'isActive(a.breakerUntil', 'isActive(a.degradeUntil']) {
+    assert.ok(cond.includes(k),
+      `⚠️ 过滤条件必须覆盖 ${k}（只看 coolKind 会漏掉按截止时刻生效的惩罚态）`)
+  }
+  assert.ok(cond.includes('a.disabled'), '⚠️ 手动停用也要回 reason（那是当前有效状态）')
+})
