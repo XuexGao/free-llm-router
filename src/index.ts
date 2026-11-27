@@ -210,7 +210,7 @@ import {
   TRAE_LOGIN_CALLBACK_PATH,
   TRAE_LOGIN_STATE_TTL_MS,
 } from './providers/trae.js'
-import { panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index.js'
+import { FAVICON_SVG, panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
 export { AccountPoolDO, TaskRunnerDO }
@@ -1360,14 +1360,32 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     })
   }
 
-  // ── /favicon.ico：显式返回 204 ──
+  // ── /favicon.ico：返回**真正的图标**（不能是 204） ──
   //
-  // ⚠️ 浏览器对**每个**页面都会自动请求 `/favicon.ico`（无需 `<link>`）。
-  // 此前这个路径落进了下面的鉴权分支：未登录时返回 **401 JSON** ——
-  // 浏览器控制台凭空多一条错误，而这里本来就没有图标可给。
-  // 返回 204 No Content：合法、无内容、无副作用（不暴露任何信息）。
+  // 🔴 **这里返回 204 会让 `<link rel="icon">` 完全失效**（用户报障，2026-11-27）
+  //
+  // 浏览器对**每个**页面都会自动请求 `/favicon.ico`（即使已写了 `<link>`）。
+  // 原实现返回 `204 No Content` —— 那样确实「不报错」，但浏览器会把这个
+  // 204 当作「本站图标就是这个空响应」，于是**标签页图标始终空白**，
+  // 而我们写在 HTML 里的 `<link rel="icon">` 根本轮不到生效。
+  // 用户看到的就是「加了图标还是不显示图标」。
+  //
+  // ⚠️ 这个坑极隐蔽：`<link rel="icon">` 单独看完全正确、CSP 也放行了、
+  // curl 抓 HTML 也能看到该标签 —— 只有**真的用浏览器打开**才暴露，
+  // 因为决定权在浏览器那次额外请求上。
+  //
+  // ⇒ 改为返回与 `<link>` **同源同内容**的 SVG（常量集中在 panel/index.js，
+  //   两处各写一份必然漂移）。
   if (path === '/favicon.ico') {
-    return new Response(null, { status: 204, headers: securityHeaders() })
+    return new Response(FAVICON_SVG, {
+      status: 200,
+      headers: {
+        ...securityHeaders(),
+        'content-type': 'image/svg+xml; charset=utf-8',
+        // 静态资源可缓存；但别缓存太久，否则图标更新后用户看不到
+        'cache-control': 'public, max-age=86400',
+      },
+    })
   }
 
   // 老的 /panel 前缀（无尾斜杠）重定向到带斜杠，避免相对路径解析错误

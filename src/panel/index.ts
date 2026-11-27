@@ -62,6 +62,42 @@ import loginJs from './assets/login.js.txt'
  * 但这是一条**真实上报的错误**，且把「全站 form-action:none」
  * 这个真实防线退化成了噪音：真正的表单劫持会被淹没。
  */
+/**
+ * 站点图标（内联 SVG，**HTML 与 /favicon.ico 共用同一份**）。
+ *
+ * 参考下游 WebUI：lucide `Route` 描边图形，嵌在 #0071E3 圆角方块里。
+ *
+ * ## ⚠️ 为什么必须有这个常量
+ *
+ * 浏览器对每个页面都会**额外**请求 `/favicon.ico`，而那一路由原先返回 204。
+ * 204 会让浏览器认定「本站图标是空的」，从而**无视** HTML 里的
+ * `<link rel="icon">` —— 用户报的「加了图标还是不显示」就是这个（2026-11-27）。
+ *
+ * ⇒ `/favicon.ico` 必须返回与 `<link>` **同源同内容**的图标。
+ * 两处各写一份必然漂移，故集中到这里。
+ *
+ * ⚠️ 用 **Base64** 而非百分号编码：`data:image/svg+xml,` 后若含未转义的
+ * 空格或单引号，部分浏览器（尤其 Safari）会截断 URI，表现为图标偶发不显示。
+ * Base64 段只有 `[A-Za-z0-9+/=]`，零歧义。
+ */
+export const FAVICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+  + '<rect width="24" height="24" rx="6" fill="#0071E3"/>'
+  + '<g fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+  + '<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/>'
+  + '<path d="M8 19h6a4 4 0 0 0 0-8H10a4 4 0 0 1 0-8h6"/>'
+  + '</g></svg>'
+
+/** 图标的 `data:` URI（HTML 的 `<link rel="icon" href>` 用它）。 */
+export const FAVICON_DATA_URI =
+  'data:image/svg+xml;base64,'
+  + 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+'
+  + 'PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNiIgZmlsbD0iIzAwNzFFMyIvPjxnIGZpbGw9'
+  + 'Im5vbmUiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQi'
+  + 'IHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxjaXJjbGUgY3g9IjYiIGN5PSIxOSIgcj0iMiIvPjxjaXJj'
+  + 'bGUgY3g9IjE4IiBjeT0iNSIgcj0iMiIvPjxwYXRoIGQ9Ik04IDE5aDZhNCA0IDAgMCAwIDAtOEgxMGE0'
+  + 'IDQgMCAwIDEgMC04aDYiLz48L2c+PC9zdmc+'
+
 export const CSP =
   "default-src 'none'; " +
   "script-src 'self'; " +

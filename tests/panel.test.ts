@@ -1904,8 +1904,11 @@ test('⚠️ /favicon.ico 必须显式处理（否则每次访问多一条 401�
   const src = readFileSync('src/index.ts', 'utf8')
   assert.ok(/path === '\/favicon\.ico'/.test(src), '应显式处理 /favicon.ico')
   const i = src.indexOf("path === '/favicon.ico'")
-  const block = src.slice(i, i + 200)
-  assert.ok(/204/.test(block), '应返回 204 No Content')
+  const block = src.slice(i, i + 700)
+  // 🔴 2026-11-27 更正：**不能**再返回 204 —— 见下方专门的图标测试
+  assert.ok(!/status:\s*204/.test(block),
+    '🔴 不得返回 204：浏览器会认定「本站图标为空」并无视 <link rel="icon">')
+  assert.ok(/FAVICON_SVG/.test(block), '⚠️ 应返回真图标内容')
   // ⚠️ 必须在**鉴权之前**：否则又变回 401（这正是要修的东西）
   const authIdx = src.indexOf('if (!(await authorized(request, env)))')
   assert.ok(authIdx > 0 && i < authIdx, '⚠️ favicon 处理必须在鉴权之前')
@@ -2346,26 +2349,49 @@ test('🔴 开关请求失败必须**回滚视觉**，不能留下「界面关�
 
 // ─────────────── 站点图标（借鉴下游 WebUI） ───────────────
 
-test('🔴 两个页面都必须带站点图标，且 CSP 不得把它拦掉', () => {
-  // 参考 https://github.com/NandaNg314/free-llm-router 的 WebUI：
-  // 图标是 lucide `Route` 描边图形，嵌在 #0071E3 圆角方块里。
+
+
+// ─────────────── 站点图标（/favicon.ico 曾让 <link> 完全失效） ───────────────
+
+test('🔴 图标：两个页面都有 <link>，且与 FAVICON_DATA_URI 逐字一致', async () => {
+  // ## 用户报障（2026-11-27）：「浏览器上网站还是没显示图标」
   //
-  // ⚠️ 用**内联 SVG**（`data:image/svg+xml,…`）而不是独立 .ico/.svg 文件：
-  // 1. 零额外请求（面板本身很轻，不值得为一个图标多一次往返）；
-  // 2. 不占路由 —— 独立文件要在 `/panel/*` 的路由表里加一条，加漏就是 404，
-  //    而 favicon 404 **不报错、只是静默不显示**，极难发现；
-  // 3. 不会因路径不对而失效（相对路径在 `/panel/` 与 `/panel` 下解析可能不同）。
+  // 我在 HTML 里加了 `<link rel="icon" ...>`，CSP 也放行了 `img-src data:`，
+  // curl 抓 HTML 能看到该标签 —— 但**浏览器里就是不显示**。
+  //
+  // 🔴 真因：`/favicon.ico` 这一路由原先显式返回 **204 No Content**。
+  // 浏览器对每个页面都会**额外**请求 `/favicon.ico`（即使写了 `<link>`），
+  // 拿到 204 就认定「本站图标是空的」，于是**无视** HTML 里的 `<link>`。
+  //
+  // ⚠️ 这个坑用 curl 抓 HTML 完全看不出来 —— 决定权在浏览器那次额外请求上。
+  //   所以必须有断言，否则下次有人「优化」成 204 又会静默坏掉。
+  const { FAVICON_DATA_URI } = await import('../src/panel/index.ts')
+
   for (const p of ['/panel/', '/login']) {
     const html = panelAsset(p)?.body ?? ''
-    assert.ok(html.includes('rel="icon"'), `⚠️ ${p} 必须有 favicon（否则浏览器静默不显示）`)
-    assert.ok(html.includes('data:image/svg+xml'), `⚠️ ${p} 的图标应为内联 SVG`)
-    // ⚠️ 必须声明圆角方块 + 品牌色，否则会退化成「白底透明图形」看不清
-    assert.ok(html.includes('%230071E3'), `⚠️ ${p} 的图标应带品牌色 #0071E3`)
+    assert.ok(html.includes('rel="icon"'), `⚠️ ${p} 必须有 favicon`)
+    // ⚠️ Base64 而非百分号编码：后者遇空格/单引号会被部分浏览器截断
+    assert.ok(html.includes('data:image/svg+xml;base64,'),
+      `⚠️ ${p} 的图标应为 Base64 内联 SVG`)
+    assert.ok(html.includes(FAVICON_DATA_URI),
+      `⚠️ ${p} 的 href 必须与 FAVICON_DATA_URI 逐字一致（两处各写一份必然漂移）`)
   }
 
-  // ⚠️ CSP：`img-src` 必须允许 `data:`，否则图标**静默失效**
-  //（浏览器不报错、控制台只有一条 CSP 违规，用户只看到「没图标」）。
+  // 常量本身必须能还原成合法 SVG（防止手改 Base64 改坏）
+  const svg = Buffer.from(FAVICON_DATA_URI.split(',')[1], 'base64').toString('utf8')
+  assert.ok(svg.startsWith('<svg') && svg.endsWith('</svg>'), '图标 Base64 应能还原成 SVG')
+  assert.ok(svg.includes('#0071E3'), '图标应带品牌色')
+
+  // /favicon.ico 必须返回 200 + SVG 类型
+  const idxSrc = readFileSync('src/index.ts', 'utf8')
+  const i = idxSrc.indexOf("path === '/favicon.ico'")
+  const block = idxSrc.slice(i, i + 700)
+  assert.ok(/status:\s*200/.test(block), '⚠️ /favicon.ico 应返回 200')
+  assert.ok(/image\/svg\+xml/.test(block), '⚠️ content-type 应为 image/svg+xml')
+
+  // CSP：`img-src` 必须允许 `data:`，否则图标**静默失效**
+  //（浏览器不报错，控制台只有一条 CSP 违规，用户只看到「没图标」）。
   for (const csp of [CSP, CSP_LOGIN]) {
-    assert.ok(/img-src[^;]*\bdata:/.test(csp), '⚠️ CSP 的 img-src 必须允许 data:（否则 favicon 被拦）')
+    assert.ok(/img-src[^;]*\bdata:/.test(csp), '⚠️ CSP 的 img-src 必须允许 data:')
   }
 })
