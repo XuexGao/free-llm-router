@@ -903,7 +903,26 @@ function cleanupToolPairing(messages: unknown[]): unknown[] {
  * 读取就会消费流。错误帧交给网关的 `detectErrorFrame` 处理
  * （它已认 OpenAI 标准 `{error:{...}}` 形态，`gateway/stream.ts:78-85`）。
  */
-async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
+async function chat(
+  credential: ProviderCredential,
+  request: ChatRequest,
+  /**
+   * 是否已经为 IAM 确认重试过一次。
+   *
+   * ## 🔴 必须显式传递（真实缺陷，2026-11-27）
+   *
+   * 原实现命中 `IAM_CONFIRM_REQUIRED` 后 `return await chat(credential, request)`
+   * —— **没有上限**。若账号真处于「需人工去网页签协议」状态（服务端持续回
+   * 同一码），就是**无界递归**：实测桩里 500ms 内打满 501 次上游调用。
+   *
+   * 真实环境的上界由 Workers 子请求配额（50/次）兜底 —— 但那意味着
+   * **一次请求把配额烧光**，同一 invocation 里其它工作全部失败，
+   * 用户看到的是完全无关的错误。
+   *
+   * ⇒ 与同文件 `raccoonRequest` 那层保持一致：**只重试一次**。
+   */
+  iamRetried = false,
+): Promise<Response> {
   const body = prepareRaccoonBody(request.body, request.model)
 
   let response: Response
@@ -941,8 +960,19 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
     // ⚠️ 这里的判定只能看 **HTTP 状态 + 响应文本**（已经 `await text()` 了，
     // 没有信封对象）：400/403 + 文本里出现业务码即可。
     if (looksLikeIamConfirm(response.status, text)) {
-      await confirmRaccoonIam(credential, request.signal)
-      return await chat(credential, request)
+      if (!iamRetried) {
+        await confirmRaccoonIam(credential, request.signal)
+        return await chat(credential, request, true)
+      }
+      // 确认过了**仍然**回同一个码 ⇒ 这是账号级真故障（如需人工去网页签协议），
+      // 必须如实报出来并说清「下一步该做什么」，而不是继续重试。
+      throw new ProviderError({
+        provider: 'raccoon',
+        httpStatus: response.status,
+        message: 'Raccoon 已自动完成 IAM 确认，但上游仍要求确认 —— 这需要你本人'
+          + '登录 https://xiaohuanxiong.com 完成账号协议/实名确认，完成后即可恢复。'
+          + `（上游原文：${text.slice(0, 200) || '(空)'}）`,
+      })
     }
 
     throw new ProviderError({

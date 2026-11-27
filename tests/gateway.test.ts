@@ -1737,3 +1737,247 @@ test('⚠️ requestHasImage：只认 content 数组里的 image_url 部件', ()
   // ⚠️ 绝不按 URL 下载（本项目的 SSRF 红线）
   assert.ok(!/fetch\(/.test(seg), '⚠️ 不得按 URL 下载图片')
 })
+
+// ═══════════ 2026-11-27 代码审计发现的缺陷（子代理审计 + 逐条复现） ═══════════
+
+/** 剥注释后读源码（本项目注释会逐字引用反例，不剥会假命中）。 */
+function stripSrc(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+test('🔴 流式路径：客户端取消不得记账（判别算了却不用，比不算更糟）', () => {
+  // ## 真实缺陷（子代理审计 + 复现，2026-11-27）
+  //
+  // `streamResponse` 的 catch 里算出了 `const clientGone = hooks.clientGone?.() === true`，
+  // 但**只用于打日志**，紧接着无条件 `hooks.onError(msg)`。而全部 4 个调用点的
+  // `onError` 都是 `applyFailure({ kind: punishmentForStreamError(msg) })`，
+  // 对非 11128 一律 `'breaker'`。
+  //
+  // ⇒ **用户点「停止」/关标签页 3 次，就熔断一个完全健康的账号 30 分钟。**
+  //   症状正是本项目反复踩的「账号明明好的，却越来越用不了」。
+  //
+  // ⚠️ AGENTS §9.1b②d 声称已修，但那轮只修了 `nonStreamingResponse`，
+  //    流式这条**只加了判别、没加分支**。判别算了却不用，比不算更糟 ——
+  //    它会让人以为已经处理过了。
+  const src = stripSrc(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('const clientGone = hooks.clientGone?.() === true')
+  assert.ok(i > 0, '流式路径应算出 clientGone')
+  // 取这一段之后 600 字符（足以包住 onError 调用）
+  const block = src.slice(i, i + 600)
+  assert.ok(/if \(!clientGone\)/.test(block),
+    '🔴 onError 必须在 `if (!clientGone)` 里 —— 否则用户取消会熔断健康账号')
+  // ⚠️ 判据：`hooks.onError(msg)` 的**第一次**出现必须在 `if (!clientGone)` 之**后**。
+  // （我第一版写成「把 if 行删掉再看有没有裸 onError」，那是错的 ——
+  //   删掉条件行后剩下的正是受保护的调用，必然命中，断言永远红。）
+  const guard = block.indexOf('if (!clientGone)')
+  const firstOnError = block.indexOf('hooks.onError(msg)')
+  assert.ok(firstOnError > guard,
+    '⚠️ onError 只能出现在 `if (!clientGone)` 之后（之前出现即为无条件调用）')
+})
+
+test('🔴 抛错型 provider 的失败必须记账（12 家的冷却/熔断此前完全失效）', () => {
+  // ## 真实缺陷（子代理审计 + 复现）
+  //
+  // 除 opencode 外，cline/minimax/codearts/lobsterai/trae/qoder/qodercn/raccoon/
+  // zcode/loomy/gemini/minimaxintl 的 `chat()` 在非 2xx 时**抛 ProviderError**
+  //（不走 `!upstream.ok` 分支）。而那个 catch 分支此前**只有**
+  // `lastError = …; continue` —— 全程没有 `applyFailure`。
+  //
+  // ⇒ 这 12 家的 429 不写冷却、402 不硬冷却、5xx 不熔断，`errTotal` **恒为 0**：
+  //   面板「错误数」永远 0、账号永远显示健康，但请求一直失败。
+  //   AGENTS §9.7 说的「记账失效是静默的」正是这个形态。
+  const src = stripSrc(readFileSync('src/gateway/server.ts', 'utf8'))
+  // ⚠️ 锚点必须是**唯一**的那一行。`upstream = await provider.chat(` 在文件里
+  // 出现多次（续期重试里也有一处），用它 indexOf 会切到错误的 catch ——
+  // 我第一版就这么切错了，断言红得莫名其妙。
+  const anchorIdx = src.indexOf('const { kind } = classify(status, message)')
+  assert.ok(anchorIdx > 0, 'catch 分支应有 classify(状态码, 消息)')
+  const catchBlock = src.slice(Math.max(0, anchorIdx - 600), anchorIdx + 900)
+  // ⚠️⚠️ 断言必须锚到**我新增的那段**（`const mapped = mapErrorToPunishment`）。
+  //
+  // 我第一版只断言「catchBlock 里出现 applyFailure」—— 反向验证时把新增段
+  // 的 `if (mapped.punish)` 改成 `if (false)`，测试**仍然全绿**：
+  // 因为 catch 里本来就有**续期重试**分支的 `applyFailure`（那是 onError 回调
+  // 里的，与失败记账无关）。典型的「断言了但没检查对地方」。
+  //
+  // ⇒ 改为要求：catch 里必须**自己**做 classify → applyFailure，
+  //   且带客户端取消判别。
+  assert.ok(/const \{ kind \} = classify\(status, message\)/.test(catchBlock),
+    '🔴 catch 分支必须自己调 classify(状态码, 消息)')
+  assert.ok(/const mapped = mapErrorToPunishment\(kind\)/.test(catchBlock),
+    '🔴 catch 分支必须 mapErrorToPunishment')
+  assert.ok(/if \(mapped\.punish\) \{\s*\n\s*const t = pool\s*\n\s*\.applyFailure/.test(catchBlock),
+    '🔴 必须据 mapped.punish 真正落 applyFailure（不是别处的回调）')
+  assert.ok(/request\.signal\.aborted/.test(catchBlock),
+    '⚠️ catch 里必须排除「客户端取消」—— 否则用户停止会换号 + 冤枉记账')
+})
+
+test('🔴 provider 路径的错误分类必须走 classify，不能只看状态码', () => {
+  // ## 真实缺陷（子代理审计 + 复现）
+  //
+  // 原实现是三元式：`402→hard / 429→细分 / **其余一律 breaker**`。
+  // ⇒ 400/401/403/404/422 全被当成「账号坏了」而熔断，其中包括
+  // AGENTS §6.7 明令**不罚号**的两类：
+  //   · `11115` 上下文超限、`11135` 图片无效（客户端请求的问题，换号也不变好）
+  //   · 400 参数错误（如 `temperature out of range`）
+  //
+  // ⚠️ 子代理实测：opencode 回 `400 invalid parameter` → 也吃了 breaker。
+  const src = stripSrc(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('const failureKind')
+  assert.ok(i > 0, '应有 failureKind 判定')
+  // ⚠️ 窗口必须**向前**扩：`classify(...)` 与 `providerMapped = ...` 都在
+  // `const failureKind` **之前**。只向后切会看不到它们，断言永远红
+  //（我第一版就是只切了 i..i+1200，白跑一轮）。
+  const block = src.slice(Math.max(0, i - 1600), i + 1200)
+  assert.ok(/mapErrorToPunishment|classify\(/.test(block),
+    '🔴 必须用 classify/mapErrorToPunishment，不能只用裸状态码三元式')
+  assert.ok(/providerMapped\.punish === false/.test(block),
+    '⚠️ 必须对「不该罚号」的类别直接跳过 applyFailure')
+
+  // ⚠️⚠️ **断言必须落到「实际用了哪个值」上**。
+  //
+  // 我第一版只查「block 里有没有 classify」—— 反向验证时把
+  // `providerMapped.dimension` 改回 `'breaker'`，测试**仍然全绿**
+  // （因为 classify 与 providerMapped 的赋值还在，只是结果没被用上）。
+  // 这就是典型的「断言了但没检查行为」。
+  //
+  // ⇒ 直接检查三元式的最后一个分支**不是**裸字符串 'breaker'。
+  const tail = block.slice(i - Math.max(0, i - 1600))
+  assert.ok(!/\?\s*'breaker'\s*\n\s*if \(providerMapped/.test(src.slice(i, i + 400)),
+    "🔴 分类的兜底分支不得写死 'breaker'（必须用 providerMapped.dimension）")
+  assert.ok(/providerMapped\.dimension/.test(src.slice(i, i + 400)),
+    '🔴 failureKind 的实际取值必须来自 providerMapped.dimension')
+})
+
+test('🔴 /v1/responses 与 /v1/messages 也必须有空响应兜底', () => {
+  // ## 真实缺陷（子代理实测）
+  //
+  // 两个适配器自己 `aggregateSse` 后直接 `Response.json(...)`，
+  // **没有** chat 路径那套「无内容 ⇒ 报 502」的兜底。
+  // 上游回 `200 + 流内错误帧` 时：
+  //   · `/v1/responses` → `200 status:"completed"`、`output[0].content[0].text == ""`
+  //   · `/v1/messages`  → `200 content: []`、`stop_reason:"end_turn"`
+  // ⇒ **把一次失败伪装成成功**（AGENTS：空回复比报错更糟）。
+  for (const f of ['src/gateway/responses.ts', 'src/gateway/messages.ts']) {
+    const src = stripSrc(readFileSync(f, 'utf8'))
+    assert.ok(/findUpstreamError\(raw\)/.test(src),
+      `🔴 ${f} 必须用 findUpstreamError 检查上游错误帧`)
+    assert.ok(/isContentless\(/.test(src),
+      `🔴 ${f} 必须有「无内容 ⇒ 报错」的兜底`)
+    // 兜底必须**早于**成功返回
+    const fallback = src.indexOf('isContentless(')
+    const okReturn = src.indexOf('Response.json(to', fallback)
+    assert.ok(okReturn > fallback,
+      `⚠️ ${f} 的兜底必须排在成功返回之前`)
+  }
+})
+
+test('🔴 content_block index 必须单调递增（并行工具调用会撞车）', () => {
+  // ## 真实缺陷（子代理实测）
+  //
+  // 原实现 `toolIndex = Math.max(textIndex, 0) + 1` 从文本块下标**反推**工具块下标：
+  // ① 两个并行 tool_use 都拿 index 1；② 工具后再出正文时又撞上工具块。
+  //
+  // ⚠️ Claude Code 按 index 维护块数组，同 index 会覆盖 ⇒ 工具参数错乱/工具名丢失。
+  //    而工具调用是 agent 场景的**主路径**。
+  const src = stripSrc(readFileSync('src/gateway/messages.ts', 'utf8'))
+  assert.ok(/let nextBlockIndex = 0/.test(src), '应有单调分配器')
+  assert.ok(/toolIndex = nextBlockIndex/.test(src), '⚠️ 工具块应取 nextBlockIndex')
+  assert.ok(/textIndex = nextBlockIndex/.test(src), '⚠️ 文本块也应取 nextBlockIndex')
+  assert.ok(!/toolIndex = Math\.max\(textIndex, 0\) \+ 1/.test(src),
+    '🔴 不得再从 textIndex 反推（那正是撞车的原因）')
+})
+
+test('🔴 Responses 流式必须用**持久** TextDecoder（中文会被切坏）', () => {
+  // ## 真实缺陷（子代理实测）：把「你好世界」首字节切开 ⇒ 输出 `�好世界`
+  //
+  // 原写法每个 chunk 都 `new TextDecoder().decode(chunk, {stream:true})`
+  // —— 新建的 decoder 没有上一块的残留字节，`stream:true` 等于没用。
+  //
+  // ⚠️ 这是**偶发**的：短回答往往一个 chunk 就完事，长中文才会切到字符中间，
+  //    所以极易漏测。同项目的 `messages.ts` 用的是持久 decoder（两种写法）。
+  const src = stripSrc(readFileSync('src/gateway/responses.ts', 'utf8'))
+  const transformIdx = src.indexOf('transform(chunk')
+  assert.ok(transformIdx > 0, '应有 transform')
+  const inTransform = src.slice(transformIdx, transformIdx + 400)
+  assert.ok(!/new TextDecoder\(\)/.test(inTransform),
+    '🔴 transform 内不得新建 TextDecoder（会让 stream:true 失效）')
+  assert.ok(/decoder\.decode\(chunk/.test(inTransform), '⚠️ 应复用外层 decoder')
+
+  // 行为验证：真跑一遍，确认多字节不会被切坏
+  return import('../src/gateway/responses.ts').then((m) => {
+    // 逐个字节喂一段中文 SSE，检查正文有没有 U+FFFD
+    const frames = ['data: {"choices":[{"delta":{"content":"你好世界"}}]}\n\n', 'data: [DONE]\n\n'].join('')
+    const bytes = new TextEncoder().encode(frames)
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const b of bytes) controller.enqueue(new Uint8Array([b])) // 逐字节
+        controller.close()
+      },
+    })
+    return new Response(m.toResponsesSse(stream, 'test-model', 'resp_1'))
+      .text()
+      .then((out) => {
+        assert.ok(!out.includes('\uFFFD'), '🔴 逐字节喂入中文不得产生替换字符（U+FFFD）')
+        assert.ok(out.includes('你好世界'), '正文应完整保留')
+      })
+  })
+})
+
+test('🔴 raccoon 对话的 IAM 自愈必须有重试上限（否则无界递归）', () => {
+  // ## 真实缺陷（子代理实测：桩里 500ms 内打满 **501 次**上游调用）
+  //
+  // 原实现命中 `IAM_CONFIRM_REQUIRED` 后 `return await chat(credential, request)`
+  // —— 没有上限。若账号真处于「需人工去网页签协议」状态（服务端持续回同一码），
+  // 就是无界递归。真实环境上界由 Workers 子请求配额（50/次）兜底 ——
+  // 但那意味着一次请求把配额烧光，同一 invocation 里其它工作全失败。
+  //
+  // ⚠️ 同文件 `raccoonRequest` 那层明写「只重试**一次**」，对话这层漏了 ——
+  //    又是「同一约束只落实一半」。
+  const src = stripSrc(readFileSync('src/providers/raccoon.ts', 'utf8'))
+  assert.ok(/iamRetried/.test(src), '应有 iamRetried 标记')
+  assert.ok(/chat\(credential, request, true\)/.test(src),
+    '⚠️ 重试时必须带上「已重试」标记')
+  assert.ok(/if \(!iamRetried\)/.test(src), '🔴 重试必须受 iamRetried 约束')
+})
+
+test('🔴 主成功路径必须绑会话（否则会话粘性从未生效）', () => {
+  // ## 真实缺陷（子代理审计 + 复现）
+  //
+  // `bindSession` 此前只出现在两个**续期重试**分支里。正常请求（不发生 401 重试）
+  // 永远走不到 ⇒ `getSession` 恒空、`bindSession` 从不发生
+  // ⇒ 「同一会话优先落同一账号」从未生效，上游 prompt cache 收益为 0。
+  //
+  // ⚠️ 原有单测断言「binds >= 2」恰好被那两个重试分支满足，
+  //    分辨不出主路径缺绑定 —— 典型**假通过**。
+  const src = stripSrc(readFileSync('src/gateway/server.ts', 'utf8'))
+  const binds = (src.match(/bindSession\(/g) ?? []).length
+  assert.ok(binds >= 3, `应有至少 3 处 bindSession（主路径 + 2 个重试分支），实得 ${binds}`)
+  // ⚠️ 锚点必须是「**直接** streamResponse(upstream.body」那一处 ——
+  // `if (upstream.body === null)` 在文件里出现多次，`indexOf` 会命中
+  // 别的分支（我第一次就切错了窗口，断言红得莫名其妙）。
+  const anchor = 'response: await streamResponse(upstream.body, {'
+  const i = src.indexOf(anchor)
+  assert.ok(i > 0, '应能找到主成功路径的 streamResponse')
+  // ⚠️ 窗口要够长：这段有**很长的说明注释**（记录缺陷来由），
+  // 1400 字符切不到 `bindSession` 那一行，断言会假红。
+  // 取到下一个 `onError:` 为止更稳（onFirstChunk 与 onError 之间就是全部内容）。
+  const end = src.indexOf('onError:', i)
+  assert.ok(end > i, '主路径应有 onError 回调（用作窗口右界）')
+  const mainReturn = src.slice(i, end)
+  assert.ok(/bindSession\(/.test(mainReturn),
+    '🔴 主成功路径的 onFirstChunk 必须 bindSession')
+})
+
+test('⚠️ 鉴权失败判据只能有一份实现（两处正则分叉已修过一次）', () => {
+  // ⚠️ `index.ts` 的 `withRefreshRetry` 曾有一份**独立的**旧正则
+  //（`invalid.?token`），而 `server.ts` 早已改成能匹配 `invalid access token`
+  // 的新版。分叉后果：minimax 令牌过期时 `/v1/models` 不续期 ⇒ 该家模型整批消失。
+  //
+  // 这是「同一个 bug 只修一半」的第 3 次（前两次：clientGone、SSE 前缀解析）。
+  const idx = stripSrc(readFileSync('src/index.ts', 'utf8'))
+  assert.ok(/isAuthLikeFailure/.test(idx),
+    '🔴 index.ts 必须复用 isAuthLikeFailure，不得另写正则')
+  assert.ok(!/invalid\.\?token/.test(idx),
+    '🔴 不得保留旧的 `invalid.?token` 正则（它匹配不上 `invalid access token`）')
+})

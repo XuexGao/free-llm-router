@@ -53,7 +53,7 @@
  *    且 parse 失败时**不能抛**（那会让整轮对话失败）。
  */
 
-import { aggregateSse, sseHeaders, type AggregatedCompletion } from './stream.js'
+import { aggregateSse, findUpstreamError, isContentless, sseHeaders, type AggregatedCompletion } from './stream.js'
 import { handleChatCompletions } from './server.js'
 import { jsonError, readJsonCapped } from './http.js'
 import { resolveMaxRequestBytes, type Env } from '../env.js'
@@ -549,6 +549,23 @@ export function toAnthropicSse(
   let buffer = ''
 
   let started = false
+  /**
+   * **块序号单调分配器**。
+   *
+   * ## 🔴 为什么必须单调（真实缺陷，2026-11-27）
+   *
+   * 原实现用 `toolIndex = Math.max(textIndex, 0) + 1` 从文本块下标**反推**
+   * 工具块下标，于是出现两类撞车：
+   *
+   * 1. **两个并行工具调用都拿 index 1**（`textIndex` 在两个工具之间没变）；
+   * 2. **工具后再出正文**时 `textIndex += 1` 得到 1，又撞上工具块。
+   *
+   * ⚠️ 后果很严重：Claude Code 按 `index` 维护块数组，同 index 会覆盖 ——
+   * 表现为工具参数错乱或工具名丢失。而工具调用是 agent 场景的**主路径**。
+   *
+   * ⇒ 改成单一递增分配器：谁开新块谁取下一个号，永不重号。
+   */
+  let nextBlockIndex = 0
   // 当前打开的块（`index` / 类型 / 已发过多少文本）
   let textIndex = -1
   let textOpen = false
@@ -665,7 +682,8 @@ export function toAnthropicSse(
               if (piece !== '') {
                 if (!textOpen) {
                   closeText(controller)
-                  textIndex += 1
+                  textIndex = nextBlockIndex
+                  nextBlockIndex += 1
                   textOpen = true
                   emit(controller, 'content_block_start', {
                     type: 'content_block_start',
@@ -695,7 +713,9 @@ export function toAnthropicSse(
                     emit(controller, 'content_block_stop', { type: 'content_block_stop', index: toolIndex })
                   }
                   closeText(controller)
-                  toolIndex = Math.max(textIndex, 0) + 1
+                  // ⚠️ 取**下一个**序号，不从 textIndex 反推（见 nextBlockIndex 说明）
+                  toolIndex = nextBlockIndex
+                  nextBlockIndex += 1
                   toolOpen = true
                   sawToolUse = true
                   toolCallIndex += 1
@@ -869,6 +889,29 @@ export async function handleMessages(
   }
 
   const aggregated = aggregateSse(raw, { model, now: Date.now() })
+
+  // ## 🔴 上游错误必须显式报出，不能回一个「合法但空白」的 200（真实缺陷）
+  //
+  // 此前这里直接 `toAnthropicMessage(...)` 返回 —— 缺少 chat 路径那套兜底。
+  // 上游回 `200 + 流内错误帧` 时，客户端拿到的是
+  //   `200 content: []`、`stop_reason:"end_turn"`
+  // ⇒ Claude Code 会把它当成「模型什么也没说」，而**完全看不到真实原因**。
+  //
+  // 判据复用 `findUpstreamError` / `isContentless`（与 chat 路径同一份实现）。
+  const upstreamError = findUpstreamError(raw)
+  if (upstreamError !== undefined) {
+    return { response: anthropicErrorJson(`上游错误：${upstreamError}`, 502, 'api_error') }
+  }
+  if (isContentless(aggregated.choices[0])) {
+    return {
+      response: anthropicErrorJson(
+        `上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。`
+        + `上游原文片段：${raw.trim().slice(0, 300) || '(空)'}`,
+        502,
+        'api_error',
+      ),
+    }
+  }
   return {
     response: Response.json(toAnthropicMessage(model, aggregated, id), {
       headers: { 'cache-control': 'no-store' },

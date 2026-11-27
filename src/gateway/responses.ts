@@ -50,6 +50,7 @@
 
 import {
   aggregateSse, createFrameTranslator, detectErrorFrame, parseSseLine,
+  findUpstreamError, isContentless,
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
@@ -532,6 +533,9 @@ export function toResponsesSse(
 
   // ⚠️ 有状态：跨 chunk 保留未完成的帧与已开启的输出项。
   let buffer = ''
+  // ⚠️ decoder 必须**在 transform 外建一次**：见 transform 里的说明
+  //（每块新建会让 `stream:true` 失效 ⇒ 中文被切坏成 U+FFFD）。
+  const decoder = new TextDecoder()
   const items: Item[] = []
   // 当前"打开中"的项 —— 正文与推理各一个（上游可能先出推理再出正文）。
   let msgItem: Item | undefined
@@ -767,7 +771,16 @@ export function toResponsesSse(
         controller.enqueue(encoder.encode(emit('response.in_progress', { response: snapshot('in_progress') })))
       },
       transform(chunk, controller) {
-        buffer += new TextDecoder().decode(chunk, { stream: true })
+        // ⚠️ decoder **必须只建一次**（真实缺陷，2026-11-27）。
+        //
+        // 原写法是每次 `transform` 都 `new TextDecoder().decode(chunk, {stream:true})`
+        // —— 新建的 decoder 没有上一块的残留字节，`stream:true` 等于没用。
+        // 多字节字符（中文/emoji）被切在分片中间时会变成 U+FFFD（乱码）。
+        //
+        // ⚠️ 这是**偶发**的：短回答往往一个 chunk 就完了，长文本才会切到字符中间，
+        // 所以极易漏测。同一项目的 `messages.ts` 用的是持久 decoder —— 又是
+        // 「同一个问题两种写法」。
+        buffer += decoder.decode(chunk, { stream: true })
         let nl = buffer.indexOf('\n')
         while (nl >= 0) {
           const line = buffer.slice(0, nl)
@@ -933,6 +946,31 @@ export async function handleResponses(
   }
 
   const aggregated = aggregateSse(raw, { model, now: Date.now() })
+
+  // ## 🔴 上游错误必须显式报出，不能回一个「合法但空白」的 200（真实缺陷）
+  //
+  // 此前这里直接 `toResponsesObject(...)` 就返回了 —— 缺少 chat 路径那套
+  // 「没内容就报错」的兜底。于是上游回 `200 + 流内错误帧`时，客户端拿到的是
+  //   `200 status:"completed"`、`output[0].content[0].text == ""`
+  // 即**把一次失败伪装成成功**（AGENTS：空回复比报错更糟）。
+  //
+  // 判据复用 `findUpstreamError` / `isContentless`（与 chat 路径同一份实现，
+  // 避免「同一个 bug 只修一半」）。工具调用不算空 —— 只调用工具时 content 也是 ''。
+  const upstreamError = findUpstreamError(raw)
+  if (upstreamError !== undefined) {
+    return { response: errorJson(`上游错误：${upstreamError}`, 502) }
+  }
+  if (isContentless(aggregated.choices[0])) {
+    // ⚠️ 附上原文片段：用户要能看出「上游到底回了什么」，
+    // 否则只能看到「空响应」三个字，无从判断是限流、风控还是模型名写错。
+    return {
+      response: errorJson(
+        `上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。`
+        + `上游原文片段：${raw.trim().slice(0, 300) || '(空)'}`,
+        502,
+      ),
+    }
+  }
   return {
     response: Response.json(toResponsesObject(body, model, aggregated, responseId), {
       headers: { 'cache-control': 'no-store' },

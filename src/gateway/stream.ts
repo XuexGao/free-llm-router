@@ -688,3 +688,87 @@ export function aggregateSse(
   if (result.id === '') result.id = `chatcmpl-${Math.random().toString(36).slice(2, 15)}`
   return result
 }
+
+/**
+ * 从**已读完的**原始 SSE 文本里找出上游的真实错误。
+ *
+ * ## 🔴 为什么要抽成公共函数（真实缺陷，2026-11-27）
+ *
+ * 这段逻辑原先**只存在于** `server.ts` 的 chat 非流式路径里。而
+ * `/v1/responses` 与 `/v1/messages` 两个新适配器各自 `aggregateSse` 后
+ * 直接 `Response.json(...)` —— **没有**这套兜底。
+ *
+ * 后果：上游回 `200 + 流内错误帧` 时，两个端点给客户端的是
+ * **合法但完全空白**的结果：
+ * - `/v1/responses` → `200 status:"completed"`、`output[0].content[0].text == ""`
+ * - `/v1/messages`  → `200 content: []`、`stop_reason:"end_turn"`
+ *
+ * ⚠️ 这正是 AGENTS 反复强调的「**空回复比报错更糟**」：用户以为模型不行，
+ * 实际是上游拒绝了这次请求，而真实原因被完整吞掉。
+ *
+ * ## 判据要点（都是踩过的坑）
+ *
+ * 1. **整包裸 JSON** 也要认：某些上游（CodeArts 经华为 APIG）在 HTTP 200 下
+ *    直接回裸 JSON 错误体，没有任何 `data:` 前缀；
+ * 2. **必须用 `parseSseLine`**，不能自己 `startsWith('data: ')` ——
+ *    上游存在 `data:{...}`（**无空格**）形态，手写判断会漏；
+ * 3. 找不到任何错误帧时返回 `undefined`，由**调用方**决定兜底文案
+ *    （调用方更清楚这个端点的语义）。
+ *
+ * @param raw 完整的响应原文
+ * @returns 上游错误文案；没有可识别的错误帧时 `undefined`
+ */
+export function findUpstreamError(raw: string): string | undefined {
+  // ① 整包就是一个 JSON 对象/数组（没有 SSE 前缀）
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const whole = JSON.parse(trimmed) as Record<string, unknown>
+      const wholeErr = detectErrorFrame(whole)
+      if (wholeErr !== undefined) return wholeErr
+    } catch {
+      // 不是合法 JSON：交给下面的逐帧扫描
+    }
+  }
+
+  // ② 逐行扫 SSE 帧
+  for (const line of raw.split('\n')) {
+    const frame = parseSseLine(line)
+    if (frame.kind === 'error' && typeof frame.error === 'string') return frame.error
+    if (frame.kind !== 'chunk' || typeof frame.data !== 'string') continue
+    try {
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>
+      const err = detectErrorFrame(parsed)
+      if (err !== undefined) return err
+    } catch {
+      // 非 JSON 帧，继续找
+    }
+  }
+  return undefined
+}
+
+/**
+ * 判定一次聚合结果是否属于「**没有任何内容**」。
+ *
+ * ⚠️ 三条纪律（都踩过）：
+ * 1. 判据**只看有没有内容**，`usage` 不参与 —— `usage` 只说明「上游计了费」，
+ *    与「有没有产出」无关，而「消耗了 token 却没内容」恰恰最该报错；
+ * 2. **必须排除工具调用**：只调用工具时 `content` 也是 `''`，
+ *    把它判成空响应是**假阳性**，而工具调用是 agent 场景的主路径；
+ * 3. 思考内容（`reasoning_content`）也算内容 —— 只有思考没有正文时，
+ *    用户至少看到模型在推理，不该报「空响应」。
+ */
+export function isContentless(choice: {
+  message?: { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown }
+} | undefined): boolean {
+  if (choice === undefined) return true
+  const message = choice.message
+  if (message === undefined) return true
+  const content = typeof message.content === 'string' ? message.content : ''
+  if (content !== '') return false
+  const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : ''
+  if (reasoning !== '') return false
+  const toolCalls = message.tool_calls
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false
+  return true
+}

@@ -690,6 +690,18 @@ export async function handleChatCompletions(
           const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(okTask)
           else void okTask
+          // ## 🔴 主成功路径**必须**绑定会话（真实缺陷，2026-11-27）
+          //
+          // `bindSession` 此前只出现在两个「续期重试」分支里，正常请求
+          //（不发生 401 重试）永远走不到 ⇒ `getSession` 恒空
+          // ⇒「同一会话优先落同一账号」从未生效，上游 prompt cache 收益为 0。
+          //
+          // ⚠️ 这处（buddy/workbuddy 专用路径）与下方 provider 路径**两条**都要绑 ——
+          // 我第一版只补了 provider 那条，又被自己的测试抓了出来
+          //（断言锚点命中的正是这条）。
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, candidate.uid, Date.now()).catch(() => {}))
+          }
         },
         onFinish: (usage) => {
           // 记账用量（面板的「用量」视图靠它）
@@ -893,7 +905,22 @@ function streamResponse(
           `[stream] aborted clientGone=${clientGone} frames=${frameSeq}` +
             ` ms=${Date.now() - streamStartedAt} err=${msg.slice(0, 160)}`,
         )
-        hooks.onError(msg)
+        // ## 🔴 「客户端取消」绝不能记成账号失败（真实缺陷，2026-11-27）
+        //
+        // 这里**曾经**算出 `clientGone` 却只用来打日志，紧接着无条件
+        // `hooks.onError(msg)` —— 而全部 4 个调用点的 `onError` 都是
+        // `applyFailure({ kind: punishmentForStreamError(msg) })`，
+        // 对非 11128 一律返回 `'breaker'`。
+        //
+        // ⇒ **用户点「停止」/关标签页 3 次，就熔断一个完全健康的账号 30 分钟**。
+        //   症状正是本项目反复踩到的那个：「账号明明好的，却越来越用不了」。
+        //
+        // ⚠️ 这正是 AGENTS §9.1b②d 声称已修的缺陷 —— 那轮只修了
+        // `nonStreamingResponse`，流式这条**只加了判别、没加分支**。
+        // 判别算了却不用，比不算更糟：它会让人以为已经处理过了。
+        if (!clientGone) {
+          hooks.onError(msg)
+        }
         hooks.onFinish?.(undefined)
         controller.enqueue(encoder.encode(errorFrame(msg)))
         controller.enqueue(encoder.encode(doneFrame()))
@@ -1099,6 +1126,48 @@ async function handleProviderChat(input: {
         }
       }
 
+      // ## 🔴 抛错型 provider 的失败**必须记账**（真实缺陷，2026-11-27）
+      //
+      // 除 opencode 外，cline/minimax/codearts/lobsterai/trae/qoder/qodercn/
+      // raccoon/zcode/loomy/gemini/minimaxintl 的 `chat()` 在非 2xx 时**抛
+      // `ProviderError`**（不走下面的 `!upstream.ok` 分支）。
+      //
+      // 而这个 catch 分支此前**只有** `lastError = …; continue` ——
+      // 全程没有 `applyFailure`。后果是这 12 家的 429 不写冷却、402 不硬冷却、
+      // 5xx 不熔断，`errTotal` **恒为 0**：面板上「错误数」永远是 0、账号永远
+      // 显示「健康」，但请求一直失败。
+      //
+      // ⚠️ 这正是 AGENTS §9.7 说的「记账失效是静默的」：用户看不出任何异常。
+      //
+      // ⚠️ **客户端取消不能记成账号失败**：qoder/zcode/gemini 会把
+      // 「请求已被客户端取消」原样抛进来。若不排除，用户点一次停止就换一个号
+      // （客户端都走了还在打 3 个号），而且记账也会冤枉健康账号。
+      const clientGone = request.signal.aborted
+      if (clientGone) {
+        lastError = { status: 499, message: '请求已被客户端取消（连接已断开）' }
+        continue
+      }
+
+      // 分类：优先用 `ProviderError.httpStatus`（它已经带上了上游状态码），
+      // 没有状态码时按 0 交给 `classify`（它会归为 network）。
+      // `ProviderError` 带 `httpStatus`（上游状态码）；其它异常按 0 走 network。
+      const status = error instanceof Error && 'httpStatus' in error
+        ? (error as { httpStatus: number }).httpStatus
+        : 0
+      const { kind } = classify(status, message)
+      const mapped = mapErrorToPunishment(kind)
+      if (mapped.punish) {
+        const t = pool
+          .applyFailure({
+            uid: picked.uid,
+            kind: mapped.dimension,
+            now: Date.now(),
+            reason: `${providerId}: ${message}`.slice(0, 200),
+          })
+          .catch(() => {})
+        if (ctx !== undefined) ctx.waitUntil(t)
+      }
+
       lastError = { status: 502, message }
       // 传输层失败：换号可能有用（也可能是本地出口抖动）
       continue
@@ -1231,12 +1300,31 @@ async function handleProviderChat(input: {
         : undefined
       const resolvedResetAt = refined.resetAt
         ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
-      const failureKind: 'soft' | 'hard' | 'model' | 'breaker' =
+      // ## 🔴 分类必须走 `classify`，不能只看状态码（真实缺陷，2026-11-27）
+      //
+      // 原实现是三元式：402→hard、429→细分、**其余一律 breaker**。
+      // ⇒ 400/401/403/404/422 全被当成「账号坏了」而熔断，其中包括：
+      //   · `11115` 上下文超限、`11135` 图片无效 —— AGENTS §6.7 明令**不罚号**
+      //     （那是客户端请求的问题，换号也不会变好，罚号只是让健康号变少）；
+      //   · 400 参数错误（如 `temperature out of range`）—— 纯客户端问题；
+      //   · 401 鉴权失败 —— 该走续期/重新登录，不该熔断。
+      //
+      // ⇒ 复用 buddy 路径的同一套 `classify` + `mapErrorToPunishment`，
+      //   两条路径口径必须一致（此前只改了 buddy 路径，又是「修一半」）。
+      const { kind: providerKind } = classify(upstream.status, text)
+      const providerMapped = mapErrorToPunishment(providerKind)
+      const failureKind: 'soft' | 'hard' | 'model' | 'breaker' | 'degrade' | 'session_dead' =
         upstream.status === 402
           ? 'hard'
           : upstream.status === 429
             ? refined.dimension
-            : 'breaker'
+            : providerMapped.dimension
+      // ⚠️ `punish === false`（如上下文超限 / 图片无效）⇒ **完全不罚号**，
+      // 但仍要换号（换一个号可能上下文预算更大）。
+      if (providerMapped.punish === false) {
+        lastError = { status: clientStatusFor(upstream.status, providerKind), message: text.slice(0, 300) }
+        continue
+      }
       await pool
         .applyFailure({
           uid: picked.uid,
@@ -1279,6 +1367,19 @@ async function handleProviderChat(input: {
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
+          // ## 🔴 主成功路径**必须**绑定会话（真实缺陷，2026-11-27）
+          //
+          // 会话粘性此前**只在两个「续期重试」分支里**绑定（:1081 / :1193），
+          // 而正常请求（不发生 401 重试）永远走不到那两条 ——
+          // ⇒ `getSession` 恒空、`bindSession` 从不发生
+          // ⇒ 「同一会话优先落同一账号」从未生效，上游 prompt cache 收益为 0。
+          //
+          // ⚠️ AGENTS §9.14 记着「会话粘性 ✅ 已修」，实际只接了一半；
+          // 而原有的单测断言「binds >= 2」恰好被那两个重试分支满足，
+          // 分辨不出主路径缺绑定 —— 典型的**假通过**（已补更精确的断言）。
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+          }
         },
         onError: (message) => {
           const t = pool

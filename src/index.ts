@@ -87,7 +87,7 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleCountTokens, handleMessages } from './gateway/messages.js'
-import { handleChatCompletions } from './gateway/server.js'
+import { handleChatCompletions, isAuthLikeFailure } from './gateway/server.js'
 import {
   type AuthResult,
   type SubkeyContext,
@@ -350,10 +350,23 @@ async function withRefreshRetry<T>(
     //
     // 宁可偶尔多试一次续期（续期失败会走 catch 落回原错误），
     // 也不要漏掉真正的鉴权失败。
-    const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|\b401\b|\b403\b/i.test(
-      message,
-    )
-    if (!isAuth) throw error
+    // ## 🔴 必须复用 `isAuthLikeFailure`，不要在这里另写一份正则
+    //
+    // 这里原先是一份**独立的**旧正则：`invalid.?token` / `token.?expir`。
+    // 而 `gateway/server.ts` 的同名判据早已改成
+    // `invalid[\W_]+(?:\w+[\W_]+){0,2}?token`（因为 `.?` 漏掉了
+    // minimax 的 `invalid access token`）。
+    //
+    // ⇒ 两份判据分叉的后果：minimax 令牌过期时，**`/v1/models` 不会续期**
+    //   （只有对话路径靠 401 兜底才活）—— 目录里那一家的模型会整批消失，
+    //   用户以为「这家没模型了」。
+    //
+    // ⚠️ 这是本项目「同一个 bug 只修一半」的第 3 次（前两次见
+    // `clientGone` 与 SSE 前缀解析）。**同一条判据只能有一个实现。**
+    const status = error instanceof Error && 'httpStatus' in error
+      ? (error as { httpStatus: number }).httpStatus
+      : 0
+    if (!isAuthLikeFailure(status, message)) throw error
 
     const provider = findProvider(providerId)
     if (provider?.refresh === undefined) throw error
