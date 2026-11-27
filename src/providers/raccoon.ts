@@ -139,6 +139,47 @@ export const RACCOON_PHONE_CIPHER_SECRET = 'senseraccoon2023'
  */
 export const RACCOON_TOKEN_REFRESH_WINDOW_SECONDS = 300
 
+/**
+ * IAM 确认端点（**必须**在业务请求收到 `IAM_CONFIRM_REQUIRED` 后调用一次）。
+ *
+ * ## 🔴 这是「Raccoon 账号老是失效」的真正原因（2026-11-27 线上实测）
+ *
+ * 症状：账号在面板上一切正常（未停用、未冷却、`expiresAt` 还有 19 天），
+ * 但**所有**业务请求都回：
+ *
+ * ```
+ * HTTP 400 {"biz_code":"IAM_CONFIRM_REQUIRED","code":200901,
+ *           "message":"iam_confirm_required","details":"IAM confirmation required"}
+ * ```
+ *
+ * ⚠️ 关键判据：这**不是**凭据过期。对照实验（同一端点、同一响应形态）：
+ *
+ * | 请求 | 结果 |
+ * |---|---|
+ * | 真实 access_token | **400** `IAM_CONFIRM_REQUIRED` (200901) |
+ * | 明显伪造的 token | **401** `AUTH_AUTHORIZATION_VERIFY_FAILED` (200003) |
+ * | 空 token | **401** `AUTH_ACCESS_TOKEN_MISSING` (200001) |
+ *
+ * ⇒ token 本身**有效**（否则会是 401），只是这个 IAM 会话需要一次
+ * 「确认」动作。因此**续期、重新登录、换号全都治不好它**
+ * —— 那正是本缺陷反复出现、每次都被误判成「凭据又失效了」的原因。
+ *
+ * ## 解法只发一次 POST
+ *
+ * `POST {base}/api/web/auth/v1/iam/confirm`（body `{}`）→ `{"code":0,"message":"success"}`。
+ * 调用后**同一个 token 立刻恢复**：实测紧随其后的余额查询从 400 变 200
+ * 并返回真实积分（2854），对话也恢复正常。
+ *
+ * ⚠️ 端点形态已实测：`POST` 有效、`GET` 返回 404 —— 不要写成 GET。
+ * ⚠️ 确认是**幂等**的：对已确认的会话再发一次仍回 `code:0`，
+ * 故可以在错误路径上无条件补一次，无需先查状态（也没有可查的状态端点）。
+ */
+export const RACCOON_IAM_CONFIRM_PATH = '/api/web/auth/v1/iam/confirm'
+
+/** 触发 IAM 确认的业务错误码（`biz_code` 与 `code` 双判据）。 */
+export const RACCOON_IAM_CONFIRM_CODE = 200901
+export const RACCOON_IAM_CONFIRM_BIZ_CODE = 'IAM_CONFIRM_REQUIRED'
+
 /** 请求超时（毫秒）。 */
 export const RACCOON_REQUEST_TIMEOUT_MS = 60_000
 
@@ -284,6 +325,13 @@ interface RaccoonEnvelope {
   message: string
   details: string
   data: Record<string, unknown> | undefined
+  /**
+   * 业务错误码（如 `IAM_CONFIRM_REQUIRED` / `AUTH_ACCESS_TOKEN_MISSING`）。
+   *
+   * ⚠️ 必须保留：`code` 是数字，个别语义（尤其 IAM 确认）**只靠数字不够稳**
+   * —— 服务端同时下发两者，用字符串码做判据可读性也更好。
+   */
+  bizCode: string
 }
 
 /**
@@ -299,10 +347,11 @@ function parseEnvelope(payload: unknown, status: number): RaccoonEnvelope {
   const code = typeof record.code === 'number' ? record.code : (status >= 400 ? status : 0)
   const message = typeof record.message === 'string' ? record.message : ''
   const details = typeof record.details === 'string' ? record.details : ''
+  const bizCode = typeof record.biz_code === 'string' ? record.biz_code : ''
   const data = typeof record.data === 'object' && record.data !== null && !Array.isArray(record.data)
     ? record.data as Record<string, unknown>
     : undefined
-  return { code, message, details, data }
+  return { code, message, details, data, bizCode }
 }
 
 /** 把信封里的错误拼成一条可读信息（服务端文案优先）。 */
@@ -323,6 +372,32 @@ function isRetryableCode(code: number): boolean {
 
 /** 发一次带凭证的 JSON 请求并拆信封。 */
 async function raccoonRequest(
+  credential: ProviderCredential,
+  path: string,
+  init: { method: string; body?: string; platform?: string },
+  signal: AbortSignal,
+): Promise<RaccoonEnvelope> {
+  const envelope = await raccoonRequestOnce(credential, path, init, signal)
+
+  // ── 🔴 IAM 确认自愈（见 `RACCOON_IAM_CONFIRM_PATH`） ──
+  //
+  // 放在**最底层**而不是各个调用点，是因为 `IAM_CONFIRM_REQUIRED` 会命中
+  // **所有**业务端点（余额、对话、模型目录、领奖…）。放在调用点就意味着
+  // 「改一处漏三处」——本仓库已经吃过这个教训（`clientGone` 只修一个调用点那次）。
+  //
+  // ⚠️ 只重试**一次**：确认本身幂等，但若确认后仍回同一个码，说明是账号级
+  // 真故障（如用户需去网页端完成协议/实名），无限重试只会放大上游压力
+  // 并把真实原因埋掉。
+  if (isIamConfirmRequired(envelope)) {
+    await confirmRaccoonIam(credential, signal)
+    // 确认改的是**服务端会话状态**，token 不变 ⇒ 原样重发同一请求。
+    return await raccoonRequestOnce(credential, path, init, signal)
+  }
+  return envelope
+}
+
+/** 发**一次**业务请求（不做任何自愈，供 {@link raccoonRequest} 复用）。 */
+async function raccoonRequestOnce(
   credential: ProviderCredential,
   path: string,
   init: { method: string; body?: string; platform?: string },
@@ -356,6 +431,44 @@ async function raccoonRequest(
     })
   }
   return parseEnvelope(parsed, response.status)
+}
+
+/**
+ * 该信封是否表示「需要 IAM 确认」。
+ *
+ * 双判据（业务码 **或** 数字码）—— 服务端两个字段都下发，
+ * 任一命中即认，避免将来只改其中一个时判据失效。
+ */
+function isIamConfirmRequired(envelope: RaccoonEnvelope): boolean {
+  return envelope.bizCode === RACCOON_IAM_CONFIRM_BIZ_CODE
+    || envelope.code === RACCOON_IAM_CONFIRM_CODE
+}
+
+/**
+ * 发一次 IAM 确认。
+ *
+ * ⚠️ 失败时**不抛错**：确认只是「顺手自愈」的一步，真正的结果由**重发的业务请求**
+ * 决定。若这里抛错，调用方拿到的会是「确认失败」这种没什么信息量的错误，
+ * 而不是**业务请求的真实答复** —— 后者才是有诊断价值的那个。
+ */
+async function confirmRaccoonIam(credential: ProviderCredential, signal: AbortSignal): Promise<void> {
+  try {
+    const response = await fetch(`${RACCOON_API_BASE}${RACCOON_IAM_CONFIRM_PATH}`, {
+      method: 'POST',
+      headers: raccoonHeaders(credential),
+      body: '{}',
+      signal: AbortSignal.any([signal, AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)]),
+    })
+    const text = await response.text().catch(() => '')
+    console.log(
+      `[raccoon] IAM 确认：HTTP ${response.status} ${text.slice(0, 120)}`,
+    )
+  } catch (error) {
+    console.error(
+      '[raccoon] IAM 确认请求失败（不影响后续重试）：',
+      error instanceof Error ? error.message : String(error),
+    )
+  }
 }
 
 /** 发一次请求；信封 `code !== 0` 时抛 `ProviderError`。 */
@@ -803,6 +916,20 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
 
   if (!response.ok) {
     const text = await response.text().catch(() => '')
+
+    // ── 🔴 IAM 确认自愈（对话路径必须**单独**做一次） ──
+    //
+    // ⚠️ 这条路径**不经过** `raccoonRequest` —— 它自己发 fetch（要返回**原始流**，
+    // 不能整包读成 JSON，见上面的说明）。若只在 `raccoonRequest` 里做自愈，
+    // 对话就会成为唯一还坏着的端点 —— 正是本仓库反复踩的「同一个 bug 只修一半」。
+    //
+    // ⚠️ 这里的判定只能看 **HTTP 状态 + 响应文本**（已经 `await text()` 了，
+    // 没有信封对象）：400/403 + 文本里出现业务码即可。
+    if (looksLikeIamConfirm(response.status, text)) {
+      await confirmRaccoonIam(credential, request.signal)
+      return await chat(credential, request)
+    }
+
     throw new ProviderError({
       provider: 'raccoon',
       httpStatus: response.status,
@@ -812,6 +939,20 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   }
 
   return response
+}
+
+/**
+ * 从「状态码 + 原始响应文本」判断是否需要 IAM 确认。
+ *
+ * 对话路径拿不到信封对象（要保住流），故只能文本匹配。
+ * ⚠️ 同时要求**非 2xx**：业务成功响应里理论上不会出现这个码，
+ * 但真出现也不该触发重试（那会把一次成功误判成失败）。
+ */
+function looksLikeIamConfirm(status: number, text: string): boolean {
+  if (status >= 200 && status < 300) return false
+  return text.includes(RACCOON_IAM_CONFIRM_BIZ_CODE)
+    || text.includes(`"code":${RACCOON_IAM_CONFIRM_CODE}`)
+    || text.includes(`"code":${RACCOON_IAM_CONFIRM_CODE},`)
 }
 
 // ── 余额 ────────────────────────────────────────────────────────────

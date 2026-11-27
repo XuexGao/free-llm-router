@@ -2453,3 +2453,93 @@ test('🔴 IDE 版本必须是 genieVersion（不是 VS Code 基底 version）',
   const parts = ua.match(/\d+\.\d+\.\d+/g) ?? []
   assert.equal(new Set(parts).size, 1, `国际版 UA 三段必须同值，实际：${ua}`)
 })
+
+// ─────────────── Raccoon 的 IAM 确认自愈（「账号老是失效」的真因） ───────────────
+
+test('🔴 Raccoon：400 IAM_CONFIRM_REQUIRED 必须自动确认并重试，不是「凭据失效」', async () => {
+  // ## 线上实测（2026-11-27）：用户报「Raccoon 账号老是失效」
+  //
+  // 症状：面板上一切正常（未停用、未冷却、`expiresAt` 还有 19 天），
+  // 但**所有**业务请求都回：
+  //   HTTP 400 {"biz_code":"IAM_CONFIRM_REQUIRED","code":200901,
+  //             "message":"iam_confirm_required"}
+  //
+  // ⚠️ 关键判据 —— 这**不是**凭据过期。我用同一端点做了三组对照：
+  //
+  // | 请求 | 结果 |
+  // |---|---|
+  // | 真实 access_token | **400** `IAM_CONFIRM_REQUIRED` (200901) |
+  // | 明显伪造的 token | **401** `AUTH_AUTHORIZATION_VERIFY_FAILED` (200003) |
+  // | 空 token | **401** `AUTH_ACCESS_TOKEN_MISSING` (200001) |
+  //
+  // ⇒ token 本身有效，只是这个 IAM 会话需要一次「确认」动作。
+  //   所以**续期 / 重新登录 / 换号全都治不好** —— 这才是它反复出现、
+  //   每次都被误判成「凭据又失效了」的原因。
+  //
+  // 解法：`POST /api/web/auth/v1/iam/confirm`（body `{}`）→ `{"code":0}`。
+  // 实测调用后**同一个 token 立刻恢复**：余额查询 400→200 并返回真实积分，
+  // 对话也恢复正常。故必须**自动**做，而不是让用户去查文档。
+  const src = readFileSync('src/providers/raccoon.ts', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+
+  // ① 端点常量必须存在且是 POST 目标
+  assert.ok(/RACCOON_IAM_CONFIRM_PATH\s*=\s*'\/api\/web\/auth\/v1\/iam\/confirm'/.test(src),
+    '应有 IAM 确认端点常量（实测该路径存在；GET 会 404，必须 POST）')
+  assert.ok(/RACCOON_IAM_CONFIRM_CODE\s*=\s*200901/.test(src),
+    '应记录上游数字码 200901')
+  assert.ok(/RACCOON_IAM_CONFIRM_BIZ_CODE\s*=\s*'IAM_CONFIRM_REQUIRED'/.test(src),
+    '应记录上游业务码 IAM_CONFIRM_REQUIRED')
+
+  // ② 信封必须保留 biz_code（否则判据只能靠数字码，服务端改码就失效）
+  assert.ok(/bizCode\s*:\s*string/.test(src), '信封类型应含 bizCode')
+  assert.ok(/record\.biz_code/.test(src), 'parseEnvelope 应读取 biz_code')
+
+  // ③ **两条路径**都要自愈：通用请求 + 对话（对话不经过通用请求，自己发 fetch）
+  const onceIdx = src.indexOf('async function raccoonRequestOnce')
+  const reqIdx = src.indexOf('async function raccoonRequest(')
+  assert.ok(reqIdx > 0 && onceIdx > reqIdx, '应有「自愈层 + 单次请求」两段结构')
+  const healBlock = src.slice(reqIdx, onceIdx)
+  assert.ok(/isIamConfirmRequired\(envelope\)/.test(healBlock), '通用请求层应判定 IAM 确认')
+  assert.ok(/await confirmRaccoonIam\(/.test(healBlock), '通用请求层应执行确认')
+  assert.ok(/raccoonRequestOnce\(credential, path, init, signal\)/.test(healBlock),
+    '⚠️ 确认后必须**重发**原请求（确认只改服务端会话状态，token 不变）')
+
+  // ⚠️ 取 `chat` 函数体时**不能用注释分隔符当终点** —— 上面的 strip 已把
+  // 行注释去掉，`// ── 余额` 根本不存在 ⇒ `indexOf` 返回 -1 ⇒ 窗口取到
+  // **文件末尾**，把 `looksLikeIamConfirm` 的**定义**也包了进去，
+  // 于是断言永远为真（假通过，我实测发现了）。
+  //
+  // ⇒ 用「函数体结束」定位：从函数头向后，找第一个顶格（列 0）的 `}`。
+  const chatIdx = src.indexOf('async function chat(')
+  assert.ok(chatIdx > 0, '应有 chat 函数')
+  const chatEnd = src.indexOf('\n}', chatIdx)
+  assert.ok(chatEnd > chatIdx, 'chat 函数应有收尾')
+  const chatBlock = src.slice(chatIdx, chatEnd)
+  assert.ok(/looksLikeIamConfirm\(/.test(chatBlock),
+    '⚠️ 对话路径必须**单独**判一次 IAM 确认 —— 它不经通用请求层，漏了就成为唯一还坏着的端点')
+
+  // ④ 只重试一次：确认后仍失败就如实报错，不做无限循环
+  //
+  // ⚠️ 统计必须**排除函数定义行**（`async function raccoonRequestOnce(`），
+  // 否则「定义 + 一次调用」会数成 2，断言永远红 —— 我第一版就踩了这个。
+  const retryCalls = (healBlock.match(/return await raccoonRequestOnce\s*\(/g) ?? []).length
+  assert.equal(retryCalls, 1, '⚠️ 确认后只重试一次（无限重试会放大上游压力并埋掉真因）')
+  // 且**不得**出现递归调用自身（那会绕过单次重试的上限）
+  assert.ok(!/return await raccoonRequest\(/.test(healBlock),
+    '⚠️ 自愈层不得递归调用自身（应调 raccoonRequestOnce）')
+})
+
+test('⚠️ IAM 确认失败不得抛出，要让**重发的业务请求**决定最终错误', () => {
+  // 确认只是「顺手自愈」的一步。若它抛错，调用方拿到的是「确认失败」这种
+  // 没信息量的错误，而**丢掉**了业务请求的真实答复 —— 后者才有诊断价值
+  //（比如确认后仍 400，说明是账号级真故障，如需网页端完成协议）。
+  const src = readFileSync('src/providers/raccoon.ts', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  const i = src.indexOf('async function confirmRaccoonIam')
+  assert.ok(i > 0, '应有 confirmRaccoonIam')
+  const body = src.slice(i, src.indexOf('\n}', src.indexOf('catch', i)) + 2)
+  assert.ok(/catch\s*\(/.test(body), '⚠️ 确认失败必须被 catch 住')
+  assert.ok(!/throw /.test(body), '⚠️ 确认失败不得抛出（否则真实业务错误被掩盖）')
+})
