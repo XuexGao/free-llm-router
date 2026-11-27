@@ -26,7 +26,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { splitModelName } from '../src/providers/types.ts'
 
-import { CSP, panelAsset, securityHeaders } from '../src/panel/index.ts'
+import { CSP, CSP_LOGIN, panelAsset, securityHeaders } from '../src/panel/index.ts'
 
 // ─────────────────────── CSP 纪律 ───────────────────────
 
@@ -2341,4 +2341,31 @@ test('🔴 开关请求失败必须**回滚视觉**，不能留下「界面关�
     '⚠️ 失败时必须把 m.disabled 回滚到请求前的值')
   assert.ok(/applySwitchVisual\(sw,\s*before\)/.test(failBranch),
     '⚠️ 失败时必须同时回滚按钮视觉（只回滚数据会留下界面欺骗）')
+})
+
+
+// ─────────────── 站点图标（借鉴下游 WebUI） ───────────────
+
+test('🔴 两个页面都必须带站点图标，且 CSP 不得把它拦掉', () => {
+  // 参考 https://github.com/NandaNg314/free-llm-router 的 WebUI：
+  // 图标是 lucide `Route` 描边图形，嵌在 #0071E3 圆角方块里。
+  //
+  // ⚠️ 用**内联 SVG**（`data:image/svg+xml,…`）而不是独立 .ico/.svg 文件：
+  // 1. 零额外请求（面板本身很轻，不值得为一个图标多一次往返）；
+  // 2. 不占路由 —— 独立文件要在 `/panel/*` 的路由表里加一条，加漏就是 404，
+  //    而 favicon 404 **不报错、只是静默不显示**，极难发现；
+  // 3. 不会因路径不对而失效（相对路径在 `/panel/` 与 `/panel` 下解析可能不同）。
+  for (const p of ['/panel/', '/login']) {
+    const html = panelAsset(p)?.body ?? ''
+    assert.ok(html.includes('rel="icon"'), `⚠️ ${p} 必须有 favicon（否则浏览器静默不显示）`)
+    assert.ok(html.includes('data:image/svg+xml'), `⚠️ ${p} 的图标应为内联 SVG`)
+    // ⚠️ 必须声明圆角方块 + 品牌色，否则会退化成「白底透明图形」看不清
+    assert.ok(html.includes('%230071E3'), `⚠️ ${p} 的图标应带品牌色 #0071E3`)
+  }
+
+  // ⚠️ CSP：`img-src` 必须允许 `data:`，否则图标**静默失效**
+  //（浏览器不报错、控制台只有一条 CSP 违规，用户只看到「没图标」）。
+  for (const csp of [CSP, CSP_LOGIN]) {
+    assert.ok(/img-src[^;]*\bdata:/.test(csp), '⚠️ CSP 的 img-src 必须允许 data:（否则 favicon 被拦）')
+  }
 })
