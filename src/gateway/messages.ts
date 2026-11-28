@@ -347,13 +347,24 @@ export function messagesToChatBody(body: MessagesRequest, model: string): Record
     messages.unshift({ role: 'system', content: system })
   }
 
+  // ⚠️ **`max_tokens` 必须校验为必填**（黑盒排查实测，2026-11-27）
+  //
+  // Anthropic 规范里 `max_tokens` 是**必填**。此前缺省时被**静默省略** ——
+  // 于是上游按自己的默认上限生成，客户端拿到的可能是超长回答，
+  // 而客户端以为「没限制」。更糟的是：这是一个**规范违例**，
+  // 任何合规的客户端都不会这么发，说明我们漏了校验。
+  //
+  // ⚠️ 但**必须区分**「缺省」与「传了非法值」：两者都该 400，
+  //    且文案要说清楚该传什么。
+  const maxTokens = positiveInt(body.max_tokens)
+  if (maxTokens === undefined) {
+    throw new MessagesError('max_tokens 必填（必须是正整数，例如 1024）')
+  }
+
   const chat: Record<string, unknown> = {
     model,
     messages,
-    // ⚠️ Anthropic 的 `max_tokens` 是**必填**，Chat 是可选的 `max_tokens`
-    ...(positiveInt(body.max_tokens) === undefined
-      ? {}
-      : { max_tokens: positiveInt(body.max_tokens) }),
+    max_tokens: maxTokens,
   }
 
   if (typeof body.temperature === 'number' && Number.isFinite(body.temperature)) {

@@ -1981,3 +1981,243 @@ test('⚠️ 鉴权失败判据只能有一份实现（两处正则分叉已修�
   assert.ok(!/invalid\.\?token/.test(idx),
     '🔴 不得保留旧的 `invalid.?token` 正则（它匹配不上 `invalid access token`）')
 })
+
+// ═══════════ 2026-11-28 黑盒排查发现的缺陷（逐条实测复现） ═══════════
+
+/** 剥注释后读源码（本项目注释会逐字引用反例）。 */
+function srcNoComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+test('🔴 请求体形状必须在本地校验：`null` 不得 500、缺 `model` 不得静默放行', () => {
+  // ## 黑盒排查实测（两条都是真实缺陷）
+  //
+  // ① `{"model":...}` 换成 `null` ⇒ 服务端对 `null` 解引用
+  //    `(rawBody).model`，异常穿透到边界 ⇒ **500 + 泄漏 JS 异常文案**。
+  //    而 `/v1/responses`、`/v1/messages` 收到 `null` 都正确返回 400
+  //    —— 只有 chat 路径炸，是漏了校验。
+  //
+  // ② **缺 `model` 字段** ⇒ `rawModel` 为空串 ⇒ 回落默认供应商，
+  //    请求**真的打到了上游**，返回 `200 + "model":""`，
+  //    用量还记到默认供应商账号上。OpenAI/Anthropic 规范里 `model` **必填**。
+  //
+  // ⚠️ ② 的后果不只是「状态码不对」：客户端拼错/漏字段会**消耗上游配额
+  //    并给账号记账**，正是「客户端问题熔断健康账号」的放大器。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('const rawBody: unknown = parsedBody.value')
+  assert.ok(i > 0, '应能定位到请求体解析处')
+  const block = src.slice(i, i + 2200)
+
+  assert.ok(/rawBody === null \|\| typeof rawBody !== 'object' \|\| Array\.isArray\(rawBody\)/.test(block),
+    '🔴 请求体必须做「非 null / 是对象 / 非数组」校验（否则 null 会 500 并泄漏异常）')
+  assert.ok(/jsonError\(400/.test(block), '🔴 非法请求体必须回 400 而不是 500')
+  assert.ok(/缺少必填字段 `model`/.test(block), '🔴 缺 model 必须本地 400，不能静默回落默认供应商')
+  // ⚠️⚠️ **必须断言守卫条件本身**，不能只查文案存在。
+  //
+  // 我第一版只查 `缺少必填字段 model` 这段字符串 —— 反向验证时把
+  // `if (...)` 改成 `if (false)`，测试**仍然全绿**（文案还在，只是条件失效了）。
+  // 那是典型的「断言了但没检查行为」。
+  //
+  // ⇒ 直接检查条件表达式：改成 `if (false)` 或删掉判空，这里立刻变红。
+  assert.ok(
+    /if \(typeof rawModelValue !== 'string' \|\| rawModelValue\.trim\(\) === ''\)/.test(block),
+    '🔴 model 的守卫条件必须真的存在（不能是 if(false) 之类的死分支）',
+  )
+  // ⚠️ 校验必须在 model 被使用之前
+  const modelUse = src.indexOf('const rawModel = rawModelValue')
+  const check = src.indexOf('rawBody === null || typeof rawBody')
+  assert.ok(check > 0 && check < modelUse, '⚠️ 校验必须排在 model 被使用之前')
+})
+
+test('🔴 `messages` / `max_tokens` 非法必须在本地 400，不得打上游', () => {
+  // ## 黑盒排查实测
+  //
+  // 原实现把客户端参数错**原样打上游**：
+  //   · `messages` 为空数组 / 缺失 / 传字符串 / 传 `null` ⇒ 上游 400，网关回 502；
+  //   · `max_tokens: -5` / `"abc"` ⇒ 同样 502。
+  //
+  // ⚠️ 关键：这类错误会**被记到账号头上**，客户端反复拼错 ⇒ 健康账号被连续惩罚。
+  //   客户端自己的参数错，不该消耗配额、也不该记账。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('const messagesValue = rawBodyRecord.messages')
+  assert.ok(i > 0, '应有 messages 校验')
+  const block = src.slice(i, i + 1400)
+
+  assert.ok(/Array\.isArray\(messagesValue\)/.test(block), '⚠️ messages 必须校验为数组')
+  assert.ok(/messagesValue\.length === 0/.test(block), '⚠️ 空数组必须拒')
+  assert.ok(/max_tokens` 必须是正整数/.test(block), '⚠️ max_tokens 非法必须拒')
+  // ⚠️ 拒的是客户端参数错，必须是 400 而不是 502
+  assert.ok(block.includes('invalid_request_error'), '⚠️ 客户端参数错必须回 invalid_request_error')
+})
+
+test('🔴 provider 路径的 400（参数无效）不得记成 breaker（客户端拼错模型名会熔断账号）', () => {
+  // ## 黑盒排查实测（P0-1）
+  //
+  // 对唯一 trae 账号连发 3 次「模型不存在」请求：
+  //   `fails` 0→2→3 ⇒ 触发 `breakerUntil`（熔断 30 分钟），期间所有 trae 调用 503。
+  // 而**真实原因只是客户端拼错了模型名**。
+  //
+  // ⚠️ 熔断过期后账号自动恢复，证明是**一次可复现的误熔断**，不是账号真坏了。
+  //
+  // 根因：`failureKind` 三元式「402→hard / 429→细分 / **其余一律 breaker**」
+  // ⇒ 400 参数无效也被记成 breaker。
+  //
+  // ⇒ 必须走 `classify` + `mapErrorToPunishment`：`unknown` 类**不罚号**。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('const failureKind')
+  assert.ok(i > 0, '应有 failureKind 判定')
+  const block = src.slice(Math.max(0, i - 1600), i + 900)
+
+  assert.ok(/mapErrorToPunishment\(providerKind\)/.test(block),
+    '🔴 必须用 classify + mapErrorToPunishment，不能只用裸状态码三元式')
+  assert.ok(/providerMapped\.punish === false/.test(block),
+    '🔴 不该罚号的类别（含 400 参数无效）必须直接跳过 applyFailure')
+  // 反向：写死 'breaker' 会让 400 也熔断
+  assert.ok(!/\?\s*'breaker'\s*\n\s*if \(providerMapped/.test(src.slice(i, i + 400)),
+    "🔴 兜底分支不得写死 'breaker'")
+})
+
+test('🔴 /v1/models 的每条条目都必须带 OpenAI 必填的 object / created / owned_by', () => {
+  // ## 黑盒排查实测（P1-4）
+  //
+  // 统计 `/v1/models`：`missing_object=13/15`、`missing_created=15/15`、
+  // `missing_owned_by=13/15` —— 单家条目此前只有 `...base`（`ProviderModel`，
+  // 不含这三个字段），只有聚合条目手工补了。
+  //
+  // ⚠️ 后果：客户端（Cherry Studio / Open WebUI / OpenAI SDK）按 OpenAI 规范
+  //   读 `object` / `owned_by`，缺失时**直接跳过该条目**或归属显示为空 ——
+  //   而这些条目**功能完全正常**，属「规范不合规导致的假故障」。
+  const src = srcNoComments(readFileSync('src/index.ts', 'utf8'))
+  const i = src.indexOf('data.push({')
+  assert.ok(i > 0, '应能定位到 models 的 push')
+  // 取这条 push 的整块（到下一个 `})` 收尾）
+  const block = src.slice(i, src.indexOf('})\n        }', i) + 2)
+
+  assert.ok(/object: 'model'/.test(block), '⚠️ 必须补 object:"model"')
+  assert.ok(/created: 0/.test(block), '⚠️ 必须补 created（与 gateway/models.ts 同口径，不编造时间）')
+  assert.ok(/owned_by: providerId/.test(block), '⚠️ owned_by 必须是该供应商，不能写默认供应商')
+})
+
+test('🔴 失败请求必须记入用量的 failed，否则面板的失败 KPI 是死数据', () => {
+  // ## 黑盒排查实测（P1-5）
+  //
+  // 所有 `recordUsage` 调用都硬编码 `ok: true`，而最终失败出口什么都不记。
+  // `store/usage.ts` 的 `addDim` **早已备好** `if (!r.ok) d.failed += 1`
+  // —— 代码写全了，却**没有任何调用方传 `ok: false`**。
+  //
+  // ⇒ 面板的「失败数 / 失败率 / 红色趋势柱」**永远是 0**，
+  //   用户看到「零失败」而请求一直在失败。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  assert.ok(/function recordFailedRequest/.test(src), '应有失败用量记录助手')
+
+  const i = src.indexOf('function recordFailedRequest')
+  const body = src.slice(i, src.indexOf('\n}\n', i) + 2)
+  assert.ok(/ok: false/.test(body), '🔴 失败记录必须 ok:false（否则 failed 恒为 0）')
+  assert.ok(/tried\.length === 0/.test(body),
+    '⚠️ 「没有可用账号」不是失败请求，不能记（否则失败率虚高）')
+
+  // 两个最终失败出口都要调用它
+  const callCount = (src.match(/recordFailedRequest\(/g) ?? []).length
+  assert.ok(callCount >= 3, `应有 ≥3 处调用（定义 + 两个失败出口），实得 ${callCount}`)
+})
+
+test('🔴 失败请求要写入日志，修复「/admin/logs 恒为空」的死视图', () => {
+  // ## 黑盒排查实测（P1-6）
+  //
+  // `appendLog()` / `readLogs()` / `clearLogs()` 与面板日志视图**早就做好**，
+  // 但**全仓库无任何调用方** ⇒ 面板日志页永远空白。
+  //
+  // ⇒ 把失败请求接上，日志里能看到「哪个模型、哪个账号、为什么失败」。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const i = src.indexOf('function recordFailedRequest')
+  const body = src.slice(i, src.indexOf('\n}\n', i) + 2)
+  assert.ok(/appendLog\(/.test(body), '🔴 必须调用 appendLog（否则日志恒空）')
+  assert.ok(/type: 'request_failed'/.test(body), '⚠️ 日志应带类型标记，便于面板分类展示')
+})
+
+test('🔴 CORS 允许头必须覆盖服务端实际接受的每个头（漏了浏览器端静默失败）', () => {
+  // ## 黑盒排查实测（P1-3）
+  //
+  // 原来只写 `authorization, content-type`。而 `/v1/messages` 支持 `x-api-key`
+  // 与 `anthropic-version` —— 浏览器预检这两个头时**预检失败**，
+  // 请求根本不会发出。
+  //
+  // ⚠️ 症状是「服务端支持、但浏览器用不了」，而**用 curl 测一切正常** ——
+  //   只有浏览器里才暴露，极难归因。
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.ok(
+    /CORS_ALLOW_HEADERS\s*=\s*'authorization, content-type, x-api-key, anthropic-version'/.test(src),
+    '⚠️ allow-headers 必须与服务端接受的头逐字对应',
+  )
+})
+
+test('🔴 `/messages` 别名必须与 `/v1/messages` 同口径（认 x-api-key、有 CORS）', () => {
+  // ## 黑盒排查实测（P2-1）
+  //
+  // 同一密钥：
+  //   · 打 `/v1/messages`（走 `guardV1` → `clientKeyOf`）⇒ 200
+  //   · 打 `/messages`（走 `authorized()`，原先只认 Authorization）⇒ **401**
+  //
+  // 且 `/messages` 的 OPTIONS 预检无 CORS 头 ⇒ 浏览器直接失败。
+  //
+  // ⇒ `authorized()` 必须与 `clientKeyOf` 同口径；别名路径也要走 CORS 预检。
+  const src = readFileSync('src/index.ts', 'utf8')
+
+  const authIdx = src.indexOf('async function authorized')
+  assert.ok(authIdx > 0)
+  const authBody = src.slice(authIdx, src.indexOf('\n}\n', authIdx) + 2)
+  assert.ok(/clientKeyOf\(request\)/.test(authBody),
+    '🔴 authorized() 必须复用 clientKeyOf（认 x-api-key），否则 /messages 别名 401')
+
+  // 别名路径必须走 CORS 预检
+  assert.ok(/const isV1Api = isV1 \|\| path === '\/messages'/.test(src),
+    '⚠️ /messages 别名必须与 v1 同口径走 CORS 预检')
+})
+
+test('🔴 成长任务扫描只处理腾讯系账号（否则非 buddy 账号全报 401，属误导性输出）', () => {
+  // ## 黑盒排查实测（P2-5）
+  //
+  // `/admin/tasks/scan` 遍历**所有**账号直接调腾讯的 `listTasks`，
+  // 结果 14 个账号**全部**报 `任务列表拉取失败（auth_error）：upstream 401` ——
+  // 而其中多数账号对话完全正常。
+  //
+  // ⚠️ 这是**误导性**输出：用户看到「全部账号任务拉取失败」会以为账号全坏了，
+  //   真实原因是扫描范围错了（拿 Trae 凭据打腾讯端点）。
+  //
+  // ⇒ 判据与 `daily-all` 一致：只处理 `ENV_BOUND_PROVIDER`。
+  // ⚠️ 这条**不用** `srcNoComments`：本文件的 `/*` 与 `*/` 数量不配对
+  //（76 vs 55，多出的在字符串/正则里），朴素剥离会把整段吃掉，
+  // 导致锚点找不到、断言假红。故直接在原文上按**代码模式**断言 ——
+  // 该模式在源码里唯一且不在注释中。
+  const src = readFileSync('src/index.ts', 'utf8')
+  // scan 端点存在
+  assert.ok(/path === '\/admin\/tasks\/scan'/.test(src), '应有 scan 端点')
+  // 过滤语句必须存在（且是 `a.provider`，即 scan 里的循环变量）
+  assert.ok(
+    /if \(\(a\.provider \?\? LEGACY_PROVIDER\) !== ENV_BOUND_PROVIDER\) continue/.test(src),
+    '🔴 scan 必须按 ENV_BOUND_PROVIDER 过滤，否则非 buddy 账号全报 401',
+  )
+  // ⚠️ 判据是「这一家是不是 buddy」而不是「是不是默认供应商」——
+  // 默认值已改成 Trae，按默认值过滤会把 Trae 账号错当腾讯系。
+  assert.ok(!/if \(\(a\.provider \?\? DEFAULT_PROVIDER\) !== ENV_BOUND_PROVIDER\) continue/.test(src),
+    '⚠️ 过滤不得用 DEFAULT_PROVIDER（那是 Trae）')
+  // 过滤必须在 listTasks 调用之前：取该行位置与 scan 端点位置比较
+  const filterIdx = src.indexOf('(a.provider ?? LEGACY_PROVIDER) !== ENV_BOUND_PROVIDER) continue')
+  const scanIdx = src.indexOf("'/admin/tasks/scan'")
+  const listTasksIdx = src.indexOf('listTasks(', scanIdx)
+  assert.ok(filterIdx > scanIdx && filterIdx < listTasksIdx,
+    '⚠️ 过滤必须在调 listTasks 之前生效')
+})
+
+test('🔴 /v1/messages 的 max_tokens 必须校验为必填（Anthropic 规范）', () => {
+  // ## 黑盒排查实测（P2-7）
+  //
+  // 此前缺 `max_tokens` 被**静默省略**，上游按自己的默认上限生成。
+  // Anthropic 规范里它是**必填** —— 缺省即规范违例。
+  const src = srcNoComments(readFileSync('src/gateway/messages.ts', 'utf8'))
+  const i = src.indexOf('const maxTokens = positiveInt(body.max_tokens)')
+  assert.ok(i > 0, '应有 max_tokens 校验')
+  const block = src.slice(i, i + 400)
+  assert.ok(/throw new MessagesError\('max_tokens 必填/.test(block),
+    '🔴 缺/非法 max_tokens 必须显式 400，不能静默省略')
+})

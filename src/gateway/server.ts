@@ -54,6 +54,7 @@ import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import { settleUsage, type SubkeyContext } from './authz.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
+import type { UsageRecord } from '../store/usage.js'
 
 /** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）。 */
 export const MAX_ROTATE = 3
@@ -356,6 +357,83 @@ export interface GatewayResult {
 }
 
 /**
+ * 记录一次**失败**的请求用量。
+ *
+ * ## 🔴 为什么必须有（黑盒排查实测，2026-11-27）
+ *
+ * 之前**全部 4 处** `recordUsage` 调用都硬编码 `ok: true`，而最终失败出口
+ * 什么都不记。而 `store/usage.ts` 的 `addDim` **早已备好**
+ * `if (!r.ok) d.failed += 1` 这个分支 —— 代码写全了，却**没有任何调用方传
+ * `ok: false`**。
+ *
+ * ⇒ 面板的「失败数 / 失败率 / 红色趋势柱」**永远是 0**，是死数据：
+ *   用户看到的是「零失败」，而请求一直在失败。这与本项目一直警告的
+ *   「静默失败」是同一个形态。
+ *
+ * ⚠️ 只在**真的打过上游并失败**时记（`tried.length > 0`）：
+ *   「没有可用账号」不是一次失败请求，记进去会让失败率虚高。
+ */
+function recordFailedRequest(
+  // ⚠️ 用**结构化**类型：调用方给的是 `DurableObjectStub<AccountPoolDO>`
+  //（通过 `env.ACCOUNT_POOL.get()` 拿到），不是 DO 实例本身。
+  // 写 `AccountPoolDO` 会类型报错 —— 而 stub 上确实实现了 `recordUsage`。
+  pool: Pick<AccountPoolDO, 'recordUsage' | 'appendLog'>,
+  ctx: ExecutionContext | undefined,
+  model: string,
+  tried: readonly string[],
+  at: number,
+  errorKind?: string,
+): void {
+  if (tried.length === 0) return
+  const record: UsageRecord = {
+    at,
+    // 记**首个**尝试的账号：这次失败确实由它触发，且明细里能看到是哪类错误。
+    uid: tried[0] ?? '',
+    model,
+    input: 0,
+    output: 0,
+    ok: false,
+    ...(errorKind === undefined ? {} : { errorKind }),
+    ms: 0,
+  }
+  const task = pool.recordUsage(record).catch((error: unknown) => {
+    console.error('[usage] 记录失败用量失败：', error instanceof Error ? error.message : String(error))
+  })
+
+  // ## ⚠️ 同时写一条日志（修复「/admin/logs 恒为空」）
+  //
+  // `appendLog` / `readLogs` / `clearLogs` 与面板的日志视图**早就做好**了，
+  // 但**全仓库没有任何调用方** ⇒ 面板的日志页永远空白，用户看到一个
+  // 「看起来坏了」的界面。
+  //
+  // ⇒ 把失败请求接在这里：日志里能看到「哪个模型、哪个账号、为什么失败」，
+  //   正是排查时最需要的信息。上限 200 条由 `appendLog` 自己控制。
+  //
+  // ⚠️ 日志与用量**分开写**：日志是尽力而为的辅助信息，
+  //   它的失败不该让用量记账一起失败。
+  const logTask = pool
+    .appendLog({
+      at,
+      type: 'request_failed',
+      uid: tried[0] ?? '',
+      tried: tried.slice(),
+      model,
+      ...(errorKind === undefined ? {} : { kind: errorKind }),
+    })
+    .catch((error: unknown) => {
+      console.error('[log] 写入失败日志失败：', error instanceof Error ? error.message : String(error))
+    })
+
+  if (ctx !== undefined) {
+    ctx.waitUntil(task)
+    ctx.waitUntil(logTask)
+  } else {
+    void task
+    void logTask
+  }
+}
+
+/**
  * 处理 `/v1/chat/completions`：**选号 → 转发 → 记账 → 失败换号**。
  */
 export async function handleChatCompletions(
@@ -387,14 +465,79 @@ export async function handleChatCompletions(
   if (!parsedBody.ok) return { response: parsedBody.response }
   const rawBody: unknown = parsedBody.value
 
+  // ## 🔴 请求体形状必须在本地校验，不能带着错误打上游
+  //
+  // 这两个缺陷都是实测出来的（2026-11-27 黑盒排查）：
+  //
+  // ① **`rawBody` 为 `null` 时直接 500**：下面 `(rawBody as Record).model`
+  //    对 `null` 解引用抛 `Cannot read properties of null`，异常穿透到边界
+  //    ⇒ 500 并泄漏 JS 异常文案。而同一项目的 `/v1/responses`、`/v1/messages`
+  //    收到 `null` 都正确返回 400 —— 只有 chat 路径炸，是漏了校验。
+  //
+  // ② **`model` 缺失时被静默放行**：`rawModel` 为空串 ⇒ `splitModelName('')`
+  //    回落到默认供应商，把**空模型名**发给上游，返回 `200 + "model":""`
+  //    —— 请求实际打到了默认供应商、用量也记到它身上，而客户端以为只是
+  //    「没传 model」而已。OpenAI/Anthropic 规范里 `model` **必填**。
+  //
+  // ⇒ 统一在这里拒掉：客户端自己的参数错，**不该**消耗上游配额、
+  //    也不该给账号记账（否则又回到「客户端拼错模型名 ⇒ 熔断健康账号」）。
+  if (rawBody === null || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+    return {
+      response: jsonError(400, '请求体必须是 JSON 对象（如 {"model":"...","messages":[...]}）', 'invalid_request_error'),
+    }
+  }
+  const rawBodyRecord = rawBody as Record<string, unknown>
+  const rawModelValue = rawBodyRecord.model
+  if (typeof rawModelValue !== 'string' || rawModelValue.trim() === '') {
+    return {
+      response: jsonError(400, '缺少必填字段 `model`（例如 {"model":"provider/name","messages":[...]}）', 'invalid_request_error'),
+    }
+  }
+
+  // ## ⚠️ `messages` 与 `max_tokens` 同样要在本地校验（黑盒排查实测）
+  //
+  // 原实现把这两类客户端参数错**原样打上游**，于是：
+  //   · `messages` 空数组 / 缺失 / 传字符串 / 传 `null` ⇒ 上游 400，网关回 502；
+  //   · `max_tokens: -5` 或 `"abc"` ⇒ 同样 502。
+  //
+  // ⚠️ 后果不只是「状态码不对」：这类错误会**被记到账号头上**（见上方注释），
+  //   客户端反复拼错 ⇒ 健康账号被连续惩罚。客户端自己的参数错，
+  //   **不该消耗上游配额、也不该记账**。
+  //
+  // ⚠️ 判据要**足够保守**：只拒「必然非法」的形态。`messages` 缺失时
+  //   上游各家行为不同，有些家可能默认补一条；因此只拒
+  //   「明确传了但不是合法数组」与「是数组但为空」这两种必然非法的情况。
+  const messagesValue = rawBodyRecord.messages
+  if (messagesValue !== undefined) {
+    if (!Array.isArray(messagesValue)) {
+      return {
+        response: jsonError(400, '`messages` 必须是数组（如 [{"role":"user","content":"你好"}]）', 'invalid_request_error'),
+      }
+    }
+    if (messagesValue.length === 0) {
+      return {
+        response: jsonError(400, '`messages` 不能为空数组', 'invalid_request_error'),
+      }
+    }
+  }
+  // `max_tokens`：OpenAI 规范要求正整数；传了但非法 ⇒ 本地拒。
+  // ⚠️ **不因为没传就拒绝** —— 各家行为不同，交给上游决定更稳。
+  const maxTokensValue = rawBodyRecord.max_tokens
+  if (maxTokensValue !== undefined && maxTokensValue !== null) {
+    if (typeof maxTokensValue === 'number' ? maxTokensValue <= 0 : typeof maxTokensValue !== 'number') {
+      return {
+        response: jsonError(400, '`max_tokens` 必须是正整数', 'invalid_request_error'),
+      }
+    }
+  }
+
   // 会话粘性 key（空串 = 无法判定会话，此时不做粘性）。
   // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。
   const sessionKey = await deriveSessionKey(rawBody)
 
-  const rawModel =
-    typeof (rawBody as Record<string, unknown>).model === 'string'
-      ? ((rawBody as Record<string, unknown>).model as string)
-      : ''
+  // ⚠️ 上面已校验过：`model` 必为非空字符串，这里不再做判空兜底。
+  // 若这里再写 `?? ''`，就等于把校验悄悄绕开，回到缺陷形态。
+  const rawModel = rawModelValue
 
   // ── 聚合 provider 分支 ──
   //
@@ -757,6 +900,10 @@ export async function handleChatCompletions(
   }
 
   // 所有轮转都失败
+  //
+  // ⚠️ **失败也要记用量**（见 `recordFailedRequest` 的说明）：
+  // 否则面板的「失败数 / 失败率」恒为 0，用户看到的是「零失败」而请求一直在失败。
+  recordFailedRequest(pool, ctx, model, tried, Date.now(), lastError?.kind)
   return {
     response: jsonError(
       lastError?.status ?? 502,
@@ -1420,6 +1567,9 @@ async function handleProviderChat(input: {
     }
   }
 
+  // ⚠️ 同上：失败也要记用量（模型名带供应商前缀，与成功记录的口径一致）。
+  // ⚠️ 这条路径的 `lastError` 类型里没有 `kind` 字段，故不传错误类别。
+  recordFailedRequest(pool, ctx, `${providerId}/${model}`, tried, Date.now())
   return {
     response: jsonError(
       lastError?.status ?? 503,

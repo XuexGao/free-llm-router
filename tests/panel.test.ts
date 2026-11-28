@@ -1978,12 +1978,19 @@ test('🔴 /v1/* 必须支持 CORS 预检（浏览器调用方否则完全用不
 
   // ① 必须有 CORS 头构造
   assert.ok(/function withCors/.test(src), '应有 withCors 助手')
+  // ⚠️ 允许头列表抽成了 `CORS_ALLOW_HEADERS` 常量（必须与服务端实际接受的头
+  // 逐字对应），故断言要**两处都查**：常量本身，以及 withCors 是否引用它。
+  assert.ok(/CORS_ALLOW_HEADERS\s*=\s*'authorization, content-type, x-api-key, anthropic-version'/.test(src),
+    '⚠️ allow-headers 必须含 authorization（漏掉会导致浏览器不发密钥）')
   const i = src.indexOf('function withCors')
   const block = src.slice(i, i + 1200)
   assert.ok(/access-control-allow-origin/.test(block), '应有 allow-origin')
-  // ⚠️ Authorization 必须在允许列表里，否则浏览器不会把密钥发出去
-  assert.ok(/allow-headers'[^)]*authorization/i.test(block) || /authorization/i.test(block),
-    '⚠️ allow-headers 必须含 authorization')
+  assert.ok(/CORS_ALLOW_HEADERS/.test(block),
+    '⚠️ withCors 必须引用 CORS_ALLOW_HEADERS（不能另写一份列表，会分叉）')
+  // ⚠️ 黑盒排查实测：漏掉 x-api-key / anthropic-version 会让
+  // 浏览器端 Anthropic 调用**预检失败**（服务端支持、但浏览器用不了）
+  assert.ok(/x-api-key/.test(src), '⚠️ allow-headers 必须含 x-api-key（Anthropic 客户端用的头）')
+  assert.ok(/anthropic-version/.test(src), '⚠️ allow-headers 必须含 anthropic-version')
 
   // ② 预检必须在**鉴权之前**处理：预检请求不带 Authorization（浏览器规定），
   // 落到鉴权分支就只会拿到 401，真正的请求永远发不出去。

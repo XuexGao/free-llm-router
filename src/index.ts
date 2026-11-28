@@ -93,6 +93,7 @@ import {
   type SubkeyContext,
   authenticate,
   clientIpOf,
+  clientKeyOf,
   countUse,
 } from './gateway/authz.js'
 import { modelAllowed } from './store/apikeys.js'
@@ -251,11 +252,31 @@ function isV1Request(request: Request): boolean {
   }
 }
 
+/**
+ * CORS 允许的请求头。
+ *
+ * ## ⚠️ 必须覆盖**服务端实际会接受**的每个头（黑盒排查实测，2026-11-27）
+ *
+ * 原来只写了 `authorization, content-type`。而 `/v1/messages` 明确支持
+ * `x-api-key`（Claude Code / Anthropic SDK 发的就是这个头，不是
+ * `Authorization`），请求还带 `anthropic-version` —— 浏览器预检
+ * `Access-Control-Request-Headers: x-api-key,anthropic-version` 时，
+ * 因不在允许列表而**预检失败**，浏览器直接不放行请求。
+ *
+ * ⚠️ 症状是「服务端支持，但浏览器用不了」，而**用 curl 测一切正常**
+ * —— 所以这条只有在浏览器里才会暴露，极难归因。
+ *
+ * ⇒ 允许列表必须与 `clientKeyOf` 实际接受的头**逐字对应**。
+ * 将来再加接受的头，这里必须同步。
+ */
+const CORS_ALLOW_HEADERS = 'authorization, content-type, x-api-key, anthropic-version'
+
 function withCors(response: Response): Response {
   const headers = new Headers(response.headers)
   headers.set('access-control-allow-origin', '*')
-  // ⚠️ `Authorization` 必须在允许列表里：否则浏览器不会把密钥发出去。
-  headers.set('access-control-allow-headers', 'authorization, content-type')
+  // ⚠️ 允许列表见 {@link CORS_ALLOW_HEADERS}：漏掉任何一个服务端支持的头，
+  // 都会让浏览器端静默失败。
+  headers.set('access-control-allow-headers', CORS_ALLOW_HEADERS)
   headers.set('access-control-allow-methods', 'GET, POST, OPTIONS')
   // ⚠️ 预检结果缓存 24 小时：否则**每个**请求都多一次 OPTIONS 往返，
   // 对流式对话这种高频场景是纯粹的延迟浪费。
@@ -298,9 +319,19 @@ async function authorized(request: Request, env: Env): Promise<boolean> {
   // ⚠️ fail-closed：没配密钥就是配置错误，不能静默放行。
   if (expected === undefined || expected === '') return false
 
-  const header = request.headers.get('authorization') ?? ''
-  const prefix = 'Bearer '
-  const provided = header.startsWith(prefix) ? header.slice(prefix.length) : ''
+  // ## ⚠️ 必须同时接受 `x-api-key`（黑盒排查实测，2026-11-27）
+  //
+  // `/messages` 是 `/v1/messages` 的别名，走**这条**鉴权闸门，而它原先只认
+  // `Authorization: Bearer`。于是同一份密钥：
+  //   · 打 `/v1/messages`（走 `guardV1` → `clientKeyOf`）⇒ 200
+  //   · 打 `/messages`（走这里）⇒ **401**
+  //
+  // ⚠️ 症状是「同一个密钥、两个路径，一个通一个不通」，而 README 明确承诺
+  // 支持 `x-api-key`。改成与 `clientKeyOf` 同口径：优先 Authorization，
+  // 没有才用 x-api-key；两个都给且不同则拒绝（不允许「任选一个能过」）。
+  const { key, conflict } = clientKeyOf(request)
+  if (conflict) return false
+  const provided = key
   // 即使 provided 为空也执行比较，保持耗时形状
   return await constantTimeEqual(provided, expected)
 }
@@ -1443,11 +1474,15 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //   - `/v1/models`：无请求体，在这里就能判完；
   //   - 其余 `/v1/*`：交给各分支自己的 `guardV1()`。
   const isV1 = path.startsWith('/v1/')
+  // ⚠️ `/messages*` 是 `/v1/messages*` 的别名（Anthropic 官方客户端会直接用
+  // 不带 `/v1` 的形态），必须与 v1 同口径 —— 否则 CORS 预检与鉴权都会不一致
+  //（见 `authorized()` 与 {@link CORS_ALLOW_HEADERS} 的说明）。
+  const isV1Api = isV1 || path === '/messages' || path === '/messages/count_tokens'
 
   // ⚠️ CORS 预检：浏览器调用方会先发 `OPTIONS`。必须在**鉴权之前**处理 ——
   // 预检请求**不带** `Authorization`（那是浏览器的规定），
   // 它落到鉴权分支就只会拿到 401，于是真正的请求永远不会发出。
-  if (isV1 && request.method === 'OPTIONS') {
+  if (isV1Api && request.method === 'OPTIONS') {
     return withCors(new Response(null, { status: 204 }))
   }
 
@@ -3546,7 +3581,22 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const accounts = await pool.listAccounts(realm, Date.now())
     const out: Array<Record<string, unknown>> = []
+    // ⚠️ **只扫腾讯系账号**（黑盒排查实测，2026-11-27）
+    //
+    // `listTasks` 打的是**腾讯** `/v2/report` 协议（成长任务是 WorkBuddy 独有
+    // 体系）。此前这里遍历**所有**账号，于是 14 个账号**全部**报
+    // `任务列表拉取失败（auth_error）：upstream 401` —— 而其中多数账号
+    // 对话完全正常，那个 401 是「用 Trae 的凭据打腾讯端点」必然的结果。
+    //
+    // ⚠️ 这种输出是**误导性**的：用户看到「全部账号任务拉取失败」，会以为
+    // 账号全坏了，而真实原因是扫描范围错了。
+    //
+    // ⇒ 判据与 `daily-all` 一致：只处理 `ENV_BOUND_PROVIDER`（buddy）的账号。
+    //   其它家**不入结果**（不是「失败」，而是「不适用」）。
     for (const a of accounts) {
+      // ⚠️ 判据是「这一家是不是 buddy」，**不是**「是不是默认供应商」——
+      // 默认值已改成 Trae，按默认值过滤会让 Trae 账号被错当腾讯系。
+      if ((a.provider ?? LEGACY_PROVIDER) !== ENV_BOUND_PROVIDER) continue
       const credential = (await pool.getCredential(a.uid)) as LoginCredential | undefined
       if (credential === undefined) { out.push({ uid: a.uid, error: '无凭据' }); continue }
       try {
@@ -3974,9 +4024,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           //
           // ⚠️ 只在这里补一次：`/v1/models` 的**所有供应商条目**都经过这一行，
           // 逐家各写一遍必然漏（本项目已多次吃过「只改一半」的教训）。
+          // ⚠️ **必须补 OpenAI 规范的三个必填字段**（黑盒排查实测）
+          //
+          // 单家条目此前只有 `...base`（`ProviderModel`，不含这三个字段）
+          // ⇒ 13/15 的条目缺 `object`、`owned_by`，**全部**缺 `created`。
+          //
+          // ⚠️ 为什么必须补：客户端（Cherry Studio / Open WebUI / OpenAI SDK 等）
+          //   按 OpenAI 规范读 `object` 与 `owned_by`。缺失时各客户端表现不一：
+          //   有的直接跳过该条目（模型列表莫名变短），有的把归属显示成空。
+          //   而这些条目**功能完全正常** —— 属「规范不合规导致的假故障」。
+          //
+          // `created` 用 0（与 `gateway/models.ts` 的既有口径一致）：
+          // 我们无从得知上游模型的真实创建时刻，**编造一个具体时间**
+          // 比如实给 0 更糟（那是在伪造数据）。
           data.push({
             ...base,
             id: `${providerId}/${m.id}`,
+            object: 'model',
+            created: 0,
+            // ⚠️ 归属是**该供应商**，不是默认供应商 —— 默认值已改成 Trae，
+            // 写错会把腾讯的模型标成「属于 Trae」。
+            owned_by: providerId,
             // ⚠️ **优先用 provider 解析出的真实倍率**（buddy 的 `credits` 字段）。
             // 只有该家没提供时才退回「从模型名抠」—— 名字里通常不写倍率，
             // 抠出来 39/46 都是空（我第一版就是这么错的）。
