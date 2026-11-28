@@ -56,6 +56,53 @@ import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
 import type { UsageRecord } from '../store/usage.js'
 
+/**
+ * **流空闲超时**：上游多久没有送出任何字节就判定为挂住。
+ *
+ * ## 🔴 为什么必须有（稳定性缺口，2026-11-28）
+ *
+ * 两处读取循环都是裸的 `await reader.read()` —— **没有任何超时**。
+ * 若上游接受了连接却再也不送数据（网关侧排队、节点卡死、连接半开），
+ * 这个 await 会**永远挂着**：
+ *
+ * - Workers 的整体墙钟没有硬上限（客户端连着就行），所以不会自动断；
+ * - 客户端会一直「转圈」，而**我们的日志里什么都没发生**；
+ * - 该账号也不会被换掉（`reader.read()` 不抛错 ⇒ 不进 catch ⇒ 不记账）。
+ *
+ * ⚠️ 这与「上游很慢但确实在输出」是**两回事**，不能共用一个总超时：
+ * 长回答可以合法地跑几分钟，但**连续 120 秒一个字节都没有**只可能是挂住。
+ * 故这里用「空闲」而不是「总时长」。
+ *
+ * 取值 120s：比任何一家的单请求超时（15–30s）都宽松得多，不会误伤
+ * 「思考很久才出第一个字」的模型（推理型首字可达 60s+）。
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 120_000
+
+/**
+ * 读一次流，但**带空闲超时**。
+ *
+ * @throws 超时时抛 `Error`（消息含「空闲超时」），由调用方的 catch 按
+ *         「上游失败」处置 —— 与真正的网络中断走同一条路，从而能记账、能换号。
+ */
+export async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleMs: number = STREAM_IDLE_TIMEOUT_MS,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  // ⚠️ 用 Promise.race 而不是 `AbortSignal`：`reader.read()` **不接受** signal，
+  // 取消 reader 会连带毁掉整个流（而这里只想**判定超时**、由上层决定怎么收尾）。
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`上游流空闲超时：${Math.round(idleMs / 1000)} 秒内没有任何数据（连接疑似卡死）`))
+    }, idleMs)
+  })
+  try {
+    return await Promise.race([reader.read(), timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 /** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）。 */
 export const MAX_ROTATE = 3
 
@@ -988,7 +1035,7 @@ function streamResponse(
 
       try {
         for (;;) {
-          const { done, value } = await reader.read()
+          const { done, value } = await readWithIdleTimeout(reader)
           if (done) break
           // ⚠️ `{stream:true}` 必需：多字节字符可能跨 chunk，否则解码出乱码
           buffer += decoder.decode(value, { stream: true })
@@ -1751,7 +1798,7 @@ async function nonStreamingResponse(
    */
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await readWithIdleTimeout(reader)
       if (done) break
       raw += decoder.decode(value, { stream: true })
     }

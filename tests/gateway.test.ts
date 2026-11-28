@@ -2250,3 +2250,82 @@ test('🔴 「上游拒了但定位不到错误帧」也要记失败用量（不
   const hooks = (src.match(/onUnattributableFailure: \(\) => \{/g) ?? []).length
   assert.ok(hooks >= 4, `⚠️ 四处 streamResponse 调用点都要接，实得 ${hooks}`)
 })
+
+// ═══════════ 流空闲超时（2026-11-28 稳定性改进） ═══════════
+
+test('🔴 上游流若挂住不送数据，必须在空闲超时后失败（不能无限等待）', async () => {
+  // ## 为什么必须修
+  //
+  // 两处读取循环原先都是裸的 `await reader.read()` —— **没有任何超时**。
+  // 若上游接受了连接却再也不送数据（排队、节点卡死、连接半开），这个 await
+  // 会**永远挂着**：
+  //   · Workers 的整体墙钟没有硬上限（客户端连着就行），不会自动断；
+  //   · 客户端一直「转圈」，而**我们的日志里什么都没发生**；
+  //   · 该账号也不会被换掉（`read()` 不抛错 ⇒ 不进 catch ⇒ 不记账）。
+  //
+  // ⚠️ 注意不能用「总时长」代替：长回答可以合法跑几分钟，
+  //   但**连续 120 秒一个字节都没有**只可能是挂住（推理型首字可达 60s+，
+  //   故阈值取得比各家单请求超时 15–30s 宽松得多）。
+  const { readWithIdleTimeout, STREAM_IDLE_TIMEOUT_MS } = await import('../src/gateway/server.ts')
+
+  // ① 一个永远不送数据的流 ⇒ 必须在超时后 reject
+  const hung = new ReadableStream<Uint8Array>({ start() { /* 不 enqueue、不 close */ } })
+  const reader = hung.getReader()
+  const t0 = Date.now()
+  // ⚠️ 测试**自己**也要有硬上限：若空闲超时被改坏，直接 await 会让整个测试套件
+  // 永久挂住（我反向验证时实测到了 —— 那比「测试失败」糟得多：CI 卡死、
+  // 没有任何红点，只有超时被外部杀掉）。
+  await assert.rejects(
+    Promise.race([
+      readWithIdleTimeout(reader, 80).then(() => {
+        throw new Error('不该成功：挂住的流必须超时')
+      }),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('测试硬上限 3s 到期：空闲超时未生效')), 3000)),
+    ]),
+    /空闲超时/,
+    '⚠️ 挂住的流必须抛「空闲超时」，不能一直等',
+  )
+  const elapsed = Date.now() - t0
+  assert.ok(elapsed >= 70 && elapsed < 2500,
+    `超时应约等于阈值（实际 ${elapsed}ms）—— 过大说明没有真正生效`)
+  try { reader.releaseLock() } catch { /* 忽略 */ }
+
+  // ② 正常流不受影响（不能误伤慢但正常的回答）
+  const ok = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(new TextEncoder().encode('data: {}\n\n')); c.close() },
+  })
+  const r2 = ok.getReader()
+  const first = await readWithIdleTimeout(r2, 200)
+  assert.equal(first.done, false, '正常流应能读到数据')
+  assert.ok(first.value.length > 0)
+  const end = await readWithIdleTimeout(r2, 200)
+  assert.equal(end.done, true, '正常流结束后应返回 done')
+  try { r2.releaseLock() } catch { /* 忽略 */ }
+
+  // ③ 默认阈值必须是 120 秒（别被悄悄改小成会误伤长回答的值）
+  assert.equal(STREAM_IDLE_TIMEOUT_MS, 120_000,
+    '⚠️ 默认空闲阈值应为 120s（小于各家首字耗时会误伤推理型模型）')
+})
+
+test('🔴 每一条上游流读取路径都必须走空闲超时（不能有裸 reader.read）', () => {
+  // ⚠️ 这是「只修一半」的高发区：全项目有 **5 处** 读上游流
+  //（chat 流式、chat 非流式聚合、messages 非流式聚合、
+  //  messages 流式帧转换、responses 非流式聚合）。
+  // 只改主路径等于没修 —— 另外三条照样会挂死。
+  const files = ['src/gateway/server.ts', 'src/gateway/messages.ts', 'src/gateway/responses.ts']
+  let total = 0
+  for (const f of files) {
+    const src = srcNoComments(readFileSync(f, 'utf8'))
+    // 统计真实的读取调用（排除注释与函数定义内部的那一处）
+    const reads = (src.match(/\b(?:await )?reader\.read\(\)/g) ?? []).length
+    const guarded = (src.match(/readWithIdleTimeout\(reader/g) ?? []).length
+    // `readWithIdleTimeout` 内部自己有一处裸 read（那是实现本体），故允许 1 处
+    const allowedBare = f.endsWith('server.ts') ? 1 : 0
+    assert.equal(
+      reads, allowedBare,
+      `${f}: 还有 ${reads} 处裸 reader.read()（应全部改为 readWithIdleTimeout）`,
+    )
+    total += guarded
+  }
+  assert.ok(total >= 5, `应至少有 5 处读取走空闲超时，实得 ${total}`)
+})

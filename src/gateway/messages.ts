@@ -54,7 +54,7 @@
  */
 
 import { aggregateSse, findUpstreamError, isContentless, sseHeaders, type AggregatedCompletion } from './stream.js'
-import { handleChatCompletions } from './server.js'
+import { handleChatCompletions, readWithIdleTimeout } from './server.js'
 import { jsonError, readJsonCapped } from './http.js'
 import { resolveMaxRequestBytes, type Env } from '../env.js'
 import type { SubkeyContext } from './authz.js'
@@ -622,7 +622,11 @@ export function toAnthropicSse(
       const reader = upstream.getReader()
 
       const pump = (): void => {
-        reader.read().then(({ done, value }) => {
+        // ⚠️ 这里同样要**带空闲超时**：这条是 Anthropic 流式帧的转换路径，
+        // 上游挂住时 `reader.read()` 会永远等下去，客户端一直转圈，
+        // 而日志里什么都没发生（见 `readWithIdleTimeout` 的说明）。
+        // 超时抛错会落到下面的 `.catch`，如实发一个 error 事件。
+        readWithIdleTimeout(reader).then(({ done, value }) => {
           if (done) {
             // 收尾：关块 → message_delta → message_stop
             ensureStart(controller)
@@ -769,7 +773,7 @@ export function toAnthropicSse(
             ensureStart(controller)
             emit(controller, 'error', {
               type: 'error',
-              error: { type: 'api_error', message: '读取上游流失败（连接中断）' },
+              error: { type: 'api_error', message: '读取上游流失败（连接中断或空闲超时）' },
             })
             controller.close()
           } catch {
@@ -891,7 +895,7 @@ export async function handleMessages(
   let raw = ''
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await readWithIdleTimeout(reader)
       if (done) break
       raw += decoder.decode(value, { stream: true })
     }

@@ -53,7 +53,7 @@ import {
   findUpstreamError, isContentless,
   type AggregatedCompletion,
 } from './stream.js'
-import { handleChatCompletions } from './server.js'
+import { handleChatCompletions, readWithIdleTimeout } from './server.js'
 import type { SubkeyContext } from './authz.js'
 import type { Env } from '../env.js'
 
@@ -937,7 +937,7 @@ export async function handleResponses(
   let raw = ''
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await readWithIdleTimeout(reader)
       if (done) break
       raw += decoder.decode(value, { stream: true })
     }
