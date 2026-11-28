@@ -2221,3 +2221,32 @@ test('🔴 /v1/messages 的 max_tokens 必须校验为必填（Anthropic 规范�
   assert.ok(/throw new MessagesError\('max_tokens 必填/.test(block),
     '🔴 缺/非法 max_tokens 必须显式 400，不能静默省略')
 })
+
+test('🔴 「上游拒了但定位不到错误帧」也要记失败用量（不罚号）', () => {
+  // ## 线上实测（2026-11-28）
+  //
+  // 我加了失败用量记账后又测了一次，发现 `total` 和 `failed` **都没变**：
+  // 因为最常见的那条失败路径 —— **非流式空响应兜底** —— 在
+  // `nonStreamingResponse` 内部**提前返回**，根本不经过我在循环末尾加的两个出口。
+  //
+  // ⚠️ 这正是「修了一半」的又一种形态：出口有**三个**（buddy 循环尾、
+  //   provider 循环尾、非流式兜底），我只堵了两个。
+  //
+  // ⇒ 兜底处必须回调 `onUnattributableFailure`，且该回调**只记账、不罚号**：
+  //   我们无法确定是账号问题还是上游抽风，误罚会让健康账号被冷却。
+  const src = srcNoComments(readFileSync('src/gateway/server.ts', 'utf8'))
+
+  // ① 兜底处要调用它
+  const i = src.indexOf('上游返回了空响应（既没有正文')
+  assert.ok(i > 0, '应有空响应兜底')
+  const block = src.slice(Math.max(0, i - 400), i + 200)
+  assert.ok(/onUnattributableFailure/.test(block),
+    '🔴 空响应兜底必须回调 onUnattributableFailure，否则这条失败路径不可见')
+
+  // ② 它是「只记账」：不能出现在 onError 里（onError 才会 applyFailure）
+  assert.ok(/onUnattributableFailure\?: \(reason: string\) => void/.test(src),
+    '⚠️ 类型上必须有这个可选回调')
+  // ③ 四个 hooks 站点都要接（两条主路径 + 两个续期重试分支）
+  const hooks = (src.match(/onUnattributableFailure: \(\) => \{/g) ?? []).length
+  assert.ok(hooks >= 4, `⚠️ 四处 streamResponse 调用点都要接，实得 ${hooks}`)
+})

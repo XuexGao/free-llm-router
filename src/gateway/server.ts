@@ -828,6 +828,11 @@ export async function handleChatCompletions(
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
+        // ⚠️ 「上游拒了但定位不到错误帧」也要记一笔失败（**不罚号**）——
+        // 否则这条最常走的失败路径在用量面板里完全不可见。
+        onUnattributableFailure: () => {
+          recordFailedRequest(pool, ctx, model, tried, Date.now(), 'upstream_empty_response')
+        },
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
           const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
@@ -934,6 +939,15 @@ function streamResponse(
      *（我为此连续几轮改错地方，见 AGENTS.md）。
      */
     clientGone?: () => boolean
+    /**
+     * ⚠️ **只记账、不罚号**：用于「上游拒了但定位不到错误帧」这种
+     * **无法归因**的失败（见 `nonStreamingResponse` 空响应兜底的说明）。
+     *
+     * 与 `onError` 的区别：`onError` 会 `applyFailure`（罚账号），
+     * 而这里只让用量面板知道「这次请求失败了」。
+     * 混用会让上游抽风误伤健康账号。
+     */
+    onUnattributableFailure?: (reason: string) => void
   },
   /**
    * 客户端要**非流式**时传 true：内部仍按流式读上游，但最后聚合成一个
@@ -1237,6 +1251,9 @@ async function handleProviderChat(input: {
                 // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
                 //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
                 clientGone: () => request.signal.aborted,
+                onUnattributableFailure: () => {
+                  recordFailedRequest(pool, ctx, `${providerId}/${model}`, tried, Date.now(), 'upstream_empty_response')
+                },
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
@@ -1359,6 +1376,11 @@ async function handleProviderChat(input: {
                 },
                 // ⚠️ 诊断用：区分「客户端断开」与「上游中断」
                 clientGone: () => request.signal.aborted,
+                // ⚠️ 无法归因的失败也记一笔（这条续期分支同样要接 ——
+                // 漏了它，「上游空响应」经这条路径失败时仍不可见）
+                onUnattributableFailure: () => {
+                  recordFailedRequest(pool, ctx, `${providerId}/${model}`, tried, Date.now(), 'upstream_empty_response')
+                },
                 onError: (message) => {
                   const t = pool
                     .applyFailure({
@@ -1511,6 +1533,10 @@ async function handleProviderChat(input: {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
+        // ⚠️ 同上：无法归因的失败也要记账（模型名带供应商前缀，与成功记录一致）
+        onUnattributableFailure: () => {
+          recordFailedRequest(pool, ctx, `${providerId}/${model}`, tried, Date.now(), 'upstream_empty_response')
+        },
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
@@ -1690,6 +1716,15 @@ async function nonStreamingResponse(
      * 不分清就会把用户的取消动作记成账号失败，进而熔断健康账号。
      */
     clientGone?: () => boolean
+    /**
+     * ⚠️ **只做记账、不惩罚账号**的回调：用于「上游拒了但定位不到错误帧」
+     * 这种**无法归因**的失败（见下方空响应兜底的说明）。
+     *
+     * 与 `onError` 的区别：`onError` 会触发 `applyFailure`（罚账号），
+     * 而这里**只是让用量面板知道「这次请求失败了」**。
+     * 混用会让上游抽风误伤健康账号。
+     */
+    onUnattributableFailure?: (reason: string) => void
   },
 ): Promise<Response> {
   const reader = upstreamBody.getReader()
@@ -1892,6 +1927,9 @@ async function nonStreamingResponse(
     // 是账号问题还是上游临时抽风，而误记会让健康账号被冷却
     //（本项目反复踩到的「状态看着对、行为不对」型缺陷）。只如实回报给客户端。
     const snippet = raw.trim().slice(0, 200)
+    // ⚠️ 记一笔「失败」（**不罚号**）：否则这条最常走的失败路径
+    // 在用量面板里完全不可见（`failed` 恒 0）。
+    hooks.onUnattributableFailure?.('upstream_empty_response')
     return jsonError(
       502,
       '上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。'
