@@ -2329,3 +2329,73 @@ test('🔴 每一条上游流读取路径都必须走空闲超时（不能有裸
   }
   assert.ok(total >= 5, `应至少有 5 处读取走空闲超时，实得 ${total}`)
 })
+
+// ═══════════ 超时不得蔓延到流式读取期（2026-11-28 稳定性） ═══════════
+
+test('🔴 boundedSignal：超时只覆盖「拿到响应头」，stop() 后不再切断流', async () => {
+  // ## 真实缺陷（实测复现）
+  //
+  // `AbortSignal.timeout(30_000)` 传给 `fetch` 后，计时器在 fetch 返回
+  // **之后仍然有效**；它一旦触发，**响应体的读取会一起被 abort**：
+  //
+  // ```
+  // $ node  # 本地起一个每 800ms 送一个 chunk、共 3 个的慢服务
+  // fetch 已返回 status 200        ← 响应头已拿到
+  // 结果: 被切断 (TimeoutError: The operation was aborted due to timeout)
+  // ```
+  //
+  // ⇒ 把「30 秒」当**整个请求**上限时，所有长于 30 秒的回答都被截断。
+  //   推理型模型（qoder / gemini / trae 等）先输出思考、正文常在之后才开始，
+  //   症状就是「只有思考、没有正文」或直接中断。
+  //
+  // 正确分工：**拿到响应头之前**由 boundedSignal 兜底；
+  //           **流式读取期**由网关的空闲超时兜底（`STREAM_IDLE_TIMEOUT_MS`）。
+  const { boundedSignal } = await import('../src/upstream/bounded.ts')
+
+  // ① 超时前拿到响应：stop() 之后信号**不应**再 abort
+  {
+    const b = boundedSignal(undefined, 60)
+    assert.equal(b.signal.aborted, false, '刚创建时不应已 abort')
+    b.stop()   // 模拟「已拿到响应头」
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(b.signal.aborted, false,
+      '🔴 stop() 之后不得再 abort —— 否则流式读取期会被切断（长回答被截断）')
+  }
+
+  // ② 没拿到响应（不 stop）：到点必须 abort
+  {
+    const b = boundedSignal(undefined, 60)
+    await new Promise((r) => setTimeout(r, 150))
+    assert.equal(b.signal.aborted, true,
+      '⚠️ 超时前未 stop 必须 abort —— 否则「请求发出即挂住」又变成无界')
+  }
+
+  // ③ 客户端取消必须仍然有效（stop 只清本地计时器，不能吞掉客户端信号）
+  {
+    const client = new AbortController()
+    const b = boundedSignal(client.signal, 10_000)
+    b.stop()
+    assert.equal(b.signal.aborted, false)
+    client.abort()
+    await new Promise((r) => setTimeout(r, 10))
+    assert.equal(b.signal.aborted, true,
+      '🔴 客户端取消必须仍然中断流（stop() 不得把它一起废掉）')
+  }
+})
+
+test('🔴 带流式响应的推理路径不得裸用 AbortSignal.timeout', () => {
+  // ⚠️ 为修这个缺陷全项目排查过一遍：**只有 gemini 与 qoder** 的流式推理
+  // 路径带超时（其余家的 `chat` 只用 `request.signal`）。
+  // 两处都必须改成 boundedSignal + stop()。
+  const g = srcNoComments(readFileSync('src/providers/gemini.ts', 'utf8'))
+  assert.ok(/boundedSignal\(request\.signal, GEMINI_REQUEST_TIMEOUT_MS\)/.test(g),
+    '⚠️ gemini 推理应使用 boundedSignal')
+  assert.ok(/bounded\.stop\(\)/.test(g),
+    '🔴 gemini 拿到响应头后必须 stop()，否则 120s 后切断长回答')
+
+  const q = srcNoComments(readFileSync('src/providers/qoder.ts', 'utf8'))
+  assert.ok(/boundedSignal\(request\.signal, INFER_TIMEOUT_MS\)/.test(q),
+    '⚠️ qoder 推理应使用 boundedSignal')
+  assert.ok(/bounded\.stop\(\)/.test(q),
+    '🔴 qoder 拿到响应头后必须 stop()，否则 30s 后切断长回答')
+})

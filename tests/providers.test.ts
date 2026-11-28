@@ -888,14 +888,29 @@ test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = �
   const ms = Number(m![1]!.replaceAll('_', ''))
   // 与参考实现的 `QODER_REQUEST_TIMEOUT_MS = 30_000` 一致
   assert.equal(ms, 30_000, '应与参考实现的 30s 一致')
-  // ⚠️ **发起推理的那次 fetch** 必须用上它（不能只是定义）
+  // ⚠️ **发起推理的那次 fetch** 必须真的用上它（不能只是定义）。
+  //
+  // ## ⚠️ 2026-11-28 更正：不能用 `AbortSignal.timeout` 裸套
+  //
+  // 原断言要求 `/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/` —— 而那个写法
+  // **本身就是缺陷**：`AbortSignal.timeout` 的计时器在 `fetch` 返回之后
+  // **仍然有效**，触发时会连**响应体读取一起 abort**
+  //（实测：fetch 先返回 200，随后读 body 抛 `TimeoutError`）
+  // ⇒ 所有长于 30 秒的回答被截断（qoder 先输出思考，正文常在此之后才开始）。
+  //
+  // ⇒ 现在要求同时满足**两件事**（缺一不可）：
+  //   ① 有界：拿到响应头之前必须超时；
+  //   ② 不蔓延：拿到响应头之后必须 `stop()`，让流自由读。
   const i = src.indexOf('async function postQoderInfer')
-  const j = src.indexOf('\n}', src.indexOf('return await fetch(', i))
+  const j = src.indexOf('\n}', src.indexOf('bounded.stop()', i))
   const block = src.slice(i, j)
-  assert.ok(/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
-    '⚠️ 推理 fetch 必须带 AbortSignal.timeout(INFER_TIMEOUT_MS)')
-  assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
-    '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
+  assert.ok(/boundedSignal\(request\.signal, INFER_TIMEOUT_MS\)/.test(block),
+    '⚠️ 推理 fetch 必须用 boundedSignal(INFER_TIMEOUT_MS) 建立有界信号')
+  assert.ok(/bounded\.stop\(\)/.test(block),
+    '🔴 拿到响应头后必须 stop() —— 否则超时会蔓延到流式读取期、截断长回答')
+  // ⚠️ 反向约束：不得再出现裸的 AbortSignal.timeout(INFER_TIMEOUT_MS)
+  assert.ok(!/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
+    '🔴 不得用裸 AbortSignal.timeout —— 那会连流一起切断')
 })
 
 test('🔴 zcode 余额：`balances: []` **不是**异常，且要认顶层无 `data` 的形态', () => {

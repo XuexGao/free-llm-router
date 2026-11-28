@@ -52,6 +52,7 @@
  * `lobsterai` / `trae` 同类。**用户只能导入凭据**。
  */
 
+import { boundedSignal } from '../upstream/bounded.js'
 import { ProviderError } from './types.js'
 import type {
   ChatRequest,
@@ -1864,15 +1865,23 @@ export async function listModels(
 export async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
   const prepared = buildGeminiInferPayload(credential, request.model, request.body)
 
+  // ## 🔴 超时只覆盖「拿到响应头」，**不能在流式读取期继续生效**
+  //
+  // 原先写的是 `AbortSignal.any([request.signal, AbortSignal.timeout(120s)])`
+  // —— 而 `AbortSignal.timeout` 的计时器在 `fetch` 返回之后**仍然有效**，
+  // 它一旦触发会连**响应体读取一起 abort**（实测：fetch 先返回 200，
+  // 随后读 body 抛 `TimeoutError`）⇒ 所有长于 120s 的回答被截断。
+  //
+  // ⇒ 改用 `boundedSignal`：拿到响应头后立刻 `stop()`，流不再受此超时约束；
+  //   「流式读取期挂住」交给网关的空闲超时（`STREAM_IDLE_TIMEOUT_MS`）。
+  const bounded = boundedSignal(request.signal, GEMINI_REQUEST_TIMEOUT_MS)
   let response: Response
   try {
     response = await fetch(prepared.url, {
       method: 'POST',
       headers: prepared.headers,
       body: prepared.body,
-      // ⚠️ 有界 fetch（项目统一口径：`AbortSignal.timeout`）——
-      // 上游挂死不能把 Worker 一起挂住。客户端断开用 `AbortSignal.any` 取交集。
-      signal: AbortSignal.any([request.signal, AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)]),
+      signal: bounded.signal,
     })
   } catch (error) {
     // ⚠️ **用户中断必须原样区分**：把它翻译成「可重试的上游故障」会让
@@ -1885,6 +1894,10 @@ export async function chat(credential: ProviderCredential, request: ChatRequest)
       retryable: true,
       message: `Gemini 请求失败：${error instanceof Error ? error.message : String(error)}`,
     })
+  } finally {
+    // ⚠️ 必须在**两个分支**都停表：成功时让流自由读；
+    // 失败时不留悬空计时器（否则已失败的请求还会在 120s 后触发一次 abort）。
+    bounded.stop()
   }
 
   if (!response.ok) {

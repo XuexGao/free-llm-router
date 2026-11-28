@@ -49,6 +49,7 @@
  *   说明缺什么，而不是返回 `alreadyDone:true`（见 {@link checkin}）。
  */
 
+import { boundedSignal } from '../upstream/bounded.js'
 import { ProviderError } from './types.js'
 import type {
   ChatRequest,
@@ -932,17 +933,34 @@ async function postQoderInfer(
   // ⚠️ `prepared.headers` **必须原样透传**：其中的 `Authorization` 是 WASM 生成的
   // `Bearer COSY.<载荷>.<签名>`。用普通 `Bearer <token>` 覆盖会导致
   // `403 Signature invalid`（参考实现 `src/qoder-wasm.ts:649-655`）。
-  return await fetch(prepared.url, {
-    method: 'POST',
-    headers: prepared.headers,
-    body: prepared.body,
-    // ⚠️ **必须带超时** —— 只透传 `request.signal` 等于「永不超时」，
-    // 一次挂住就会让上层所有预算（排队总预算等）失效。
-    // 两者用 `any` 组合：客户端取消与超时都要生效。
-    signal: request.signal.aborted
-      ? request.signal
-      : AbortSignal.any([request.signal, AbortSignal.timeout(INFER_TIMEOUT_MS)]),
-  })
+  // ## 🔴 超时只覆盖「拿到响应头」，**不能在流式读取期继续生效**
+  //
+  // 原先写的是 `AbortSignal.any([request.signal, AbortSignal.timeout(30s)])`
+  // —— 而 `AbortSignal.timeout` 的计时器在 `fetch` 返回之后**仍然有效**，
+  // 它一旦触发会连**响应体读取一起 abort**（实测：fetch 先返回 200，
+  // 随后读 body 抛 `TimeoutError`）⇒ 所有长于 30 秒的回答被截断。
+  //
+  // ⚠️ qoder 的回答尤其容易超 30 秒：它在 `reasoning_content` 里先输出思考，
+  // 正文往往在 30 秒之后才开始 ⇒ 症状是「只有思考、没有正文」或直接中断。
+  //
+  // ⇒ 改用 `boundedSignal`：拿到响应头后立刻 `stop()`，流不再受此超时约束；
+  //   「流式读取期挂住」交给网关的空闲超时（`STREAM_IDLE_TIMEOUT_MS`）。
+  //
+  // ⚠️ 保留原「已取消就直接透传」的短路：`request.signal.aborted` 时
+  // 不必再建控制器（那会多一个悬空计时器）。
+  if (request.signal.aborted) return await fetch(prepared.url, { method: 'POST', headers: prepared.headers, body: prepared.body, signal: request.signal })
+  const bounded = boundedSignal(request.signal, INFER_TIMEOUT_MS)
+  try {
+    return await fetch(prepared.url, {
+      method: 'POST',
+      headers: prepared.headers,
+      body: prepared.body,
+      signal: bounded.signal,
+    })
+  } finally {
+    // ⚠️ 成功与失败都要停表，否则已失败的请求还会在 30s 后触发一次 abort。
+    bounded.stop()
+  }
 }
 
 /** 发起对话（返回**已转成 OpenAI SSE** 的响应）。 */
