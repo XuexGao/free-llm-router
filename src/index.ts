@@ -4105,6 +4105,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       data.push({
         id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
         object: 'model',
+        // ⚠️ OpenAI 规范必填。聚合是虚拟条目、没有真实创建时刻，
+        // 用 0（与单家条目、`gateway/models.ts` 同口径）——
+        // 编造一个具体时间比如实给 0 更糟。
+        created: 0,
         owned_by: AGGREGATE_PROVIDER_ID,
         name: '自动选择（临期优先）',
         priceFactor: cheapestOf(
@@ -4130,6 +4134,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         data.push({
           id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
           object: 'model',
+          created: 0,
           owned_by: AGGREGATE_PROVIDER_ID,
           // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
           name: v.name || v.key,
