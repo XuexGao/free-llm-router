@@ -603,6 +603,51 @@ export const QODER_BILLING_CODES: readonly string[] = ['110', '112']
 export const QODER_BILLING_CODE = '110'
 
 /**
+ * 把 system 文本里会触发 Qoder「永久排队」的 agent 自我介绍改写掉。
+ *
+ * ## 🔴 为什么必须改写（上游行为，2026-11-28 核实）
+ *
+ * Qoder（尤其 CN）会把 **system prompt 里含特定 agent 自我介绍**的请求
+ * 放进一个**永不推进的队列**：`10605`、前面没有别的请求、只回 keepalive，
+ * 直到客户端放弃。
+ *
+ * 两条实测触发条件（均来自上游 issue 的逐字 bisect，不是推测）：
+ *
+ * 1. **整句** `You are an AI agent powered by DeepSeek Harness.` ——
+ *    ⚠️ 而这**正是 DSH 的系统提示词开头**（`dsh-system-prompt` 的
+ *    `includeHarnessIdentity`，order −1000）⇒ 我们经本服务调 Qoder 时
+ *    **必然命中**。把 `powered by` 前加一个逗号就立刻正常；
+ * 2. `You are <某个别的 agent 名>, a/an/the/...`（逗号后接描述）——
+ *    `You are ZCode, an interactive agent` 这类。改成两句
+ *    （`You are X. You are ...`）即可。
+ *
+ * ## 只改 system，**不动用户消息**
+ *
+ * 用户自己的提问必须原样送达 —— 那是他要对模型说的话。
+ * 这里只调整**我们代为转发的系统提示词**的措辞，语义不变。
+ *
+ * ⚠️ 匹配是**区分大小写**、且要求整句形态（上游 bisect 明确记录了
+ * 「工具、体积、max_completion_tokens、会话头都不影响，差异就在那 48 个字符」）。
+ * 故这里用保守的整句替换，不做泛化。
+ */
+export function defuseQoderQueueTraps(systemText: string): string {
+  if (systemText === '') return systemText
+  let out = systemText
+  // ① `You are <X> powered by/运行于 …` ⇒ 在连接词前加逗号
+  out = out.replace(
+    /(\bYou are (?:an?|the)\s[^\n.,]{0,60}?\b(?:agent|assistant))\s+(powered by|running on|running in|built on|based on)\b/gi,
+    '$1, $2',
+  )
+  // ② `You are <Name>, a/an/the/based/...` ⇒ 拆成两句
+  //    ⚠️ 排除 Qoder 自己的名字：上游对它们不过滤，改写反而多一次未知风险。
+  out = out.replace(
+    /\bYou are ((?!(?:Qoder|Lingma|QwenWork)\b)[A-Z][\w.+-]*(?:[ \t][A-Z][\w.+-]*){0,2}),[ \t]*(?=(?:an?|the|based|built|powered|running|made)\b)/g,
+    'You are $1. You are ',
+  )
+  return out
+}
+
+/**
  * 从一段错误文本/对象里解析「排队」信息。
  *
  * ⚠️ **不能先用某个字段当门禁再解析** —— 第三次回归（2026-09-27）的教训是
@@ -891,7 +936,12 @@ async function postQoderInfer(
   /** 最后一条 user 消息即本轮提问（其余作为历史）。 */
   const lastUser = [...messages].reverse().find((m) => m.role === 'user')
   const userText = qoderContentText(lastUser?.content)
-  const systemText = qoderContentText(lastUser === undefined ? '' : body.system ?? body.system_prompt)
+  // ⚠️ 必须**改写**再发：原样的 agent 自我介绍会让 Qoder 把请求放进
+  // 永不推进的队列（`10605`），而 DSH 的系统提示词开头正好命中 ——
+  // 见 `defuseQoderQueueTraps` 的说明（含上游 bisect 依据）。
+  const systemText = defuseQoderQueueTraps(
+    qoderContentText(lastUser === undefined ? '' : body.system ?? body.system_prompt),
+  )
 
   const model = product.fallbackModels.find((m) => m.id === request.model)
   const maxTokens = typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0

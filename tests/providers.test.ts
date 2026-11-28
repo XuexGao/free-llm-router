@@ -2660,3 +2660,56 @@ test('🔴 Gemini 的 VALIDATION_REQUIRED 不得被判为「可换号重试」',
       '其它错误不应附这条提示')
   })
 })
+
+// ═══════════ Qoder 的「永久排队」system prompt 陷阱（2026-11-28） ═══════════
+
+test('🔴 Qoder：DSH 的系统提示词开头会让请求进「永不推进的队列」，必须改写', () => {
+  // ## 上游行为（核实自 magpie 的逐字 bisect，非推测）
+  //
+  // Qoder（尤其 CN）会把 **system prompt 含特定 agent 自我介绍**的请求放进
+  // 一个**永不推进的队列**：`10605`、前面没有别的请求、只回 keepalive，
+  // 直到客户端放弃。
+  //
+  // 触发条件（两条，都是逐字 bisect 得出的）：
+  //   ① **整句** `You are an AI agent powered by DeepSeek Harness.`
+  //      —— ⚠️ 这正是 **DSH 的系统提示词开头**（`dsh-system-prompt` 的
+  //      `includeHarnessIdentity`，order −1000）⇒ 我们经本服务调 Qoder 时
+  //      **必然命中**。把 `powered by` 前加一个逗号就立刻正常；
+  //   ② `You are <别的 agent 名>, a/an/the/...`
+  //
+  // ⚠️ bisect 明确记录了「工具、体积、max_completion_tokens、会话头都不影响，
+  //   差异就在那 48 个字符」—— 所以这**不是**猜测，是精确的字符级判据。
+  return import('../src/providers/qoder.ts').then((m) => {
+    // ① DSH 的真实开场白必须被改掉（否则我们必然踩坑）
+    const dsh = 'You are an AI agent powered by DeepSeek Harness. You are a coding agent.'
+    const fixed = m.defuseQoderQueueTraps(dsh)
+    assert.ok(!/agent powered by/.test(fixed), '🔴 必须拆开 `agent powered by`')
+    assert.ok(fixed.includes('agent, powered by'), '应在连接词前补逗号（上游认可形态）')
+    // ⚠️ 语义不能变：原句的关键词都得还在
+    for (const w of ['You are an AI agent', 'DeepSeek Harness']) {
+      assert.ok(fixed.includes(w), `⚠️ 改写不得丢失语义：${w}`)
+    }
+
+    // ② 别的 agent 名 + 逗号描述 ⇒ 拆成两句
+    const zcode = 'You are ZCode, an interactive coding agent.'
+    assert.ok(m.defuseQoderQueueTraps(zcode).includes('You are ZCode. You are an interactive'),
+      '⚠️ `You are X, a ...` 应拆成两句')
+
+    // ③ ⚠️ Qoder 自己的名字**不该**被改写（上游对它们不过滤，多改一次多一次风险）
+    const own = 'You are Qoder, an interactive coding agent.'
+    assert.equal(m.defuseQoderQueueTraps(own), own, '⚠️ Qoder 自己的名字不得改写')
+
+    // ④ 不含陷阱的普通文本必须**逐字不变**（不能顺手改动用户的内容）
+    const plain = 'You are a helpful assistant. Answer briefly.'
+    assert.equal(m.defuseQoderQueueTraps(plain), plain, '⚠️ 无陷阱文本必须原样返回')
+    assert.equal(m.defuseQoderQueueTraps(''), '', '空串应原样返回')
+  })
+})
+
+test('🔴 Qoder 必须**实际调用**这个改写（定义了但没用等于没修）', () => {
+  // ⚠️ 这是「只修一半」的经典形态：函数写好、单测过了，但调用点漏了。
+  //    故这里直接断言 `systemText` 的构造必须经过它。
+  const src = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(/const systemText = defuseQoderQueueTraps\(/.test(src),
+    '🔴 systemText 的构造必须经过 defuseQoderQueueTraps')
+})
